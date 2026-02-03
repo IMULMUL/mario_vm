@@ -3,5 +3,6 @@
         "atomic": "c",
         "mutex": "c",
         "typeinfo": "c"
-    }
+    },
+    "C_Cpp.errorSquiggles": "disabled"
 }

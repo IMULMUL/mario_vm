@@ -4,7 +4,7 @@ function f( ) {
 
 	function f2() {
 		function f1() {
-			debug(x + y);
+			console.log(x + y);
 			y++;
 			return y;
 		}

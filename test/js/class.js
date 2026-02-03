@@ -5,28 +5,28 @@ function f() {
 }
 
 a = new f();
-debug(a);
+console.log(a);
 
 /**/
 class Base {
 	constructor() {
 		this.b = 1;
-		debug("Super Base Constructor");
+		console.log("Super Base Constructor");
 	}
 
 	f() {
-		debug("Super Base");
+		console.log("Super Base");
 	}
 }
 
 class Base1 extends Base {
 	constructor() {
 		super();
-		debug("Super Base1 Constructor");
+		console.log("Super Base1 Constructor");
 	}
 	f() {
 		super.f();
-		debug("Super Base1");
+		console.log("Super Base1");
 	}
 }
 
@@ -38,7 +38,7 @@ class Test extends Base1 {
 
 	f() {
 		super.f();
-		debug("this: " + this);
+		console.log("this: " + this);
 	}
 }
 
