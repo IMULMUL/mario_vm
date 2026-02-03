@@ -1,5 +1,5 @@
 CC := $(CROSS_COMPILE)gcc
-CXX := $(CROSS_COMPILE)g++
+#CXX := $(CROSS_COMPILE)g++
 AR := $(CROSS_COMPILE)ar
 LD := $(CROSS_COMPILE)gcc
 
@@ -17,18 +17,22 @@ mvm_OBJS = bin/mario/mario.o bin/lib/mbc.o bin/lib/js.o
 MARIO_OBJS = $(mario_OBJS) $(mvm_OBJS) $(lang_OBJS) $(platform_OBJS) \
 		$(NATIVE_OBJS)
 
-ifneq ($(MARIO_DEBUG), no)
+ifeq ($(MARIO_DEBUG),yes)
 CFLAGS += -g -DMARIO_DEBUG
+#CXXFLAGS += -g -DMARIO_DEBUG
 else
 CFLAGS += -O2
+#CXXFLAGS += -O2
 endif
 
-ifneq ($(MARIO_CACHE), no)
+ifneq ($(MARIO_CACHE),no)
 CFLAGS += -DMARIO_CACHE
+#CXXFLAGS += -DMARIO_CACHE
 endif
 
-ifneq ($(MARIO_THREAD), no)
+ifneq ($(MARIO_THREAD),no)
 CFLAGS += -DMARIO_THREAD
+#CXXFLAGS += -DMARIO_THREAD
 endif
 
 
@@ -38,10 +42,10 @@ HEADS = -I$(NATIVE_PATH_BUILTIN) \
 	-I$(MARIO_VM)/platform
 
 CFLAGS += $(HEADS)
-CXXFLAGS += $(HEADS)
+#CXXFLAGS += $(HEADS)
 
 CFLAGS += -Wno-incompatible-function-pointer-types
-CXXFLAGS += -Wno-incompatible-function-pointer-types
+#CXXFLAGS += -Wno-incompatible-function-pointer-types
 
 MARIO = build/mario
 
