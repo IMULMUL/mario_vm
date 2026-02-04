@@ -15,4 +15,5 @@ NATIVE_OBJS= $(NATIVE_PATH)/natives.o  \
 	$(NATIVE_PATH_BUILTIN)/json/native_json.o \
 	$(NATIVE_PATH_BUILTIN)/system/native_system.o \
 	$(NATIVE_PATH_BUILTIN)/fs/native_fs.o \
-	$(NATIVE_PATH_BUILTIN)/dir/native_dir.o
+	$(NATIVE_PATH_BUILTIN)/dir/native_dir.o \
+	$(NATIVE_PATH_BUILTIN)/date/native_date.o
