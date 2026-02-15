@@ -20,12 +20,21 @@ var_t* native_Object_getPrototypeOf(vm_t* vm, var_t* env, void* data) {
 	return var_get_prototype(obj);
 }
 
+var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
+	(void)vm; (void)data;
+	var_t* obj = get_obj(env, THIS);
+	const char* name = get_str(env, "name");
+	node_t* n = var_find(obj, name);
+	return var_new_bool(vm, (n != NULL && n->be_inherited == 0));
+}
+
 #define CLS_OBJECT "Object"
 
 void reg_native_object(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_OBJECT);
 	vm_reg_static(vm, cls, "create(proto)", native_Object_create, NULL); 
 	vm_reg_static(vm, cls, "getPrototypeOf(obj)", native_Object_getPrototypeOf, NULL); 
+	vm_reg_static(vm, cls, "hasOwnProperty(name)", native_Object_hasOwnProperty, NULL); 
 }
 
 #ifdef __cplusplus

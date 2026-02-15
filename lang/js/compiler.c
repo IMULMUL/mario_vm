@@ -16,7 +16,7 @@ typedef enum {
 	LEX_EQUAL = LEX_BASIC_END,
 	LEX_TYPEEQUAL,
 	LEX_NEQUAL,
-	LEX_NTYPEEQUAL,
+	LEX_NTYPEQUAL,
 	LEX_LEQUAL,
 	LEX_LSHIFT,
 	LEX_LSHIFTEQUAL,
@@ -79,7 +79,7 @@ void lex_get_op_token(lex_t* lex) {
 		lex->tk = LEX_NEQUAL;
 		lex_get_nextch(lex);
 		if (lex->curr_ch=='=') { // !==
-			lex->tk = LEX_NTYPEEQUAL;
+			lex->tk = LEX_NTYPEQUAL;
 			lex_get_nextch(lex);
 		}
 	} else if (lex->tk=='<' && lex->curr_ch=='=') {
@@ -161,24 +161,24 @@ void lex_get_js_str(lex_t* lex) {
 				case '\'' : mstr_add(lex->tk_str, '\''); break;
 				case '\\' : mstr_add(lex->tk_str, '\\'); break;
 				case 'x' : { // hex digits
-										 char buf[3] = "??";
-										 lex_get_nextch(lex);
-										 buf[0] = lex->curr_ch;
-										 lex_get_nextch(lex);
-										 buf[1] = lex->curr_ch;
-										 mstr_add(lex->tk_str, (char)strtol(buf,0,16));
-									 } break;
+							 char buf[3] = "??";
+							 lex_get_nextch(lex);
+							 buf[0] = lex->curr_ch;
+							 lex_get_nextch(lex);
+							 buf[1] = lex->curr_ch;
+							 mstr_add(lex->tk_str, (char)strtol(buf,0,16));
+						 } break;
 				default: if (lex->curr_ch>='0' && lex->curr_ch<='7') {
-									 // octal digits
-									 char buf[4] = "???";
-									 buf[0] = lex->curr_ch;
-									 lex_get_nextch(lex);
-									 buf[1] = lex->curr_ch;
-									 lex_get_nextch(lex);
-									 buf[2] = lex->curr_ch;
-									 mstr_add(lex->tk_str, (char)strtol(buf,0,8));
-								 } else
-									 mstr_add(lex->tk_str, lex->curr_ch);
+							 // octal digits
+							 char buf[4] = "???";
+							 buf[0] = lex->curr_ch;
+							 lex_get_nextch(lex);
+							 buf[1] = lex->curr_ch;
+							 lex_get_nextch(lex);
+							 buf[2] = lex->curr_ch;
+							 mstr_add(lex->tk_str, (char)strtol(buf,0,8));
+						 } else
+							 mstr_add(lex->tk_str, lex->curr_ch);
 			}
 		} else {
 			mstr_add(lex->tk_str, lex->curr_ch);
@@ -270,7 +270,7 @@ const char* lex_get_token_str(int token) {
 		case LEX_EQUAL          : return "==";
 		case LEX_TYPEEQUAL      : return "===";
 		case LEX_NEQUAL         : return "!=";
-		case LEX_NTYPEEQUAL     : return "!==";
+		case LEX_NTYPEQUAL      : return "!==";
 		case LEX_LEQUAL         : return "<=";
 		case LEX_LSHIFT         : return "<<";
 		case LEX_LSHIFTEQUAL    : return "<<=";
@@ -290,7 +290,7 @@ const char* lex_get_token_str(int token) {
 		case LEX_OREQUAL        : return "|=";
 		case LEX_OROR           : return "||";
 		case LEX_XOREQUAL       : return "^=";
-															// reserved words
+									// reserved words
 		case LEX_R_IF           : return "if";
 		case LEX_R_ELSE         : return "else";
 		case LEX_R_DO           : return "do";
@@ -382,7 +382,7 @@ int call_func(lex_t* l, bytecode_t* bc) {
 			arg_num++;
 
 		if (l->tk!=')') {
-			if(!lex_chkread(l, ',')) return -1;	
+			if(!lex_chkread(l, ',')) return -1; 
 		}
 		else
 			break;
@@ -494,7 +494,7 @@ bool factor_def_afunc(lex_t* l, bytecode_t* bc) {
 	if(op != INSTR_RETURN && op != INSTR_RETURNV)
 		bc_gen(bc, INSTR_RETURN);
 	bc_set_instr(bc, pc, INSTR_JMP, ILLEGAL_PC);
-	return true;	
+	return true; 
 }
 
 static bool lex_chkread_stmt_end(lex_t* l) {
@@ -590,8 +590,8 @@ bool factor_json(lex_t*l, bytecode_t* bc) {
 		}
 		else {
 			if(!lex_chkread(l, LEX_ID)) return false;
-		}	
-
+		}
+		
 		if(!lex_chkread(l, ':')) return false;
 		if(!base(l, bc)) return false;
 		lex_skip_empty(l);
@@ -626,7 +626,7 @@ bool factor_call_func(lex_t* l, bytecode_t* bc, mstr_t* name, bool member) {
 
 	int arg_num = call_func(l, bc);
 	gen_func_name(name->cstr, arg_num, s);
-	bc_gen_str(bc, member ? INSTR_CALLO:INSTR_CALL, s->cstr);	
+	bc_gen_str(bc, member ? INSTR_CALLO:INSTR_CALL, s->cstr); 
 	mstr_free(s);
 	return true;
 }
@@ -722,19 +722,19 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
 		}
 		else {
 			if(member) {
-				bc_gen_str(bc, INSTR_GET, name->cstr);	
+				bc_gen_str(bc, INSTR_GET, name->cstr);
 			}
 			else if (l->tk == '.') {
-				bc_gen_str(bc, INSTR_LOADO, name->cstr);	
+				bc_gen_str(bc, INSTR_LOADO, name->cstr);
 			}
 			else if (l->tk == LEX_R_AFUNCTION) {
 				if(!lex_chkread(l, LEX_R_AFUNCTION)) return false;
 				bc_gen(bc, INSTR_FUNC);
-				bc_gen_str(bc, INSTR_LOAD, name->cstr);	
+				bc_gen_str(bc, INSTR_LOAD, name->cstr);
 				factor_def_afunc(l, bc);
 			}
 			else {
-				bc_gen_str(bc, INSTR_LOAD, name->cstr);	
+				bc_gen_str(bc, INSTR_LOAD, name->cstr);
 			}
 		}
 		mstr_free(name);
@@ -763,7 +763,7 @@ bool unary(lex_t* l, bytecode_t* bc) {
 	if(instr != INSTR_END) {
 		bc_gen(bc, instr);
 	}
-	return true;	
+	return true; 
 }
 
 bool term(lex_t* l, bytecode_t* bc) {
@@ -786,7 +786,7 @@ bool term(lex_t* l, bytecode_t* bc) {
 		}
 	}
 
-	return true;	
+	return true; 
 }
 
 bool expr(lex_t* l, bytecode_t* bc) {
@@ -837,7 +837,7 @@ bool expr(lex_t* l, bytecode_t* bc) {
 		}
 	}
 
-	return true;	
+	return true; 
 }
 
 bool shift(lex_t* l, bytecode_t* bc) {
@@ -860,7 +860,7 @@ bool shift(lex_t* l, bytecode_t* bc) {
 			bc_gen(bc, INSTR_URSHIFT);
 		}
 	}
-	return true;	
+	return true; 
 }
 
 bool condition(lex_t *l, bytecode_t* bc) {
@@ -868,7 +868,7 @@ bool condition(lex_t *l, bytecode_t* bc) {
 		return false;
 
 	while (l->tk==LEX_EQUAL || l->tk==LEX_NEQUAL ||
-			l->tk==LEX_TYPEEQUAL || l->tk==LEX_NTYPEEQUAL ||
+			l->tk==LEX_TYPEEQUAL || l->tk==LEX_NTYPEQUAL ||
 			l->tk==LEX_LEQUAL || l->tk==LEX_GEQUAL ||
 			l->tk==LEX_R_INSTANCEOF ||
 			l->tk=='<' || l->tk=='>') {
@@ -886,7 +886,7 @@ bool condition(lex_t *l, bytecode_t* bc) {
 		else if(op == LEX_TYPEEQUAL) {
 			bc_gen(bc, INSTR_TEQ);
 		}
-		else if(op == LEX_NTYPEEQUAL) {
+		else if(op == LEX_NTYPEQUAL) {
 			bc_gen(bc, INSTR_NTEQ);
 		}
 		else if(op == LEX_LEQUAL) {
@@ -906,7 +906,7 @@ bool condition(lex_t *l, bytecode_t* bc) {
 		}
 	}
 
-	return true;	
+	return true; 
 }
 
 bool logic(lex_t* l, bytecode_t* bc) {
@@ -935,7 +935,7 @@ bool logic(lex_t* l, bytecode_t* bc) {
 			bc_gen(bc, INSTR_XOR);
 		}
 	}
-	return true;	
+	return true; 
 }
 
 
@@ -953,7 +953,7 @@ bool ternary(lex_t *l, bytecode_t* bc) {
 		base(l, bc); //second choice
 		bc_set_instr(bc, pc2, INSTR_JMP, ILLEGAL_PC);
 	} 
-	return true;	
+	return true; 
 }
 
 bool base(lex_t* l, bytecode_t* bc) {
@@ -961,11 +961,11 @@ bool base(lex_t* l, bytecode_t* bc) {
 		return false;
 
 	if (l->tk=='=' || 
-			l->tk==LEX_PLUSEQUAL ||
-			l->tk==LEX_MULTIEQUAL ||
-			l->tk==LEX_DIVEQUAL ||
-			l->tk==LEX_MODEQUAL ||
-			l->tk==LEX_MINUSEQUAL) {
+		l->tk==LEX_PLUSEQUAL ||
+		l->tk==LEX_MULTIEQUAL ||
+		l->tk==LEX_DIVEQUAL ||
+		l->tk==LEX_MODEQUAL ||
+		l->tk==LEX_MINUSEQUAL) {
 		LEX_TYPES op = (LEX_TYPES)l->tk;
 		if(!lex_chkread(l, l->tk)) return false;
 		base(l, bc);
@@ -1082,38 +1082,180 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 	PC pc = bc_gen(bc, INSTR_LOOP);
 	bc_add_instr(bc, pc, INSTR_JMP, pc+3); //jmp to init.
 	PC pc_condition = bc_reserve(bc); //jump to condition (for continue anchor);
-	PC pc_break = bc_reserve(bc); //jump out of loop (for break anchor);
+	PC pc_break = bc_reserve(bc); //jump out of loop if not condition.
 
 	if(!lex_chkread(l, '(')) return false;
-	if(!statement(l, bc)) //init statement
-		return false;
+	
+	// Check if it's a for-in loop
+	bool is_for_in = false;
+	mstr_t* loop_var = NULL;
+	opr_code_t var_op = INSTR_VAR;
+	
+	// Handle variable declaration for for-in loop specially
+	if(l->tk == LEX_R_VAR || l->tk == LEX_R_SAFE_VAR || l->tk == LEX_R_CONST) {
+		// Save the variable declaration type
+		if(l->tk == LEX_R_VAR) {
+			var_op = INSTR_VAR;
+		} else if(l->tk == LEX_R_SAFE_VAR) {
+			var_op = INSTR_SAFE_VAR;
+		} else {
+			var_op = INSTR_CONST;
+		}
+		
+		// Consume the var/let/const keyword
+		lex_chkread(l, l->tk);
+		lex_skip_empty(l);
+		
+		// Read the variable name
+		if(l->tk != LEX_ID) return false;
+		loop_var = mstr_new(l->tk_str->cstr);
+		lex_chkread(l, LEX_ID);
+		lex_skip_empty(l);
+		
+		// Check if the next token is "in" (for-in loop)
+		if(l->tk == LEX_ID && strcmp(l->tk_str->cstr, "in") == 0) {
+			is_for_in = true;
+			lex_chkread(l, LEX_ID); // consume "in"
+			lex_skip_empty(l);
+		} else {
+			// Standard for loop variable initialization
+			// Generate variable declaration bytecode
+			if(loop_var) {
+				bc_gen_str(bc, var_op, loop_var->cstr);
+			}
+			if(l->tk == '=') {
+				lex_chkread(l, '=');
+				bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+				if(!base(l, bc)) return false;
+				bc_gen(bc, INSTR_ASIGN);
+				bc_gen(bc, INSTR_POP);
+			}
+			if(l->tk != ';') return false;
+			lex_chkread(l, ';');
+			lex_skip_empty(l);
+		}
+	} else {
+		// Standard for loop init statement
+		if(!statement(l, bc)) return false;
+		
+		lex_skip_empty(l);
+		if(l->tk != ';') return false;
+		lex_chkread(l, ';');
+		lex_skip_empty(l);
+	}
+	
+	if(is_for_in) {
+		// For-in loop implementation using INSTR_ARRAY_AT
+		
+		// Store the object in a temporary variable
+		bc_gen_str(bc, INSTR_VAR, "__for_in_obj");
+		
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
+		// Load the object to iterate over
+		if(!base(l, bc)) return false;
+		if(!lex_chkread(l, ')')) return false;
+		
+		// The arr value is already on the stack from the base(l, bc) call above
+		bc_gen(bc, INSTR_ASIGN);
+		bc_gen(bc, INSTR_POP);
+		
+		// Generate variable declaration bytecode for loop variable
+		if(loop_var) {
+			bc_gen_str(bc, var_op, loop_var->cstr);
+		}
+		
+		// Initialize index to 0
+		bc_gen_str(bc, INSTR_VAR, "__for_in_idx");
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
+		bc_gen_str(bc, INSTR_INT, "0");
+		bc_gen(bc, INSTR_ASIGN);
+		bc_gen(bc, INSTR_POP);
+		
+		// Condition: check if the current member is not empty or undefined
+		bc_set_instr(bc, pc_condition, INSTR_JMP, bc->cindex);
+		
+		// Load the object and current index
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
+		
+		// Use INSTR_ARRAY_AT to get the member at current index
+		bc_gen(bc, INSTR_ARRAY_AT);
+		
+		// Check if the member is undefined
+		bc_gen(bc, INSTR_UNDEF);
+		bc_gen(bc, INSTR_NEQ);
+		
+		// Jump out of loop if the member is undefined
+		bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC);
+		
+		// Store the current index in the loop variable
+		if(loop_var) {
+			bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+			bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
+			bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
+			bc_gen(bc, INSTR_NAME_AT);
+			bc_gen(bc, INSTR_ASIGN);
+			bc_gen(bc, INSTR_POP);
+		}
+		
+		// Loop body
+		if(!stmt_loop_block(l, bc)) return false;
+		
+		// Increment index
+		PC pci = bc->cindex;  //iterator anchor;
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
+		bc_gen(bc, INSTR_PPLUS);
+		bc_gen(bc, INSTR_POP);
+		
+		bc_add_instr(bc, pc_condition, INSTR_JMPB, ILLEGAL_PC); //jump to continue anchor;
+		
+		pc = bc_gen(bc, INSTR_LOOP_END);
+		bc_set_instr(bc, pc_break, INSTR_JMP, pc-1); // end anchor;
+		
+		// Clean up temporary variables
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
+		bc_gen(bc, INSTR_POP);
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
+		bc_gen(bc, INSTR_POP);
+		
+		if(loop_var) {
+			mstr_free(loop_var);
+		}
+		
+		return true;
+	} else {
+		// Standard for loop implementation
+		bc_set_instr(bc, pc_condition, INSTR_JMP, bc->cindex);
+		if(!base(l, bc)) //condition
+			return false; 
+		if(!lex_chkread(l, ';')) return false;
+		lex_skip_empty(l);
+		bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC); //jump out of loop if not condition.
+		PC pcl = bc_reserve(bc); //jump to loop .skip the iterrator
 
-	lex_skip_empty(l);
-	bc_set_instr(bc, pc_condition, INSTR_JMP, bc->cindex);
-	if(!base(l, bc)) //condition
-		return false; 
-	if(!lex_chkread(l, ';')) return false;
-	lex_skip_empty(l);
-	bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC); //jump out of loop if not condition.
-	PC pcl = bc_reserve(bc); //jump to loop .skip the iterrator
+		PC pci = bc->cindex;  //iterator anchor;
+		if(!base(l, bc)) //iterator statement
+			return false; 
+		if(!lex_chkread(l, ')')) return false;
+		bc_gen(bc, INSTR_POP); //pop the stack.
 
-	PC pci = bc->cindex;  //iterator anchor;
-	if(!base(l, bc)) //iterator statement
-		return false; 
-	if(!lex_chkread(l, ')')) return false;
-	bc_gen(bc, INSTR_POP); //pop the stack.
+		bc_add_instr(bc, pc_condition, INSTR_JMPB, ILLEGAL_PC); //jump to coninue anchor;
 
-	bc_add_instr(bc, pc_condition, INSTR_JMPB, ILLEGAL_PC); //jump to coninue anchor;
+		bc_set_instr(bc, pcl, INSTR_JMP, ILLEGAL_PC); // loop anchor;
 
-	bc_set_instr(bc, pcl, INSTR_JMP, ILLEGAL_PC); // loop anchor;
+		// Loop body
+		if(!stmt_loop_block(l, bc)) return false;
 
-	//if(!statement(l, bc)) return false; //loop statement
-	if(!stmt_loop_block(l, bc)) return false;
-
-	bc_add_instr(bc, pci, INSTR_JMPB, ILLEGAL_PC); //jump to iterator anchor;
-	pc = bc_gen(bc, INSTR_LOOP_END);
-	bc_set_instr(bc, pc_break, INSTR_JMP, pc-1); // end anchor;
-	return true;
+		bc_add_instr(bc, pci, INSTR_JMPB, ILLEGAL_PC); //jump to iterator anchor;
+		pc = bc_gen(bc, INSTR_LOOP_END);
+		bc_set_instr(bc, pc_break, INSTR_JMP, pc-1); // end anchor;
+		
+		if(loop_var) {
+			mstr_free(loop_var);
+		}
+		
+		return true;
+	}
 }
 
 bool stmt_break(lex_t* l, bytecode_t* bc) {
@@ -1199,12 +1341,10 @@ bool statement(lex_t* l, bytecode_t* bc) {
 	if(l->tk == '\n') {
 		lex_skip_empty(l);
 		pop = false;
-	}
-	else if (l->tk=='{') { /* A block of code */
+	} else if (l->tk=='{') { /* A block of code */
 		if(!stmt_block(l, bc, false)) return false;
 		pop = false;
-	}
-	else if (l->tk == LEX_STR || 
+	} else if (l->tk == LEX_STR || 
 			l->tk == LEX_INT || l->tk == LEX_FLOAT ||
 			l->tk == '[' ||
 			l->tk==LEX_ID ||
@@ -1215,62 +1355,46 @@ bool statement(lex_t* l, bytecode_t* bc) {
 		if(!base(l, bc)) return false;
 		if(is_stmt_end(l->tk))
 			if(!lex_chkread_stmt_end(l)) return false;
-	}
-	else if (l->tk==LEX_R_VAR || l->tk == LEX_R_CONST || l->tk == LEX_R_SAFE_VAR) {
+	} else if (l->tk==LEX_R_VAR || l->tk == LEX_R_CONST || l->tk == LEX_R_SAFE_VAR) {
 		if(!stmt_var(l, bc)) return false; 
 		pop = false;
-	}
-	else if(l->tk == LEX_R_CLASS) {
+	} else if(l->tk == LEX_R_CLASS) {
 		factor_def_class(l, bc);
-	}
-	else if(l->tk == LEX_R_FUNCTION) {
+	} else if(l->tk == LEX_R_FUNCTION) {
 		if(!stmt_function(l, bc)) return false; 
 		pop = false;
-	}
-	else if(l->tk == LEX_R_INCLUDE) {
+	} else if(l->tk == LEX_R_INCLUDE) {
 		if(!stmt_include(l, bc)) return false; 
 		pop = false;
-	}
-	else if (l->tk == LEX_R_RETURN) {
+	} else if (l->tk == LEX_R_RETURN) {
 		if(!stmt_return(l, bc)) return false;
 		pop = false;
-	} 
-	else if (l->tk == LEX_R_IF) {
+	} else if (l->tk == LEX_R_IF) {
 		if(!stmt_if(l, bc)) return false;
 		pop = false;
-	}
-	else if (l->tk == LEX_R_WHILE) {
+	} else if (l->tk == LEX_R_WHILE) {
 		if(!stmt_while(l, bc)) return false;
 		pop = false;
-	}
-	else if (l->tk==LEX_R_FOR) {
+	} else if (l->tk == LEX_R_FOR) {
 		if(!stmt_for(l, bc)) return false;
 		pop = false;
-	}
-	else if(l->tk == LEX_R_BREAK) {
+	} else if (l->tk == LEX_R_BREAK) {
 		if(!stmt_break(l, bc)) return false;
 		pop = false;
-	}
-	else if(l->tk == LEX_R_CONTINUE) {
+	} else if (l->tk == LEX_R_CONTINUE) {
 		if(!stmt_continue(l, bc)) return false;
 		pop = false;
-	}
-	else if(l->tk == LEX_R_TRY) {
-		if(!stmt_try(l, bc)) return false;
-		pop = false;
-	}
-	else if(l->tk == LEX_R_THROW) {
+	} else if (l->tk == LEX_R_THROW) {
 		if(!stmt_throw(l, bc)) return false;
 		pop = false;
-	}
-	else {
-		mario_error("Error: don't understand '%s' ", l->tk_str->cstr);
-		mario_error_pos(l, -1);
-		return false;
+	} else if (l->tk == LEX_R_TRY) {
+		if(!stmt_try(l, bc)) return false;
+		pop = false;
 	}
 
 	if(pop)
 		bc_gen(bc, INSTR_POP);
+
 	return true;
 }
 
@@ -1278,21 +1402,19 @@ bool js_compile(bytecode_t *bc, const char* input) {
 	lex_t lex;
 	lex_init(&lex, input);
 	lex_get_next_token(&lex);
-
-	while(lex.tk) {
-		if(!statement(&lex, bc)) {
-			mario_error("Error: compile failed! '%s' ", lex.tk_str->cstr);
-			mario_error_pos(&lex, -1);
-			lex_release(&lex);
-			return false;
-		}
+	
+	bc_init(bc);
+	
+	bool ret = true;
+	while (lex.tk != LEX_EOF && ret) {
+		ret = statement(&lex, bc);
+		lex_skip_empty(&lex);
 	}
-	bc_gen(bc, INSTR_END);
+	
+	if(ret) {
+		bc_gen(bc, INSTR_END);
+	}
+	
 	lex_release(&lex);
-	return true;
+	return ret;
 }
-
-#ifdef __cplusplus
-}
-#endif /* __cplusplus */
-

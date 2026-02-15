@@ -2,7 +2,18 @@
     "files.associations": {
         "atomic": "c",
         "mutex": "c",
-        "typeinfo": "c"
+        "typeinfo": "c",
+        "__locale": "c",
+        "__node_handle": "c",
+        "sstream": "c",
+        "queue": "c",
+        "stack": "c",
+        "array": "c",
+        "complex": "c",
+        "memory": "c",
+        "istream": "c",
+        "locale": "c",
+        "variant": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }
