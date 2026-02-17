@@ -1158,6 +1158,14 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 		// The arr value is already on the stack from the base(l, bc) call above
 		bc_gen(bc, INSTR_ASIGN);
 		bc_gen(bc, INSTR_POP);
+
+		bc_gen_str(bc, INSTR_VAR, "__for_in_size");
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_size");
+		bc_gen_str(bc, INSTR_LOADO, "__for_in_obj");
+		bc_gen(bc, INSTR_TRUE);
+		bc_gen_str(bc, INSTR_CALLO, "getPropertiesNum$1");
+		bc_gen(bc, INSTR_ASIGN);
+		bc_gen(bc, INSTR_POP);
 		
 		// Generate variable declaration bytecode for loop variable
 		if(loop_var) {
@@ -1167,7 +1175,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 		// Initialize index to 0
 		bc_gen_str(bc, INSTR_VAR, "__for_in_idx");
 		bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
-		bc_gen_str(bc, INSTR_INT, "0");
+		bc_gen_int(bc, INSTR_INT, 0);
 		bc_gen(bc, INSTR_ASIGN);
 		bc_gen(bc, INSTR_POP);
 		
@@ -1175,15 +1183,9 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 		bc_set_instr(bc, pc_condition, INSTR_JMP, bc->cindex);
 		
 		// Load the object and current index
-		bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
 		bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
-		
-		// Use INSTR_ARRAY_AT to get the member at current index
-		bc_gen(bc, INSTR_ARRAY_AT);
-		
-		// Check if the member is undefined
-		bc_gen(bc, INSTR_UNDEF);
-		bc_gen(bc, INSTR_NEQ);
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_size");
+		bc_gen(bc, INSTR_LES);
 		
 		// Jump out of loop if the member is undefined
 		bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC);
@@ -1191,9 +1193,9 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 		// Store the current index in the loop variable
 		if(loop_var) {
 			bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
-			bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
+			bc_gen_str(bc, INSTR_LOADO, "__for_in_obj");
 			bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
-			bc_gen(bc, INSTR_NAME_AT);
+			bc_gen_str(bc, INSTR_CALLO, "getPropertyKey$1");
 			bc_gen(bc, INSTR_ASIGN);
 			bc_gen(bc, INSTR_POP);
 		}
@@ -1211,12 +1213,6 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 		
 		pc = bc_gen(bc, INSTR_LOOP_END);
 		bc_set_instr(bc, pc_break, INSTR_JMP, pc-1); // end anchor;
-		
-		// Clean up temporary variables
-		bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
-		bc_gen(bc, INSTR_POP);
-		bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
-		bc_gen(bc, INSTR_POP);
 		
 		if(loop_var) {
 			mstr_free(loop_var);

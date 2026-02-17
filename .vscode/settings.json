@@ -13,7 +13,14 @@
         "memory": "c",
         "istream": "c",
         "locale": "c",
-        "variant": "c"
+        "variant": "c",
+        "algorithm": "c",
+        "compare": "c",
+        "type_traits": "c",
+        "string": "c",
+        "string_view": "c",
+        "ratio": "c",
+        "ios": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }
