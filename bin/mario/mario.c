@@ -81,6 +81,7 @@ static inline var_t* vm_load_var(vm_t* vm, const char* name, bool create) {
 }
 
 static inline void vm_load_basic_classes(vm_t* vm) {
+	vm->var_Object = vm_load_var(vm, "Object", false);
 	vm->var_String = vm_load_var(vm, "String", false);
 	vm->var_Array = vm_load_var(vm, "Array", false);
 	vm->var_Number = vm_load_var(vm, "Number", false);
