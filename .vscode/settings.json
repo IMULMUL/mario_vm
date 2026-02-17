@@ -20,7 +20,15 @@
         "string": "c",
         "string_view": "c",
         "ratio": "c",
-        "ios": "c"
+        "ios": "c",
+        "bitset": "c",
+        "cstdio": "c",
+        "cstdlib": "c",
+        "cstring": "c",
+        "cwchar": "c",
+        "iterator": "c",
+        "ostream": "c",
+        "streambuf": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

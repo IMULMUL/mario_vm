@@ -13,6 +13,7 @@ var_t* native_Array_constructor(vm_t* vm, var_t* env, void* data) {
     var_t* members = var_new_obj(vm, NULL, NULL);
     node_t* n = var_add(this_v, "_ARRAY_", members);
     n->be_unenumerable = 1;
+	n->invisable = 1;
     return this_v;
 }
     

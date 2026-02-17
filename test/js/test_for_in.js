@@ -1,5 +1,5 @@
 var arr = ["aa", "bb", "cc"];
-for (var key in arr) {
+for (let key in arr) {
     console.log("   " + key + ": " + arr[key]);
 }
 
@@ -12,7 +12,7 @@ for (var key in obj) {
 console.log("\n");
 
 var obj1 = {a: 0, b: 1, c: 2, d: 3};
-for (var key in obj1) {
+for (let key in obj1) {
     console.log("   " + key + ": " + obj1[key]);
 }
 

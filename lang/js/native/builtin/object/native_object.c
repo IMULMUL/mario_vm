@@ -25,7 +25,7 @@ var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
 	var_t* obj = get_obj(env, THIS);
 	const char* name = get_str(env, "name");
 	node_t* n = var_find(obj, name);
-	return var_new_bool(vm, (n != NULL && n->be_inherited == 0));
+	return var_new_bool(vm, (n != NULL && n->be_inherited == 0 && n->invisable == 0));
 }
 
 static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var, bool enumerable) {
@@ -33,7 +33,10 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 	uint32_t i;
 	for(i=0; i<var->children.size; i++) {
 		node_t* node = (node_t*)var->children.items[i];
-		if(node != NULL && node->be_inherited == 0 && node->var != keys_var) {
+		if(node != NULL && 
+				node->be_inherited == 0 &&
+				node->invisable == 0 &&
+				node->var != keys_var) {
 			if(!node->be_unenumerable || !enumerable) {
 				var_array_add(keys_var, var_new_str(vm, node->name));
 				++num;
@@ -58,6 +61,7 @@ var_t* native_Object_getPropertiesNum(vm_t* vm, var_t* env, void* data) {
 	bool enumerable = get_bool(env, "enumerable");
 	node_t* keys_node = var_add(obj, "_property_keys_", var_new_array(vm));
 	keys_node->be_unenumerable = 1;
+	keys_node->invisable = 1;
 	uint32_t num = var_properties_num(vm, obj, keys_node->var, enumerable);	
 	return var_new_int(vm, num);
 }
