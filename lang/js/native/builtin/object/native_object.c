@@ -10,7 +10,7 @@ var_t* native_Object_create(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 	var_t* proto = get_obj(env, "proto");
 	var_t* ret = var_new_obj(vm, NULL, NULL);
-	var_from_prototype(ret, proto);
+	var_set_prototype(ret, proto);
 	return ret;
 }
 

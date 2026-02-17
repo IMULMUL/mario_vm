@@ -725,7 +725,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
 				bc_gen_str(bc, INSTR_GET, name->cstr);
 			}
 			else if (l->tk == '.') {
-				bc_gen_str(bc, INSTR_LOADO, name->cstr);
+				bc_gen_str(bc, INSTR_LOAD, name->cstr);
 			}
 			else if (l->tk == LEX_R_AFUNCTION) {
 				if(!lex_chkread(l, LEX_R_AFUNCTION)) return false;
@@ -1157,7 +1157,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 
 		bc_gen_str(bc, INSTR_VAR, "__for_in_size");
 		bc_gen_str(bc, INSTR_LOAD, "__for_in_size");
-		bc_gen_str(bc, INSTR_LOADO, "__for_in_obj");
+		bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
 		bc_gen(bc, INSTR_TRUE);
 		bc_gen_str(bc, INSTR_CALLO, "getPropertiesNum$1");
 		bc_gen(bc, INSTR_ASIGN);
@@ -1189,7 +1189,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 		// Store the current index in the loop variable
 		if(loop_var) {
 			bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
-			bc_gen_str(bc, INSTR_LOADO, "__for_in_obj");
+			bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
 			bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
 			bc_gen_str(bc, INSTR_CALLO, "getPropertyKey$1");
 			bc_gen(bc, INSTR_ASIGN);
