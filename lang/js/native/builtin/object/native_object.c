@@ -78,6 +78,27 @@ var_t* native_Object_getPropertyKey(vm_t* vm, var_t* env, void* data) {
 	return key;
 }
 
+var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
+	var_t* obj = get_obj(env, "obj");
+	const char* name = get_str(env, "name");
+	var_t* descriptor = get_obj(env, "descriptor");
+	var_t* v = var_find_var(descriptor, "value");
+	node_t* node = var_add(obj, name, v);
+
+	v = var_find_var(descriptor, "writable");
+	if(v != NULL)
+		node->be_const = !var_get_bool(v);
+
+	v = var_find_var(descriptor, "enumerable");
+	if(v != NULL)
+		node->be_unenumerable = !var_get_bool(v);
+
+	v = var_find_var(descriptor, "configurable");
+	if(v != NULL)
+		node->be_const = !var_get_bool(v);
+	return NULL;
+}
+
 #define CLS_OBJECT "Object"
 
 void reg_native_object(vm_t* vm) {
@@ -87,6 +108,7 @@ void reg_native_object(vm_t* vm) {
 	vm_reg_static(vm, cls, "hasOwnProperty(name)", native_Object_hasOwnProperty, NULL); 
 	vm_reg_static(vm, cls, "getPropertiesNum(enumerable)", native_Object_getPropertiesNum, NULL); 
 	vm_reg_static(vm, cls, "getPropertyKey(index)", native_Object_getPropertyKey, NULL); 
+	vm_reg_static(vm, cls, "defineProperty(obj, name, descriptor)", native_Object_defineProperty, NULL); 
 }
 
 #ifdef __cplusplus
