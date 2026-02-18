@@ -76,18 +76,6 @@ var_t* native_Object_keys(vm_t* vm, var_t* env, void* data) {
 	return keys;
 }
 
-var_t* native_Object_getPropertyKey(vm_t* vm, var_t* env, void* data) {
-	(void)data;
-	var_t* obj = get_obj(env, THIS);
-	uint32_t index = get_int(env, "index");
-	if(obj->is_array)
-		return var_new_int(vm, index);
-
-	node_t* keys_node = var_find_own_member(obj, "_property_keys_");
-	var_t* key = var_array_get_var(keys_node->var, index);
-	return key;
-}
-
 var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
 	var_t* obj = get_obj(env, "obj");
 	const char* name = get_str(env, "name");
