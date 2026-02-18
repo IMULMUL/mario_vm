@@ -28,7 +28,13 @@
         "cwchar": "c",
         "iterator": "c",
         "ostream": "c",
-        "streambuf": "c"
+        "streambuf": "c",
+        "native_number.h": "c",
+        "mario.h": "c",
+        "native_date.h": "c",
+        "native_error.h": "c",
+        "__config": "c",
+        "__availability": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

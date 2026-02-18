@@ -11,6 +11,7 @@
 #include "fs/native_fs.h"
 #include "dir/native_dir.h"
 #include "date/native_date.h"
+#include "error/native_error.h"
 //#include "socket/native_socket.h"
 
 #ifdef __cplusplus /* __cplusplus */
@@ -19,6 +20,7 @@ extern "C" {
 
 void reg_basic_natives(vm_t* vm) {
 	reg_native_object(vm);
+	reg_native_error(vm);
 	reg_native_string(vm);
 	reg_native_console(vm);
 	reg_native_number(vm);

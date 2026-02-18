@@ -7,6 +7,7 @@ NATIVE_PATH_BUILTIN = $(MARIO_VM)/lang/$(MARIO_LANG)/native/builtin
 NATIVE_OBJS= $(NATIVE_PATH)/natives.o  \
 	$(NATIVE_PATH_BUILTIN)/native_builtin.o  \
 	$(NATIVE_PATH_BUILTIN)/object/native_object.o  \
+	$(NATIVE_PATH_BUILTIN)/error/native_error.o  \
 	$(NATIVE_PATH_BUILTIN)/number/native_number.o  \
 	$(NATIVE_PATH_BUILTIN)/bytes/native_bytes.o  \
 	$(NATIVE_PATH_BUILTIN)/console/native_console.o \
