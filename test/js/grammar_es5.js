@@ -342,4 +342,26 @@ try {
     console.log("   ✗ null/undefined failed:", e);
 }
 
+// 16. Strict Mode
+console.log("\n16. Strict Mode");
+
+try {
+    // Test 1: Basic strict mode activation
+    "use strict";
+    console.log("   ✓ Strict mode activated successfully");
+} catch (e) {
+    console.log("   ✗ Strict mode activation failed:", e);
+}
+
+try {
+    // Test 2: Variable declaration in strict mode
+    "use strict";
+    strictVar = "test";
+    console.log("   ✗ Variable declaration in strict mode failed!");
+    console.log("   strictVar =", strictVar);
+} catch (e) {
+    console.log("   ✓ Variable declaration in strict mode works, error catched: ", e.message);
+}
+
 console.log("\n=== Test Suite Complete ===");
+
