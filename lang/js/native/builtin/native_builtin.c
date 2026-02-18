@@ -21,10 +21,10 @@ extern "C" {
 void reg_basic_natives(vm_t* vm) {
 	reg_native_object(vm);
 	reg_native_error(vm);
+	reg_native_array(vm);
 	reg_native_string(vm);
 	reg_native_console(vm);
 	reg_native_number(vm);
-	reg_native_array(vm);
 	//reg_native_math(vm);
 	reg_native_json(vm);
 	reg_native_bytes(vm);

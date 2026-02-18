@@ -201,6 +201,13 @@ var_t* native_Array_isArray(vm_t* vm, var_t* env, void* data) {
 	return var_new_bool(vm, obj->is_array);
 }
 
+var_t* native_Array_length(vm_t* vm, var_t* env, void* data) {
+	(void)vm; (void)data;
+	var_t* arr = get_obj(env, THIS);
+	uint32_t sz = var_array_size(arr);
+	return var_new_int(vm, sz);
+}
+
 #define CLS_ARRAY "Array"
 
 void reg_native_array(vm_t* vm) {
@@ -217,6 +224,7 @@ void reg_native_array(vm_t* vm) {
 	vm_reg_native(vm, cls, "unshift()", native_Array_unshift, NULL); 
 	vm_reg_native(vm, cls, "slice(start, end)", native_Array_slice, NULL); 
 	vm_reg_native(vm, cls, "isArray(obj)", native_Array_isArray, NULL); 
+	vm_reg_native(vm, cls, "length()", native_Array_length, NULL); 
 }
 
 #ifdef __cplusplus
