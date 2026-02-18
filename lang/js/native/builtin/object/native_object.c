@@ -67,18 +67,13 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 	return num;
 }
 
-var_t* native_Object_getPropertiesNum(vm_t* vm, var_t* env, void* data) {
+var_t* native_Object_keys(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_obj(env, THIS);
-	if(obj->is_array)
-		return var_new_int(vm, var_array_size(obj));
 
-	bool enumerable = get_bool(env, "enumerable");
-	node_t* keys_node = var_add(obj, "_property_keys_", var_new_array(vm));
-	keys_node->be_unenumerable = 1;
-	keys_node->invisable = 1;
-	uint32_t num = var_properties_num(vm, obj, keys_node->var, enumerable);	
-	return var_new_int(vm, num);
+	var_t* keys = var_new_array(vm);
+	uint32_t num = var_properties_num(vm, obj, keys, true);	
+	return keys;
 }
 
 var_t* native_Object_getPropertyKey(vm_t* vm, var_t* env, void* data) {
@@ -121,8 +116,7 @@ void reg_native_object(vm_t* vm) {
 	vm_reg_static(vm, cls, "create(proto)", native_Object_create, NULL); 
 	vm_reg_static(vm, cls, "getPrototypeOf(obj)", native_Object_getPrototypeOf, NULL); 
 	vm_reg_static(vm, cls, "hasOwnProperty(name)", native_Object_hasOwnProperty, NULL); 
-	vm_reg_static(vm, cls, "getPropertiesNum(enumerable)", native_Object_getPropertiesNum, NULL); 
-	vm_reg_static(vm, cls, "getPropertyKey(index)", native_Object_getPropertyKey, NULL); 
+	vm_reg_static(vm, cls, "keys()", native_Object_keys, NULL); 
 	vm_reg_static(vm, cls, "defineProperty(obj, name, descriptor)", native_Object_defineProperty, NULL); 
 }
 
