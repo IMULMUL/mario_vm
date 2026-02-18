@@ -10,7 +10,7 @@ var_t* native_Array_constructor(vm_t* vm, var_t* env, void* data) {
     (void)vm; (void)data;
     var_t* this_v = get_obj(env, THIS);
     this_v->is_array = 1;
-    var_t* members = var_new_obj(vm, NULL, NULL);
+    var_t* members = var_new_obj_no_proto(vm, NULL, NULL);
     node_t* n = var_add(this_v, "_ARRAY_", members);
     n->be_unenumerable = 1;
 	n->invisable = 1;
@@ -195,6 +195,12 @@ var_t* native_Array_slice(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+var_t* native_Array_isArray(vm_t* vm, var_t* env, void* data) {
+	(void)vm; (void)data;
+	var_t* obj = get_obj(env, "obj");
+	return var_new_bool(vm, obj->is_array);
+}
+
 #define CLS_ARRAY "Array"
 
 void reg_native_array(vm_t* vm) {
@@ -210,6 +216,7 @@ void reg_native_array(vm_t* vm) {
 	vm_reg_native(vm, cls, "shift()", native_Array_shift, NULL); 
 	vm_reg_native(vm, cls, "unshift()", native_Array_unshift, NULL); 
 	vm_reg_native(vm, cls, "slice(start, end)", native_Array_slice, NULL); 
+	vm_reg_native(vm, cls, "isArray(obj)", native_Array_isArray, NULL); 
 }
 
 #ifdef __cplusplus

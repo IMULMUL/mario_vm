@@ -51,7 +51,7 @@ var_t* native_UTF8Constructor(vm_t* vm, var_t* env, void* data) {
 	const char* s = get_str(env, "str");
 	utf8_t* u = utf8_new(s);
 
-	var_t* thisV = var_new_obj(vm, u, (free_func_t)utf8_free);
+	var_t* thisV = var_new_obj_no_proto(vm, u, (free_func_t)utf8_free);
 	var_instance_from(thisV, get_obj(env, THIS));
 	return thisV;
 }
@@ -116,7 +116,7 @@ var_t* native_UTF8Substr(vm_t* vm, var_t* env, void* data) {
 			utf8_append(sub, s->cstr);	
 		}
 	}
-	var_t* ret = var_new_obj(vm, sub, (free_func_t)utf8_free);
+	var_t* ret = var_new_obj_no_proto(vm, sub, (free_func_t)utf8_free);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
 }
@@ -127,7 +127,7 @@ var_t* native_UTF8ReaderConstructor(vm_t* vm, var_t* env, void* data) {
 	utf8_reader_t* ur = (utf8_reader_t*)_malloc(sizeof(utf8_reader_t));
 	utf8_reader_init(ur, s, 0);
 
-	var_t* thisV = var_new_obj(vm, ur, NULL);
+	var_t* thisV = var_new_obj_no_proto(vm, ur, NULL);
 	var_instance_from(thisV, get_obj(env, THIS));
 	return thisV;
 }
