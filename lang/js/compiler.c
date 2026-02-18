@@ -1325,6 +1325,21 @@ bool stmt_try(lex_t* l, bytecode_t* bc) {
 	return true;
 }
 
+bool stmt_strict(lex_t* l, bytecode_t* bc) {
+	if(l->tk != LEX_STR)
+		return false;
+
+	const char* s = l->tk_str->cstr;
+	if(strcmp(s, "use strict") != 0) {
+		return false;
+	}
+
+	if(!lex_chkread(l, LEX_STR)) return false;
+	if(!lex_chkread_stmt_end(l)) return false;
+	bc_gen(bc, INSTR_STRICT);
+	return true;
+}
+
 bool statement(lex_t* l, bytecode_t* bc) {
 	bool pop = true;
 
@@ -1341,10 +1356,15 @@ bool statement(lex_t* l, bytecode_t* bc) {
 			l->tk==LEX_PLUSPLUS ||
 			l->tk==LEX_MINUSMINUS ||
 			l->tk=='-') {
-		/* Execute a simple statement that only contains basic arithmetic... */
-		if(!base(l, bc)) return false;
-		if(is_stmt_end(l->tk))
-			if(!lex_chkread_stmt_end(l)) return false;
+		if(stmt_strict(l, bc)) {
+			pop = false;
+		}
+		else {
+			/* Execute a simple statement that only contains basic arithmetic... */
+			if(!base(l, bc)) return false;
+			if(is_stmt_end(l->tk))
+				if(!lex_chkread_stmt_end(l)) return false;
+		}
 	} else if (l->tk==LEX_R_VAR || l->tk == LEX_R_CONST || l->tk == LEX_R_SAFE_VAR) {
 		if(!stmt_var(l, bc)) return false; 
 		pop = false;

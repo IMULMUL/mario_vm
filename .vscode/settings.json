@@ -34,7 +34,9 @@
         "native_date.h": "c",
         "native_error.h": "c",
         "__config": "c",
-        "__availability": "c"
+        "__availability": "c",
+        "__threading_support": "c",
+        "stdexcept": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }
