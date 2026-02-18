@@ -51,8 +51,7 @@ var_t* native_UTF8Constructor(vm_t* vm, var_t* env, void* data) {
 	const char* s = get_str(env, "str");
 	utf8_t* u = utf8_new(s);
 
-	var_t* thisV = var_new_obj_no_proto(vm, u, (free_func_t)utf8_free);
-	var_instance_from(thisV, get_obj(env, THIS));
+	var_t* thisV = var_new_obj(vm, get_obj(env, THIS), u, (free_func_t)utf8_free);
 	return thisV;
 }
 

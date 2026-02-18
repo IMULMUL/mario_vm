@@ -24,8 +24,21 @@ var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_obj(env, THIS);
 	const char* name = get_str(env, "name");
-	node_t* n = var_find(obj, name);
+	node_t* n = var_find_own_member(obj, name);
 	return var_new_bool(vm, (n != NULL && n->be_inherited == 0 && n->invisable == 0));
+}
+
+static inline bool property_registed(var_t* keys_var, const char* name) {
+	uint32_t i;
+	uint32_t size = var_array_size(keys_var);
+	for(i=0; i<size; i++) {
+		var_t* v = var_array_get_var(keys_var, i);
+		const char* s = var_get_str(v);
+		if(s != NULL && strcmp(s, name) == 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var, bool enumerable) {
@@ -38,8 +51,10 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 				node->invisable == 0 &&
 				node->var != keys_var) {
 			if(!node->be_unenumerable || !enumerable) {
-				var_array_add(keys_var, var_new_str(vm, node->name));
-				++num;
+				if(!property_registed(keys_var, node->name)) {
+					var_array_add(keys_var, var_new_str(vm, node->name));
+					++num;
+				}
 			}
 		}
 	}
@@ -73,7 +88,7 @@ var_t* native_Object_getPropertyKey(vm_t* vm, var_t* env, void* data) {
 	if(obj->is_array)
 		return var_new_int(vm, index);
 
-	node_t* keys_node = var_find(obj, "_property_keys_");
+	node_t* keys_node = var_find_own_member(obj, "_property_keys_");
 	var_t* key = var_array_get_var(keys_node->var, index);
 	return key;
 }
@@ -82,18 +97,18 @@ var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
 	var_t* obj = get_obj(env, "obj");
 	const char* name = get_str(env, "name");
 	var_t* descriptor = get_obj(env, "descriptor");
-	var_t* v = var_find_var(descriptor, "value");
+	var_t* v = var_find_own_member_var(descriptor, "value");
 	node_t* node = var_add(obj, name, v);
 
-	v = var_find_var(descriptor, "writable");
+	v = var_find_own_member_var(descriptor, "writable");
 	if(v != NULL)
 		node->be_const = !var_get_bool(v);
 
-	v = var_find_var(descriptor, "enumerable");
+	v = var_find_own_member_var(descriptor, "enumerable");
 	if(v != NULL)
 		node->be_unenumerable = !var_get_bool(v);
 
-	v = var_find_var(descriptor, "configurable");
+	v = var_find_own_member_var(descriptor, "configurable");
 	if(v != NULL)
 		node->be_const = !var_get_bool(v);
 	return NULL;

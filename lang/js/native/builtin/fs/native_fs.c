@@ -33,7 +33,7 @@ var_t* native_fs_write(vm_t* vm, var_t* env, void* data) {
 
 	int fd = get_int(env, "fd");
 
-	node_t* n = var_find(env, "bytes");
+	node_t* n = var_find_own_member(env, "bytes");
 	if(n == NULL || n->var == NULL || n->var->size == 0)
 		return NULL;
 	var_t* bytes = n->var;
@@ -55,7 +55,7 @@ var_t* native_fs_read(vm_t* vm, var_t* env, void* data) {
 
 	int fd = get_int(env, "fd");
 
-	node_t* n = var_find(env, "bytes");
+	node_t* n = var_find_own_member(env, "bytes");
 	if(n == NULL || n->var == NULL || n->var->size == 0)
 		return NULL;
 	var_t* bytes = n->var;

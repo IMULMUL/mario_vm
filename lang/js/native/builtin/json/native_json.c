@@ -8,7 +8,7 @@ extern "C" {
 var_t* native_json_stringify(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 
-	node_t* n = var_find(env, "var");
+	node_t* n = var_find_own_member(env, "var");
 	mstr_t* s = mstr_new("");
 	if(n != NULL)
 		var_to_json_str(n->var, s, 0);

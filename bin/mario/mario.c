@@ -85,6 +85,7 @@ static inline void vm_load_basic_classes(vm_t* vm) {
 	vm->var_String = vm_load_var(vm, "String", false);
 	vm->var_Array = vm_load_var(vm, "Array", false);
 	vm->var_Number = vm_load_var(vm, "Number", false);
+	vm->var_Error = vm_load_var(vm, "Error", false);
 }
 
 bool js_compile(bytecode_t *bc, const char* input);

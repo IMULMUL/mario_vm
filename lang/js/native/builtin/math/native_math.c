@@ -23,7 +23,7 @@ extern "C" {
 //Math.abs(x) - returns absolute of given value
 var_t* native_math_abs(vm_t* vm, var_t* env, void *data) {
 	(void)vm; (void)data;
-	node_t* n = var_find(env, "a");
+	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL || n->var == NULL)
 		return NULL;
 
@@ -39,7 +39,7 @@ var_t* native_math_abs(vm_t* vm, var_t* env, void *data) {
 //Math.round(a) - returns nearest round of given value
 var_t* native_math_round(vm_t* vm, var_t* env, void *data) {
 	(void)vm; (void)data;
-	node_t* n = var_find(env, "a");
+	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL || n->var == NULL)
 		return NULL;
 
@@ -51,11 +51,11 @@ var_t* native_math_round(vm_t* vm, var_t* env, void *data) {
 //Math.min(a,b) - returns minimum of two given values 
 var_t* native_math_min(vm_t* vm, var_t* env, void *data) {
 	(void)vm; (void)data;
-	node_t* n = var_find(env, "a");
+	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL) return NULL;
 	var_t* varA = n->var;
 
-	n = var_find(env, "b");
+	n = var_find_own_member(env, "b");
 	if(n == NULL) return NULL;
 	var_t* varB = n->var;
 
@@ -70,11 +70,11 @@ var_t* native_math_min(vm_t* vm, var_t* env, void *data) {
 //Math.max(a,b) - returns maximum of two given values  
 var_t* native_math_max(vm_t* vm, var_t* env, void *data) {
 	(void)vm; (void)data;
-	node_t* n = var_find(env, "a");
+	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL) return NULL;
 	var_t* varA = n->var;
 
-	n = var_find(env, "b");
+	n = var_find_own_member(env, "b");
 	if(n == NULL) return NULL;
 	var_t* varB = n->var;
 
@@ -89,15 +89,15 @@ var_t* native_math_max(vm_t* vm, var_t* env, void *data) {
 //Math.range(x,a,b) - returns value limited between two given values  
 var_t* native_math_range(vm_t* vm, var_t* env, void *data) {
 	(void)vm; (void)data;
-	node_t* n = var_find(env, "x");
+	node_t* n = var_find_own_member(env, "x");
 	if(n == NULL) return NULL;
 	var_t* varX = n->var;
 
-	n = var_find(env, "a");
+	n = var_find_own_member(env, "a");
 	if(n == NULL) return NULL;
 	var_t* varA = n->var;
 
-	n = var_find(env, "b");
+	n = var_find_own_member(env, "b");
 	if(n == NULL) return NULL;
 	var_t* varB = n->var;
 
@@ -112,7 +112,7 @@ var_t* native_math_range(vm_t* vm, var_t* env, void *data) {
 //Math.sign(a) - returns sign of given value (-1==negative,0=zero,1=positive)
 var_t* native_math_sign(vm_t* vm, var_t* env, void *data) {
 	(void)vm; (void)data;
-	node_t* n = var_find(env, "a");
+	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL) return NULL;
 	var_t* var = n->var;
 

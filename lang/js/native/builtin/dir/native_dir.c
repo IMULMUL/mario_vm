@@ -43,8 +43,7 @@ var_t* native_dir_open(vm_t* vm, var_t* env, void* data) {
 	if(d == NULL)
 		return NULL;
 	
-	var_t* thisV = var_new_obj_no_proto(vm, d, destroyDir);
-	var_instance_from(thisV, get_obj(env, THIS));
+	var_t* thisV = var_new_obj(vm, get_obj(env, THIS), d, destroyDir);
 	return thisV;
 }
 

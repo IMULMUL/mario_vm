@@ -9,9 +9,8 @@ extern "C" {
 var_t* native_ErrorConstructor(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	const char* s = get_str(env, "str");
-	var_t* thisV = var_new_obj_no_proto(vm, NULL, NULL);
-	var_instance_from(thisV, get_obj(env, THIS));
-	node_t* message = find_member(thisV, "message");
+	var_t* thisV = var_new_obj(vm, get_obj(env, THIS), NULL, NULL);
+	node_t* message = var_find_member(thisV, "message");
 	var_set_str( message->var, s);
 	return thisV;
 }
