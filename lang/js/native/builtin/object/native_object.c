@@ -28,19 +28,6 @@ var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
 	return var_new_bool(vm, (n != NULL && n->be_inherited == 0 && n->invisable == 0));
 }
 
-static inline bool property_registed(var_t* keys_var, const char* name) {
-	uint32_t i;
-	uint32_t size = var_array_size(keys_var);
-	for(i=0; i<size; i++) {
-		var_t* v = var_array_get_var(keys_var, i);
-		const char* s = var_get_str(v);
-		if(s != NULL && strcmp(s, name) == 0) {
-			return true;
-		}
-	}
-	return false;
-}
-
 // Callback function for hash_map_iterate in var_properties_num
 typedef struct {
 	vm_t* vm;
@@ -48,6 +35,7 @@ typedef struct {
 	var_t* keys_var;
 	bool enumerable;
 	uint32_t num;
+	hash_map_t* seen_properties; // 用于快速检查属性是否已经存在的哈希表
 } properties_callback_data;
 
 static void properties_callback(const char* key, void* value, void* user_data) {
@@ -59,7 +47,11 @@ static void properties_callback(const char* key, void* value, void* user_data) {
 		node->invisable == 0 &&
 		node->var != data->keys_var) {
 		if(!node->be_unenumerable || !data->enumerable) {
-			if(!property_registed(data->keys_var, node->name)) {
+			// 使用哈希表快速检查属性是否已经存在
+			if(hash_map_get(data->seen_properties, node->name) == NULL) {
+				// 将属性添加到哈希表中，标记为已存在
+				hash_map_add(data->seen_properties, node->name, (void*)1);
+				// 将属性名称添加到结果数组中
 				var_array_add(data->keys_var, var_new_str(data->vm, node->name));
 				data->num++;
 			}
@@ -70,6 +62,9 @@ static void properties_callback(const char* key, void* value, void* user_data) {
 static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var, bool enumerable) {
 	uint32_t num = 0;
 	
+	// 创建并初始化哈希表，用于快速检查属性是否已经存在
+	hash_map_t* seen_properties = hash_map_new();
+	
 	// Use hash_map_iterate to traverse the properties
 	properties_callback_data data;
 	data.vm = vm;
@@ -77,15 +72,32 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 	data.keys_var = keys_var;
 	data.enumerable = enumerable;
 	data.num = 0;
+	data.seen_properties = seen_properties;
 	
 	hash_map_iterate(&var->children, properties_callback, &data);
 	num += data.num;
 
+	// 处理原型链上的属性
 	var_t* proto = var_get_prototype(var);
 	while(proto != NULL) {
-		num += var_properties_num(vm, proto, keys_var, enumerable);
+		// 递归调用时传递同一个哈希表，确保整个原型链上的属性都不重复
+		properties_callback_data proto_data;
+		proto_data.vm = vm;
+		proto_data.var = proto;
+		proto_data.keys_var = keys_var;
+		proto_data.enumerable = enumerable;
+		proto_data.num = 0;
+		proto_data.seen_properties = seen_properties;
+		
+		hash_map_iterate(&proto->children, properties_callback, &proto_data);
+		num += proto_data.num;
+		
 		proto = var_get_prototype(proto);
 	}
+	
+	// 释放哈希表
+	hash_map_free(seen_properties, NULL, NULL);
+	
 	return num;
 }
 
