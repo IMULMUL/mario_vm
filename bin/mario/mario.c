@@ -122,8 +122,22 @@ int main(int argc, char** argv) {
 			}
 			
 			if(res) {
-				if(_mode == MODE_CMPL) 
-					vm_gen_mbc(vm, _fname_out);
+				if(_mode == MODE_CMPL) {
+					// 如果没有指定输出文件名，默认使用输入文件名（将 .js 改为 .mbc）
+					const char* output_name = _fname_out;
+					char auto_output[256] = {0};
+					if(output_name[0] == 0) {
+						const char* js_ext = strstr(_fname, ".js");
+						if(js_ext) {
+							// 复制输入文件名到 auto_output，替换 .js 为 .mbc
+							size_t ext_pos = js_ext - _fname;
+							strncpy(auto_output, _fname, ext_pos);
+							strcat(auto_output, ".mbc");
+							output_name = auto_output;
+						}
+					}
+					vm_gen_mbc(vm, output_name);
+				}
 				else {
 					if(_dump) {
 						mstr_t* dump = bc_dump(&vm->bc);
@@ -132,13 +146,14 @@ int main(int argc, char** argv) {
 							mstr_free(dump);
 						}
 					}
-					else 
+					else  {
 						vm_run(vm);
+					}
 				}
 			}
 		}
 	}
-	
+
 	vm_close(vm);
 	mem_quit();
 	return 0;
