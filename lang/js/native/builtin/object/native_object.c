@@ -41,23 +41,45 @@ static inline bool property_registed(var_t* keys_var, const char* name) {
 	return false;
 }
 
-static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var, bool enumerable) {
-	uint32_t num = 0;
-	uint32_t i;
-	for(i=0; i<var->children.size; i++) {
-		node_t* node = (node_t*)var->children.items[i];
-		if(node != NULL && 
-				node->be_inherited == 0 &&
-				node->invisable == 0 &&
-				node->var != keys_var) {
-			if(!node->be_unenumerable || !enumerable) {
-				if(!property_registed(keys_var, node->name)) {
-					var_array_add(keys_var, var_new_str(vm, node->name));
-					++num;
-				}
+// Callback function for hash_map_iterate in var_properties_num
+typedef struct {
+	vm_t* vm;
+	var_t* var;
+	var_t* keys_var;
+	bool enumerable;
+	uint32_t num;
+} properties_callback_data;
+
+static void properties_callback(const char* key, void* value, void* user_data) {
+	properties_callback_data* data = (properties_callback_data*)user_data;
+	node_t* node = (node_t*)value;
+	
+	if(node != NULL && 
+		node->be_inherited == 0 &&
+		node->invisable == 0 &&
+		node->var != data->keys_var) {
+		if(!node->be_unenumerable || !data->enumerable) {
+			if(!property_registed(data->keys_var, node->name)) {
+				var_array_add(data->keys_var, var_new_str(data->vm, node->name));
+				data->num++;
 			}
 		}
 	}
+}
+
+static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var, bool enumerable) {
+	uint32_t num = 0;
+	
+	// Use hash_map_iterate to traverse the properties
+	properties_callback_data data;
+	data.vm = vm;
+	data.var = var;
+	data.keys_var = keys_var;
+	data.enumerable = enumerable;
+	data.num = 0;
+	
+	hash_map_iterate(&var->children, properties_callback, &data);
+	num += data.num;
 
 	var_t* proto = var_get_prototype(var);
 	while(proto != NULL) {
