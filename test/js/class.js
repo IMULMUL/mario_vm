@@ -28,6 +28,10 @@ class Base1 extends Base {
 		super.f();
 		console.log("Super Base1");
 	}
+
+	f2() {
+		console.log("Super Base1 f2");
+	}
 }
 
 class Test extends Base1 {
@@ -44,3 +48,7 @@ class Test extends Base1 {
 
 a = new Test(2, 4);
 a.f();
+
+for(var k in a) {
+	console.log("key: " + k + ", member: " + a[k]);
+}
