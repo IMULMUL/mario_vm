@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
 	bool loaded = true;
 
 	mem_init();
-	vm_t* vm = vm_new(js_compile);
+	vm_t* vm = vm_new(js_compile, VAR_CACHE_MAX_DEF, LOAD_NCACHE_MAX_DEF);
 	vm->gc_buffer_size = 1024;
 	init_args(vm, argc, argv);
 
