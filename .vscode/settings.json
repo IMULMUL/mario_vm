@@ -37,7 +37,8 @@
         "__availability": "c",
         "__threading_support": "c",
         "stdexcept": "c",
-        "utility": "c"
+        "utility": "c",
+        "initializer_list": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }
