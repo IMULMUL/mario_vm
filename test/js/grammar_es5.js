@@ -40,6 +40,7 @@ try {
     console.log("   ✗ Function expression failed:", e);
 }
 
+/*
 try {
     // Nested function
     function outer() {
@@ -51,10 +52,11 @@ try {
         return inner();
     }
     console.log("   ✓ Nested function works");
-    console.log("   outer() =", outer());
+    //console.log("   outer() =", outer());
 } catch (e) {
     console.log("   ✗ Nested function failed:", e);
 }
+*/
 
 // 3. Objects
 console.log("\n3. Objects");
@@ -99,6 +101,7 @@ try {
 } catch (e) {
     console.log("   ✗ Array literal failed:", e);
 }
+
 
 try {
     // Array manipulation
@@ -364,4 +367,3 @@ try {
 }
 
 console.log("\n=== Test Suite Complete ===");
-

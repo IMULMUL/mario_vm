@@ -15,7 +15,7 @@ var_t* native_Bytes_constructor(vm_t* vm, var_t* env, void* data) {
 		return thisV;
 
 	if(thisV != NULL) {
-		thisV->value = _malloc(sz+1);
+		thisV->value = mario_malloc(sz+1);
 		memset(thisV->value, 0, sz+1);
 		thisV->size = sz;
 	}
@@ -77,10 +77,10 @@ var_t* native_Bytes_fromString(vm_t* vm, var_t* env, void* data) {
 	if(thisV != NULL) {
 		thisV->size = (uint32_t)strlen(s) + 1;
 		void* p = thisV->value;
-		thisV->value = _malloc(thisV->size);
+		thisV->value = mario_malloc(thisV->size);
 		memcpy(thisV->value, s, thisV->size);
 		if(p != NULL)
-			_free(p);
+			mario_free(p);
 	}
 		
 	return NULL;

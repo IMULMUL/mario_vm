@@ -1,14 +1,22 @@
 #include "js.h"
 #include "mbc.h"
-#include "platform.h"
 #include "bcdump/bcdump.h"
-#include "mem.h"
 
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdio.h>
+
+static void out(const char* str) {
+    write(1, str, strlen(str));
+}
+
+void platform_init(void) {
+	_platform_malloc = malloc;
+	_platform_free = free;
+    _platform_out = out;
+}
 
 /**
 load extra native libs.
@@ -48,9 +56,6 @@ static int doargs(int argc, char* argv[]) {
 		switch (c) {
 		case 'c':
 			_mode = MODE_CMPL;
-			break;
-		case 'd':
-			_m_debug = true;
 			break;
 		case 'a':
 			_dump = true;
@@ -103,7 +108,7 @@ int main(int argc, char** argv) {
 
 	bool loaded = true;
 
-	mem_init();
+	mario_mem_init();
 	vm_t* vm = vm_new(js_compile, VAR_CACHE_MAX_DEF, LOAD_NCACHE_MAX_DEF);
 	vm->gc.gc_trig_var_num = 1024;
 	init_args(vm, argc, argv);
@@ -142,7 +147,7 @@ int main(int argc, char** argv) {
 					if(_dump) {
 						mstr_t* dump = bc_dump(&vm->bc);
 						if(dump != NULL) {
-							_out_func(dump->cstr);
+							_platform_out(dump->cstr);
 							mstr_free(dump);
 						}
 					}
@@ -155,6 +160,6 @@ int main(int argc, char** argv) {
 	}
 
 	vm_close(vm);
-	mem_quit();
+	mario_mem_quit();
 	return 0;
 }

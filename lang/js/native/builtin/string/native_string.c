@@ -423,7 +423,7 @@ var_t* native_UTF8Substr(vm_t* vm, var_t* env, void* data) {
 var_t* native_UTF8ReaderConstructor(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 	const char* s = get_str(env, "str");
-	utf8_reader_t* ur = (utf8_reader_t*)_malloc(sizeof(utf8_reader_t));
+	utf8_reader_t* ur = (utf8_reader_t*)mario_malloc(sizeof(utf8_reader_t));
 	utf8_reader_init(ur, s, 0);
 
 	var_t* thisV = var_new_obj_no_proto(vm, ur, NULL);

@@ -4,10 +4,9 @@ function f() {
 	this.name = "xx";
 }
 
-a = new f();
+var a = new f();
 console.log(a);
 
-/**/
 class Base {
 	constructor() {
 		this.b = 1;

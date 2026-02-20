@@ -10,11 +10,9 @@ endif
 include $(MARIO_VM)/lang/js/lang.mk
 
 mario_OBJS = $(MARIO_VM)/mario/mario.o $(MARIO_VM)/mario/bcdump/bcdump.o
-platform_OBJS = $(MARIO_VM)/platform/platform.o \
-		$(MARIO_VM)/platform/mem.o
 mvm_OBJS = bin/mario/mario.o bin/lib/mbc.o bin/lib/js.o 
 
-MARIO_OBJS = $(mario_OBJS) $(mvm_OBJS) $(lang_OBJS) $(platform_OBJS) \
+MARIO_OBJS = $(mario_OBJS) $(mvm_OBJS) $(lang_OBJS) \
 		$(NATIVE_OBJS)
 
 ifeq ($(MARIO_DEBUG),yes)

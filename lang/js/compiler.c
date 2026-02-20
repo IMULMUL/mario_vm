@@ -331,7 +331,7 @@ void mario_error_pos(lex_t* l, int pos) {
 	int col;
 
 	lex_get_pos(l, &line, &col, pos);
-	mario_error("(line: %d, col: %d)\n",  line, col);
+	mario_printf("(line: %d, col: %d)\n",  line, col);
 }
 
 bool lex_chkread(lex_t* lex, uint32_t expected_tk);
@@ -1427,8 +1427,6 @@ bool js_compile(bytecode_t *bc, const char* input) {
 	lex_t lex;
 	lex_init(&lex, input);
 	lex_get_next_token(&lex);
-	
-	bc_init(bc);
 	
 	bool ret = true;
 	while (lex.tk != LEX_EOF && ret) {

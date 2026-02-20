@@ -1,5 +1,5 @@
-#ifndef MARIO_ERROR
-#define MARIO_ERROR
+#ifndef mario_error
+#define mario_error
 
 #include "mario.h"
 

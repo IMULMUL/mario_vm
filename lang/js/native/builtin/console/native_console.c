@@ -27,7 +27,7 @@ var_t* native_print(vm_t* vm, var_t* env, void* data) {
 
 	var_t* v = get_func_args(env); 
 	mstr_t* ret = args_to_str(v);
-	_out_func(ret->cstr);
+	_platform_out(ret->cstr);
 	mstr_free(ret);
 	return NULL;
 }
@@ -38,7 +38,7 @@ var_t* native_println(vm_t* vm, var_t* env, void* data) {
 	var_t* v = get_func_args(env); 
 	mstr_t* ret = args_to_str(v);
 	mstr_add(ret, '\n');
-	_out_func(ret->cstr);
+	_platform_out(ret->cstr);
 	mstr_free(ret);
 	return NULL;
 }
