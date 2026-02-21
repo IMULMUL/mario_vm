@@ -1,8 +1,7 @@
 function f( ) {
 	let x = "closure test: ";
-	let y = 0;
-
 	function f2() {
+		let y = 0;
 		function f1() {
 			console.log(x + y);
 			y++;
@@ -10,11 +9,12 @@ function f( ) {
 		}
 		return f1;
 	}
-	return f2();
+	return f2;
 }
 
-var fc = f();
+var f2 = f();
+var f1 = f2();
 while(true) {
-	if(fc() >= 10)
+	if(f1() >= 10)
 		break;
 }
