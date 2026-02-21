@@ -13,8 +13,8 @@ function f( ) {
 	return f2();
 }
 
-fc = f();
+var fc = f();
 while(true) {
-	if(fc() >= 10000)
+	if(fc() >= 10)
 		break;
 }
