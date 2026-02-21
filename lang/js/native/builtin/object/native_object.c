@@ -50,7 +50,7 @@ static void properties_callback(const char* key, void* value, void* user_data) {
 			// 使用哈希表快速检查属性是否已经存在
 			if(hash_map_get(data->seen_properties, node->name) == NULL) {
 				// 将属性添加到哈希表中，标记为已存在
-				hash_map_add(data->seen_properties, node->name, (void*)NULL);
+				hash_map_add(data->seen_properties, node->name, (void*)"");
 				// 将属性名称添加到结果数组中
 				var_array_add(data->keys_var, var_new_str(data->vm, node->name));
 				data->num++;
