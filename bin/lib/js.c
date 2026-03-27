@@ -64,18 +64,28 @@ static mstr_t* include_script(vm_t* vm, const char* name) {
 	return ret;
 }
 
+static mstr_t* _script = NULL;
 bool load_js(vm_t* vm, const char* fname) {
 	_load_m_func = include_script;
 
-	mstr_t* s = load_script_content(fname);
-	if(s == NULL) {
-		printf("Can not open file '%s'\n", fname);
+	if(_script != NULL)
+		mstr_free(_script);
+	
+	_script = load_script_content(fname);
+	if(_script == NULL) {
 		return false;
 	}
 	
-	bool ret = vm_load(vm, s->cstr);
-	mstr_free(s);
+	bool ret = vm_load(vm, _script->cstr);
 	return ret;
+}
+
+void quit_js(vm_t* vm) {
+	vm_close(vm);
+	if(_script != NULL) {
+		mstr_free(_script);
+		_script = NULL;
+	}
 }
 
 #ifdef __cplusplus

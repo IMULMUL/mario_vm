@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 bool load_js(vm_t* vm, const char* fname);
+void quit_js(vm_t* vm);
 
 #ifdef __cplusplus
 }
