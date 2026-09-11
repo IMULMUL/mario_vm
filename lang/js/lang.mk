@@ -12,6 +12,10 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH_BUILTIN)/Object/native_Object.o  \
 	$(NATIVES_PATH_BUILTIN)/Error/native_Error.o  \
 	$(NATIVES_PATH_BUILTIN)/Number/native_Number.o  \
+	$(NATIVES_PATH_BUILTIN)/BigInt/native_BigInt.o  \
+	$(NATIVES_PATH_BUILTIN)/ArrayBuffer/native_ArrayBuffer.o  \
+	$(NATIVES_PATH_BUILTIN)/DataView/native_DataView.o  \
+	$(NATIVES_PATH_BUILTIN)/TypedArray/native_TypedArray.o  \
 	$(NATIVES_PATH_BUILTIN)/Console/native_Console.o \
 	$(NATIVES_PATH_BUILTIN)/String/native_String.o \
 	$(NATIVES_PATH_BUILTIN)/Array/native_Array.o \

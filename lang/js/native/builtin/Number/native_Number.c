@@ -21,6 +21,7 @@ var_t* native_Number_constructor(vm_t* vm, var_t* env, void* data) {
 			case V_INT64:   this_v = var_new_int64(vm, var_get_int64(v)); break;
 			case V_FLOAT:   this_v = var_new_float(vm, var_get_float(v)); break;
 			case V_FLOAT64: this_v = var_new_float64(vm, var_get_float64(v)); break;
+			case V_BIGINT:  this_v = var_new_float64(vm, var_get_float64(v)); break; // Number(bigint) -> nearest double
 			default: break;
 		}
 	}

@@ -74,6 +74,8 @@ typedef enum {
     LEX_R_INSTANCEOF,
     LEX_R_ASYNC,
     LEX_R_AWAIT,
+    LEX_R_DELETE,     // `delete` unary operator
+    LEX_R_IN,         // `in` relational operator (and for-in separator)
     LEX_R_LIST_END /* always the last entry */
 } LEX_TYPES;
 
@@ -303,6 +305,10 @@ void lex_get_reserved_word(lex_t* lex) {
         lex->tk = LEX_R_ASYNC;
     } else if (strcmp(lex->tk_str->cstr, "await") == 0) {
         lex->tk = LEX_R_AWAIT;
+    } else if (strcmp(lex->tk_str->cstr, "delete") == 0) {
+        lex->tk = LEX_R_DELETE;
+    } else if (strcmp(lex->tk_str->cstr, "in") == 0) {
+        lex->tk = LEX_R_IN;
     }
 }
 
@@ -355,6 +361,8 @@ const char* lex_get_token_str(int token, char* str) {
             return "FLOAT";
         case LEX_STR:
             return "STRING";
+        case LEX_BIGINT:
+            return "BIGINT";
         case LEX_EQUAL:
             return "==";
         case LEX_TYPEEQUAL:
@@ -444,6 +452,10 @@ const char* lex_get_token_str(int token, char* str) {
             return "new";
         case LEX_R_INCLUDE:
             return "include";
+        case LEX_R_DELETE:
+            return "delete";
+        case LEX_R_IN:
+            return "in";
     }
     return "?[UNKNOW]";
 }
@@ -1357,6 +1369,16 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
                 mstr_free(id);
                 return false;
             }
+        } else if (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END) {
+            /* A reserved word used as an object-literal key: {in:1}, {delete:1},
+             * {new:1}, {if:1}. JS permits keywords as property names; `id`
+             * already captured the word text from tk_str above, so just consume
+             * the token exactly like an identifier. */
+            int tk = l->tk;
+            if (!lex_chkread(l, tk)) {
+                mstr_free(id);
+                return false;
+            }
         } else {
             mstr_free(id);
             return false;
@@ -1882,6 +1904,13 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         if (!lex_chkread(l, LEX_FLOAT)) {
             return false;
         }
+    } else if (l->tk == LEX_BIGINT) {
+        /* BigInt literal: pool the digit string (with any 0x/0b/0o prefix) as the
+         * INSTR_BIGINT payload; handle_bigint parses it into a bignum at run time. */
+        bc_gen_str(bc, INSTR_BIGINT, l->tk_str->cstr);
+        if (!lex_chkread(l, LEX_BIGINT)) {
+            return false;
+        }
     } else if (l->tk == LEX_STR) {
         bc_gen_str(bc, INSTR_STR, l->tk_str->cstr);
         if (!lex_chkread(l, LEX_STR)) {
@@ -2085,6 +2114,37 @@ bool unary(lex_t* l, bytecode_t* bc) {
         bc_gen_str(bc, INSTR_CALL, "__await$1");
         return true;
     }
+    /* ES `delete ref`: compile the operand, then RETARGET its final reference
+     * instruction to the matching delete opcode (member `.x` -> DELETE,
+     * computed `[k]` -> DELETE_AT, bare name -> DELETE_VAR). Each retarget keeps
+     * the operand instruction's stack arity, so the result is one bool on the
+     * stack. Deleting a non-reference (a literal, or a call/paren result) is a
+     * no-op that yields true: drop the value and push true. */
+    if (l->tk == LEX_R_DELETE) {
+        if (!lex_chkread(l, LEX_R_DELETE)) {
+            return false;
+        }
+        if (!factor(l, bc, false)) {
+            return false;
+        }
+        if (bc->cindex > 0) {
+            PC last = bc->code_buf[bc->cindex - 1];
+            opr_code_t op = OP(last);
+            if (op == INSTR_GET) {
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_DELETE, OFF(last));
+                return true;
+            } else if (op == INSTR_ARRAY_AT) {
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_DELETE_AT, OFF(last));
+                return true;
+            } else if (op == INSTR_LOAD) {
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_DELETE_VAR, OFF(last));
+                return true;
+            }
+        }
+        bc_gen(bc, INSTR_POP);
+        bc_gen(bc, INSTR_TRUE);
+        return true;
+    }
     opr_code_t instr = INSTR_END;
     if (l->tk == '!') {
         if (!lex_chkread(l, '!')) {
@@ -2185,8 +2245,19 @@ bool expr(lex_t* l, bytecode_t* bc) {
     if (pre == '-') {
         bc_gen(bc, INSTR_NEG);
     } else if (pre == LEX_PLUSPLUS) {
+        /* A prefix `++a[i]` / `--a[i]` steps through the binding node: retarget a
+         * subscript operand to the write-variant so a TypedArray element yields a
+         * synthetic @@taslot target (normal arrays are unaffected). */
+        if (bc->cindex > 0 && OP(bc->code_buf[bc->cindex - 1]) == INSTR_ARRAY_AT) {
+            PC last = bc->code_buf[bc->cindex - 1];
+            bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+        }
         bc_gen(bc, INSTR_PPLUS_PRE);
     } else if (pre == LEX_MINUSMINUS) {
+        if (bc->cindex > 0 && OP(bc->code_buf[bc->cindex - 1]) == INSTR_ARRAY_AT) {
+            PC last = bc->code_buf[bc->cindex - 1];
+            bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+        }
         bc_gen(bc, INSTR_MMINUS_PRE);
     }
 
@@ -2197,8 +2268,17 @@ bool expr(lex_t* l, bytecode_t* bc) {
             return false;
         }
         if (op == LEX_PLUSPLUS) {
+            /* Postfix `a[i]++`: same subscript retarget as the prefix form. */
+            if (bc->cindex > 0 && OP(bc->code_buf[bc->cindex - 1]) == INSTR_ARRAY_AT) {
+                PC last = bc->code_buf[bc->cindex - 1];
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+            }
             bc_gen(bc, INSTR_PPLUS);
         } else if (op == LEX_MINUSMINUS) {
+            if (bc->cindex > 0 && OP(bc->code_buf[bc->cindex - 1]) == INSTR_ARRAY_AT) {
+                PC last = bc->code_buf[bc->cindex - 1];
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+            }
             bc_gen(bc, INSTR_MMINUS);
         } else {
             if (!term(l, bc)) {
@@ -2248,7 +2328,7 @@ bool condition(lex_t* l, bytecode_t* bc) {
     while (l->tk == LEX_EQUAL || l->tk == LEX_NEQUAL ||
            l->tk == LEX_TYPEEQUAL || l->tk == LEX_NTYPEQUAL ||
            l->tk == LEX_LEQUAL || l->tk == LEX_GEQUAL ||
-           l->tk == LEX_R_INSTANCEOF ||
+           l->tk == LEX_R_INSTANCEOF || l->tk == LEX_R_IN ||
            l->tk == '<' || l->tk == '>') {
         int op = l->tk;
         if (!lex_chkread(l, l->tk)) {
@@ -2272,6 +2352,8 @@ bool condition(lex_t* l, bytecode_t* bc) {
             bc_gen(bc, INSTR_GEQ);
         } else if (op == LEX_R_INSTANCEOF) {
             bc_gen(bc, INSTR_INSTOF);
+        } else if (op == LEX_R_IN) {
+            bc_gen(bc, INSTR_IN);
         } else if (op == '>') {
             bc_gen(bc, INSTR_GRT);
         } else if (op == '<') {
@@ -2375,11 +2457,17 @@ bool base(lex_t* l, bytecode_t* bc) {
         /* For a plain assignment whose target ended with a member fetch (`.`),
          * retarget that fetch to the write-variant so a runtime setter is
          * invoked. This must run before the RHS is compiled, since the RHS
-         * appends instructions after the target's final INSTR_GET. */
-        if (op == '=' && bc->cindex > 0) {
+         * appends instructions after the target's final INSTR_GET.
+         * Likewise a subscript target (`a[i] op= ..`) retargets INSTR_ARRAY_AT to
+         * the write-variant INSTR_ARRAY_AT_W for EVERY assignment op: normal
+         * arrays behave identically (the W handler delegates to the same push),
+         * while a TypedArray receiver yields a synthetic @@taslot write target. */
+        if (bc->cindex > 0) {
             PC last = bc->code_buf[bc->cindex - 1];
-            if (OP(last) == INSTR_GET) {
+            if (op == '=' && OP(last) == INSTR_GET) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
+            } else if (OP(last) == INSTR_ARRAY_AT) {
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
             }
         }
         if (!base(l, bc)) {
@@ -3098,10 +3186,11 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             lex_skip_empty(l);
         }
         
-        // Check if the next token is "in" (for-in loop)
-        if (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "in") == 0) {
+        // Check if the next token is "in" (for-in loop). `in` is lexed as the
+        // reserved word LEX_R_IN (it is also the binary `in` operator).
+        if (l->tk == LEX_R_IN) {
             is_for_in = true;
-            lex_chkread(l, LEX_ID); // consume "in"
+            lex_chkread(l, LEX_R_IN); // consume "in"
             lex_skip_empty(l);
         } else if (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "of") == 0) {
             is_for_of = true;
@@ -3456,12 +3545,13 @@ bool statement(lex_t* l, bytecode_t* bc) {
         }
     } else if (l->tk == LEX_STR || 
                l->tk == LEX_INT || l->tk == LEX_FLOAT ||
+               l->tk == LEX_BIGINT ||
                l->tk == '`' ||
                l->tk == LEX_ID ||
                l->tk == LEX_PLUSPLUS ||
                l->tk == LEX_MINUSMINUS ||
                l->tk == '(' || l->tk == '!' || l->tk == LEX_R_NEW ||
-               l->tk == LEX_R_AWAIT ||
+               l->tk == LEX_R_AWAIT || l->tk == LEX_R_DELETE ||
                l->tk == '-') {
         if (!stmt_strict(l, bc)) {
             /* Execute a simple statement that only contains basic arithmetic... */

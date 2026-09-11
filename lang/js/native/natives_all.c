@@ -14,6 +14,7 @@ static inline void load_basic_classes(vm_t* vm) {
 	vm->builtin_vars.var_Object = vm_load_var(vm, "Object", false);
 	vm->builtin_vars.var_String = vm_load_var(vm, "String", false);
 	vm->builtin_vars.var_Number = vm_load_var(vm, "Number", false);
+	vm->builtin_vars.var_BigInt = vm_load_var(vm, "BigInt", false);
 	vm->builtin_vars.var_Error = vm_load_var(vm, "Error", false);
 	vm->builtin_vars.var_Array = vm_load_var(vm, "Array", false);
 

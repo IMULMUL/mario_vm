@@ -49,14 +49,18 @@
 //       MAX_VALUE/MIN_VALUE) && logical `&&`/`||` operand-return semantics
 //   32. 64-bit numbers (exact large integer literals & arithmetic, int64/double
 //       promotion, double precision, Number.MAX_SAFE_INTEGER/MAX_VALUE)
+//   33. BigInt (arbitrary-precision literals/arithmetic/comparison/bitwise,
+//       toString radix, BigInt()/Number() conversion, asIntN/asUintN)
+//   34. ArrayBuffer & DataView (byteLength, zero-init, isView, offset views,
+//       every get/set width + endianness, shared backing, slice, BigInt64/BigUint64)
+//   35. TypedArrays (Int8..BigUint64: length/array/typedarray/buffer ctors,
+//       from/of, wrapping & clamping writes, subarray/slice/set/fill/reverse/
+//       copyWithin/sort/indexOf/includes/find/every/some/forEach/map/filter/
+//       reduce/reduceRight/at/join/toString/values/keys/entries/@@iterator)
 //
 // Deliberately EXCLUDED (each would need a subsystem this minimal engine lacks):
 //   - RegExp: no /pattern/ literals, no regex-based match/split/replace.
 //   - Proxy / Reflect: no metaprogramming traps.
-//   - TypedArrays / ArrayBuffer / DataView: no binary buffers.
-//   - BigInt: arbitrary-precision integers. The number model is int32 (V_INT),
-//     int64 (V_INT64), float32 (V_FLOAT, Math.fround only) and double (V_FLOAT64,
-//     the canonical float); int64 is fixed-width, not arbitrary precision.
 //   - ES Modules: import/export; this is a single-file script engine.
 // =============================================================================
 
@@ -1409,6 +1413,402 @@ section("15. async / await");
         eq(opts.port || 8080, 8080, "the `a || default` idiom works");
         const o = {};
         eq(o && 5, 5, "an object is truthy in &&");
+    })();
+
+    // =========================================================================
+    section("32. 64-bit numbers (int64 exactness & double precision)");
+    // =========================================================================
+    (function () {
+        // --- Exact large integer literals (V_INT64; not lossy float32) ---
+        // 2^53-1 is the largest safe integer and round-trips exactly as an int64.
+        // === coerces across numeric tags, so it (not Object.is) is the right
+        // check when a V_INT64 result is compared with a differently-tagged literal.
+        ok(9007199254740991 === Number.MAX_SAFE_INTEGER, "9007199254740991 === Number.MAX_SAFE_INTEGER");
+        ok(-9007199254740991 === Number.MIN_SAFE_INTEGER, "-9007199254740991 === Number.MIN_SAFE_INTEGER");
+        eq(typeof 9007199254740991, "number", "a large int64 literal is typeof 'number'");
+        eq(typeof 1.5, "number", "a double literal is typeof 'number'");
+        eq(typeof 1e308, "number", "an exponent-form double is typeof 'number'");
+
+        // A Unix-ms timestamp (1.6e12) exceeds int32 but stays exact end to end.
+        ok(1600000000000 === 1600000000000, "a 1.6e12 literal equals itself");
+        ok(1600000000000 + 1 === 1600000000001, "int64 addition stays exact at 1.6e12");
+
+        // --- int32 -> int64 promotion on signed overflow ---
+        ok(2147483647 + 1 === 2147483648, "int32 max + 1 promotes to an exact int64");
+        ok(-2147483648 - 1 === -2147483649, "int32 min - 1 promotes to an exact int64");
+        ok(1000000 * 1000000 === 1000000000000, "1e6 * 1e6 is an exact int64 (no wrap)");
+
+        // --- Large-integer arithmetic & comparison are exact (int64 lanes) ---
+        ok(9007199254740992 > 9007199254740991, "adjacent large integers compare exactly");
+        ok(1600000000001 > 1600000000000, "1.6e12 neighbours compare exactly");
+        ok(9007199254740991 % 10 === 1, "int64 modulo stays integral");
+
+        // --- 2**53 goes through double pow; === coerces across numeric tags ---
+        ok(2 ** 53 === 9007199254740992, "2**53 equals its exact integer value");
+        ok(2 ** 53 - 9007199254740992 === 0, "2**53 minus its int64 twin is 0");
+
+        // --- Bitwise ops keep JS ToInt32 semantics (int32 wraparound) ---
+        ok((1 << 31) === -2147483648, "1<<31 wraps to the int32 minimum");
+        ok(0xFFFFFFFF === 4294967295, "a 0x literal wider than int32 is an exact int64");
+
+        // --- Double precision (V_FLOAT64 is a true IEEE-754 double) ---
+        ok(7 / 2 === 3.5, "integer division yields the exact double 3.5");
+        ok(0.1 + 0.2 !== 0.3, "0.1+0.2 is the closest double, not exactly 0.3");
+        ok(Math.abs((0.1 + 0.2) - 0.3) < 1e-15, "0.1+0.2 is within 1e-15 of 0.3");
+        ok(Number.isFinite(1e308), "1e308 is finite");
+        ok(1e308 < Number.MAX_VALUE, "1e308 is below Number.MAX_VALUE");
+        ok(Number.MAX_VALUE > 1e308, "Number.MAX_VALUE exceeds 1e308");
+        ok(!Number.isFinite(Number.MAX_VALUE * 10), "overflowing past MAX_VALUE is Infinity");
+        ok(Number.MIN_VALUE > 0 && Number.MIN_VALUE < 1e-300, "Number.MIN_VALUE is the smallest positive double");
+    })();
+
+    // =========================================================================
+    section("33. BigInt (arbitrary-precision integers)");
+    // =========================================================================
+    (function () {
+        // --- typeof / literals (=== coerces across numeric tags, so use ok, not eq) ---
+        eq(typeof 1n, "bigint", "typeof 1n is 'bigint'");
+        eq(typeof BigInt(5), "bigint", "typeof BigInt(5) is 'bigint'");
+        eq(typeof BigInt, "function", "BigInt is typeof 'function'");
+
+        // --- arithmetic ---
+        ok(1n + 2n === 3n, "1n + 2n === 3n");
+        ok(10n - 4n === 6n, "10n - 4n === 6n");
+        ok(6n * 7n === 42n, "6n * 7n === 42n");
+        ok(42n / 7n === 6n, "42n / 7n === 6n");
+        ok(10n % 3n === 1n, "10n % 3n === 1n");
+        ok(2n ** 10n === 1024n, "2n ** 10n === 1024n");
+        ok(0n - 5n === -5n, "0n - 5n === -5n");
+
+        // --- arbitrary precision beyond int64 / double ---
+        ok(2n ** 64n === 18446744073709551616n, "2n**64n exceeds the uint64 range");
+        ok(2n ** 100n === 1267650600228229401496703205376n, "2n**100n is exact");
+        ok(12345678901234567890n + 1n === 12345678901234567891n, "addition past 2^63 stays exact");
+        ok(18446744073709551616n / 2n === 9223372036854775808n, "division of a >2^64 value");
+
+        // --- comparison (strict differs from loose across bigint/number) ---
+        ok(1n === 1n, "1n === 1n");
+        ok(!(1n === 1), "1n === 1 is false (strict, different type)");
+        ok(1n == 1, "1n == 1 is true (loose, by value)");
+        ok(2n > 1n && 1n < 2n, "bigint ordering");
+        ok(1n < 1.5, "bigint vs float comparison");
+        ok(-1n < 0n, "negative bigint ordering");
+
+        // --- toString radix / String / concatenation ---
+        eq((255n).toString(16), "ff", "255n.toString(16)");
+        eq((8n).toString(2), "1000", "8n.toString(2)");
+        eq((-255n).toString(16), "-ff", "-255n.toString(16)");
+        eq((1000n).toString(36), "rs", "1000n.toString(36)");
+        eq(String(-1n), "-1", "String(-1n)");
+        eq("" + 5n, "5", "empty-string concat with a bigint");
+        eq(1n + "a", "1a", "1n + 'a' concatenates");
+
+        // --- truthiness ---
+        ok(!0n, "0n is falsy");
+        ok(1n, "1n is truthy");
+        ok(-1n, "-1n is truthy");
+
+        // --- BigInt() conversion ---
+        ok(BigInt(5) === 5n, "BigInt(5)");
+        ok(BigInt("5") === 5n, "BigInt('5')");
+        ok(BigInt("0x10") === 16n, "BigInt('0x10')");
+        ok(BigInt(true) === 1n, "BigInt(true)");
+        ok(BigInt(5.0) === 5n, "BigInt(5.0) integral double");
+        ok(BigInt(null) === 0n, "BigInt(null) is 0n");
+        ok(BigInt() === 0n, "BigInt() is 0n");
+
+        // --- bitwise (two's complement, arbitrary width) ---
+        ok((5n & 3n) === 1n, "5n & 3n");
+        ok((5n | 3n) === 7n, "5n | 3n");
+        ok((5n ^ 3n) === 6n, "5n ^ 3n");
+        ok((1n << 4n) === 16n, "1n << 4n");
+        ok((16n >> 2n) === 4n, "16n >> 2n");
+        ok((-16n >> 2n) === -4n, "-16n >> 2n is an arithmetic shift");
+        ok((-1n & -1n) === -1n, "-1n & -1n");
+
+        // --- asIntN / asUintN / valueOf / Number() ---
+        ok(BigInt.asIntN(8, 128n) === -128n, "BigInt.asIntN(8,128n) wraps to -128n");
+        ok(BigInt.asUintN(8, -1n) === 255n, "BigInt.asUintN(8,-1n) is 255n");
+        ok((5n).valueOf() === 5n, "5n.valueOf()");
+        ok(Number(10n) === 10, "Number(10n)");
+
+        // --- mixing bigint with number throws (1 representative caught throw) ---
+        throws(() => { let x = 1n + 1; }, "1n + 1 (mixing bigint and number) throws");
+    })();
+
+    // =========================================================================
+    section("34. ArrayBuffer & DataView (binary buffers)");
+    // =========================================================================
+    (function () {
+        // --- ArrayBuffer basics + zero-init ---
+        let ab = new ArrayBuffer(8);
+        ok(ab.byteLength === 8, "new ArrayBuffer(8).byteLength");
+        ok(new ArrayBuffer(0).byteLength === 0, "new ArrayBuffer(0).byteLength");
+        let dz = new DataView(new ArrayBuffer(4));
+        ok(dz.getUint8(0) === 0 && dz.getUint8(3) === 0, "a fresh buffer is zero-initialised");
+        ok(dz.getUint32(0, true) === 0, "zero-init uint32");
+
+        // --- isView ---
+        ok(ArrayBuffer.isView(dz) === true, "ArrayBuffer.isView(DataView) is true");
+        ok(ArrayBuffer.isView(ab) === false, "ArrayBuffer.isView(ArrayBuffer) is false");
+        ok(ArrayBuffer.isView({}) === false, "ArrayBuffer.isView({}) is false");
+
+        // --- DataView members / offset views ---
+        let mab = new ArrayBuffer(8);
+        let mdv = new DataView(mab);
+        ok(mdv.buffer === mab, "dv.buffer identity");
+        ok(mdv.byteOffset === 0, "dv.byteOffset defaults to 0");
+        ok(mdv.byteLength === 8, "dv.byteLength defaults to the buffer length");
+        let mdv2 = new DataView(mab, 2, 4);
+        ok(mdv2.byteOffset === 2 && mdv2.byteLength === 4, "dv(buffer, offset, length) members");
+        ok(new DataView(mab, 3).byteLength === 5, "dv(buffer, offset) covers the rest");
+
+        // --- integer round-trips (both endiannesses) ---
+        let r = new DataView(new ArrayBuffer(8));
+        r.setInt8(0, -5);              ok(r.getInt8(0) === -5, "int8 round-trip -5");
+        r.setUint8(0, 200);            ok(r.getUint8(0) === 200, "uint8 round-trip 200");
+        r.setInt16(0, -300, true);     ok(r.getInt16(0, true) === -300, "int16 LE round-trip");
+        r.setInt16(0, -300, false);    ok(r.getInt16(0, false) === -300, "int16 BE round-trip");
+        r.setUint16(0, 60000, true);   ok(r.getUint16(0, true) === 60000, "uint16 LE round-trip 60000");
+        r.setInt32(0, -100000, true);  ok(r.getInt32(0, true) === -100000, "int32 LE round-trip");
+        r.setInt32(0, -100000, false); ok(r.getInt32(0, false) === -100000, "int32 BE round-trip");
+        r.setUint32(0, 4000000000, true); ok(r.getUint32(0, true) === 4000000000, "uint32 large round-trip");
+        r.setUint32(0, 4294967295, true); ok(r.getInt32(0, true) === -1, "0xFFFFFFFF read as int32 is -1");
+        r.setUint8(7, 42);             ok(r.getUint8(7) === 42, "the last byte (byteLength-1) is in-bounds");
+
+        // --- explicit endianness / byte layout ---
+        let e = new DataView(new ArrayBuffer(4));
+        e.setUint16(0, 0x1234, false);   // BE: [0]=0x12, [1]=0x34
+        ok(e.getUint8(0) === 0x12 && e.getUint8(1) === 0x34, "BE uint16 lays the high byte first");
+        e.setUint16(2, 0x1234, true);    // LE: [2]=0x34, [3]=0x12
+        ok(e.getUint8(2) === 0x34 && e.getUint8(3) === 0x12, "LE uint16 lays the low byte first");
+        e.setUint16(0, 0x1234, false);
+        ok(e.getUint16(0, true) === 0x3412, "reading LE over BE-written bytes swaps");
+        ok(e.getUint16(0, false) === 0x1234, "reading BE matches the BE write");
+
+        // --- shared backing across views ---
+        let sab = new ArrayBuffer(8);
+        let v1 = new DataView(sab);
+        let v2 = new DataView(sab);
+        v1.setUint8(3, 77);
+        ok(v2.getUint8(3) === 77, "two views over one buffer share bytes");
+        let v3 = new DataView(sab, 4);
+        v3.setUint8(0, 99);
+        ok(v1.getUint8(4) === 99, "an offset view's [0] is the buffer's byte 4");
+
+        // --- unaligned access (memcpy-safe) ---
+        let u = new DataView(new ArrayBuffer(8));
+        u.setUint8(1, 1); u.setUint8(2, 2);
+        ok(u.getUint16(1, true) === 513, "unaligned LE uint16 at offset 1 (1 + 2*256)");
+        u.setUint32(1, 0x01020304, false);
+        ok(u.getUint8(1) === 0x01 && u.getUint8(4) === 0x04, "unaligned BE uint32 byte layout");
+
+        // --- floats ---
+        r.setFloat32(0, 3.5, true);    ok(r.getFloat32(0, true) === 3.5, "float32 round-trip 3.5");
+        r.setFloat32(0, -2.25, false); ok(r.getFloat32(0, false) === -2.25, "float32 BE round-trip -2.25");
+        r.setFloat64(0, 3.141592653589793, true);
+        ok(r.getFloat64(0, true) === 3.141592653589793, "float64 round-trip pi");
+        r.setFloat32(0, 0.1, true);
+        ok(r.getFloat32(0, true) !== 0.1, "float32 loses precision on 0.1");
+
+        // --- BigInt64 / BigUint64 ---
+        let b = new DataView(new ArrayBuffer(8));
+        b.setBigInt64(0, -5n, true);
+        ok(b.getBigInt64(0, true) === -5n, "bigint64 round-trip -5n");
+        eq(typeof b.getBigInt64(0, true), "bigint", "getBigInt64 typeof is bigint");
+        b.setBigInt64(0, 9223372036854775807n, false);
+        ok(b.getBigInt64(0, false) === 9223372036854775807n, "bigint64 INT64_MAX (BE)");
+        b.setBigInt64(0, -9223372036854775808n, true);
+        ok(b.getBigInt64(0, true) === -9223372036854775808n, "bigint64 INT64_MIN (LE)");
+        b.setBigUint64(0, 18446744073709551615n, true);
+        ok(b.getBigUint64(0, true) === 18446744073709551615n, "biguint64 UINT64_MAX");
+        eq(typeof b.getBigUint64(0, true), "bigint", "getBigUint64 typeof is bigint");
+
+        // --- ArrayBuffer.prototype.slice (independent copy) ---
+        let s = new ArrayBuffer(8);
+        let ds = new DataView(s);
+        for (let i = 0; i < 8; i++) { ds.setUint8(i, i + 1); }   // bytes 1..8
+        let sliced = s.slice(2, 5);
+        ok(sliced.byteLength === 3, "slice(2,5).byteLength");
+        let dsl = new DataView(sliced);
+        ok(dsl.getUint8(0) === 3 && dsl.getUint8(2) === 5, "slice(2,5) copies orig[2..4]");
+        dsl.setUint8(0, 99);
+        ok(ds.getUint8(2) === 3, "writing the slice leaves the original intact (copy)");
+        ok(s.slice().byteLength === 8, "slice() copies the whole buffer");
+        ok(s.slice(-2).byteLength === 2, "slice(-2) covers the last two bytes");
+        ok(new DataView(s.slice(-2)).getUint8(0) === 7, "slice(-2)[0] is orig[6]");
+        ok(s.slice(0, 100).byteLength === 8, "slice(0,100) clamps end to byteLength");
+        ok(s.slice(6, 3).byteLength === 0, "slice(6,3) with begin>end yields an empty buffer");
+        ok(s.byteLength === 8, "slice left the source byteLength intact");
+
+        // --- OOB DataView read throws RangeError (1 representative caught throw) ---
+        throws(() => { new DataView(new ArrayBuffer(8)).getInt8(8); }, "DataView OOB read throws RangeError");
+    })();
+
+    // =========================================================================
+    section("35. TypedArrays (Int8Array .. BigUint64Array)");
+    // =========================================================================
+    (function () {
+        // --- construction: (length) zero-filled + element sizes ---
+        let a = new Int8Array(3);
+        ok(a.length === 3, "new Int8Array(3).length");
+        ok(a[0] === 0 && a[2] === 0, "a fresh TypedArray is zero-filled");
+        ok(a.byteLength === 3, "Int8Array byteLength");
+        ok(a.BYTES_PER_ELEMENT === 1, "Int8Array.BYTES_PER_ELEMENT");
+        ok(new Int16Array(4).byteLength === 8, "Int16Array(4).byteLength is 8");
+        ok(new Float64Array(2).BYTES_PER_ELEMENT === 8, "Float64Array.BYTES_PER_ELEMENT is 8");
+        ok(new Uint32Array(2).BYTES_PER_ELEMENT === 4, "Uint32Array.BYTES_PER_ELEMENT is 4");
+
+        // --- OOB / negative reads are undefined (no throw) ---
+        ok(a[3] === undefined, "OOB read yields undefined");
+        ok(a[-1] === undefined, "negative-index read yields undefined");
+
+        // --- construction: (array) and (typedarray copy) ---
+        let b = new Int32Array([10, 20, 30]);
+        ok(b.length === 3 && b[1] === 20, "new Int32Array([10,20,30])");
+        let c = new Uint8Array(b);
+        ok(c.length === 3 && c[0] === 10, "new Uint8Array(typedarray) copies element-wise");
+
+        // --- construction: (buffer[, offset[, length]]) views ---
+        let buf = new ArrayBuffer(16);
+        ok(new Int32Array(buf).length === 4, "a view over the whole buffer");
+        let vo = new Int32Array(buf, 8);
+        ok(vo.length === 2 && vo.byteOffset === 8, "new Int32Array(buffer, byteOffset)");
+        ok(new Int32Array(buf, 4, 1).length === 1, "new Int32Array(buffer, byteOffset, length)");
+
+        // --- statics: from / of (with and without mapFn) ---
+        let d = Int32Array.from([1, 2, 3]);
+        ok(d.length === 3 && d[2] === 3, "Int32Array.from(array)");
+        ok(Uint8Array.of(7, 8, 9)[0] === 7, "Uint8Array.of(...)");
+        ok(Int32Array.from([1, 2, 3], x => x * 10)[1] === 20, "from(array, mapFn)");
+
+        // --- writes, wrapping and clamping ---
+        let w = new Int32Array(2);
+        w[0] = 42; ok(w[0] === 42, "element write + readback");
+        ok((w[1] = 99) === 99, "an assignment expression yields the RHS");
+        w[0] += 5; ok(w[0] === 47, "compound += writes through");
+        let u = new Uint8Array(2);
+        u[0] = 300; ok(u[0] === 44, "Uint8Array wraps 300 -> 44");
+        u[1] = -1;  ok(u[1] === 255, "Uint8Array wraps -1 -> 255");
+        let i8 = new Int8Array(1);
+        i8[0] = 127; i8[0] += 1; ok(i8[0] === -128, "Int8Array overflows 127+1 -> -128");
+        let cl = new Uint8ClampedArray(3);
+        cl[0] = 300; ok(cl[0] === 255, "Uint8ClampedArray clamps high to 255");
+        cl[1] = -20; ok(cl[1] === 0, "Uint8ClampedArray clamps low to 0");
+        cl[2] = 2.5; ok(cl[2] === 2, "Uint8ClampedArray rounds half to even (2.5 -> 2)");
+        let u32 = new Uint32Array(1);
+        u32[0] = 4294967295; ok(u32[0] === 4294967295, "Uint32Array holds UINT32_MAX");
+        let f64 = new Float64Array(1);
+        f64[0] = 3.5; ok(f64[0] === 3.5, "Float64Array round-trips 3.5");
+
+        // --- ++ / -- (postfix yields the old value) ---
+        let inc = new Int32Array(2);
+        inc[0] = 5; inc[0]++; ok(inc[0] === 6, "postfix ++ increments");
+        ++inc[0]; ok(inc[0] === 7, "prefix ++ increments");
+        let pv = inc[1]++; ok(pv === 0 && inc[1] === 1, "postfix ++ yields the old value");
+
+        // --- shared backing: TypedArray <-> DataView and TA <-> TA ---
+        let sb = new ArrayBuffer(8);
+        let tu = new Uint8Array(sb);
+        let tdv = new DataView(sb);
+        tu[0] = 0xAB; ok(tdv.getUint8(0) === 0xAB, "a TypedArray write is seen by a DataView");
+        tdv.setUint8(1, 0xCD); ok(tu[1] === 0xCD, "a DataView write is seen by a TypedArray");
+        let tv1 = new Int32Array(sb, 0, 2);
+        let tv2 = new Int32Array(sb, 0, 2);
+        tv1[0] = 777; ok(tv2[0] === 777, "two TypedArray views share one buffer");
+
+        // --- subarray (view) vs slice (copy) ---
+        let src = Int32Array.from([10, 20, 30, 40, 50]);
+        let sub = src.subarray(1, 4);
+        ok(sub.length === 3 && sub[0] === 20 && sub[2] === 40, "subarray(1,4) is a 3-element view");
+        ok(sub.byteOffset === 4, "subarray byteOffset accounts for element size");
+        sub[0] = 99; ok(src[1] === 99, "subarray shares backing (write-through)");
+        let sl = src.slice(1, 4);
+        sl[0] = -1; ok(src[1] === 99 && sl[0] === -1, "slice is an independent copy");
+
+        // --- set / fill / reverse / copyWithin ---
+        let dst = new Int32Array(5);
+        dst.set([1, 2, 3], 1);
+        ok(dst[0] === 0 && dst[1] === 1 && dst[3] === 3, "set(array, offset)");
+        let dst2 = new Int32Array(3);
+        dst2.set(Int32Array.from([7, 8, 9]));
+        ok(dst2[0] === 7 && dst2[2] === 9, "set(typedarray)");
+        let f = new Int32Array(5); f.fill(3);
+        ok(f[0] === 3 && f[4] === 3, "fill(value) fills the whole array");
+        f.fill(9, 1, 3);
+        ok(f[0] === 3 && f[1] === 9 && f[2] === 9 && f[3] === 3, "fill(value, start, end)");
+        let rv = Int32Array.from([1, 2, 3, 4]); rv.reverse();
+        ok(rv[0] === 4 && rv[3] === 1, "reverse() in place");
+        let cw = Int32Array.from([1, 2, 3, 4, 5]); cw.copyWithin(0, 3);
+        ok(cw[0] === 4 && cw[1] === 5 && cw[2] === 3, "copyWithin(0, 3)");
+
+        // --- sort (default + comparator) ---
+        let so = Int32Array.from([5, 3, 1, 4, 2]); so.sort();
+        ok(so[0] === 1 && so[4] === 5, "sort() ascending by default");
+        let so2 = Int32Array.from([1, 2, 3]); so2.sort((x, y) => y - x);
+        ok(so2[0] === 3 && so2[2] === 1, "sort(compareFn) descending");
+
+        // --- searching: indexOf / lastIndexOf / includes / find / findIndex ---
+        let ix = Int32Array.from([1, 2, 3, 2, 1]);
+        ok(ix.indexOf(2) === 1, "indexOf finds the first match");
+        ok(ix.lastIndexOf(2) === 3, "lastIndexOf finds the last match");
+        ok(ix.indexOf(9) === -1, "indexOf returns -1 when absent");
+        ok(ix.includes(3) && !ix.includes(9), "includes");
+        let fd = Int32Array.from([1, 2, 3, 4]);
+        ok(fd.find(x => x > 2) === 3, "find returns the first matching element");
+        ok(fd.findIndex(x => x > 2) === 2, "findIndex returns the first matching index");
+        ok(fd.find(x => x > 9) === undefined, "find returns undefined when absent");
+
+        // --- quantifiers / iteration: every / some / forEach ---
+        ok(fd.every(x => x > 0) && !fd.every(x => x > 2), "every");
+        ok(fd.some(x => x > 3) && !fd.some(x => x > 9), "some");
+        let sum = 0; fd.forEach(x => { sum += x; });
+        ok(sum === 10, "forEach visits every element");
+
+        // --- map / filter ---
+        let mp = fd.map(x => x * 2);
+        ok(mp.length === 4 && mp[0] === 2 && mp[3] === 8, "map returns a new TypedArray");
+        let fl = fd.filter(x => x % 2 === 0);
+        ok(fl.length === 2 && fl[0] === 2 && fl[1] === 4, "filter returns a new TypedArray");
+
+        // --- reduce / reduceRight ---
+        ok(fd.reduce((acc, x) => acc + x) === 10, "reduce without an initial value");
+        ok(fd.reduce((acc, x) => acc + x, 100) === 110, "reduce with an initial value");
+        ok(fd.reduceRight((acc, x) => acc * 10 + x) === 4321, "reduceRight folds from the end");
+        ok(fd.reduceRight((acc, x) => acc + x, 5) === 15, "reduceRight with an initial value");
+
+        // --- at / join / toString ---
+        ok(fd.at(0) === 1 && fd.at(-1) === 4, "at(index) supports negatives");
+        ok(fd.at(9) === undefined, "at() out of range is undefined");
+        eq(fd.join("-"), "1-2-3-4", "join(sep)");
+        eq(fd.join(), "1,2,3,4", "join() defaults to a comma");
+        eq(fd.toString(), "1,2,3,4", "toString() is comma-joined");
+
+        // --- values / keys / entries ---
+        let vals = fd.values();
+        ok(vals.length === 4 && vals[0] === 1, "values() snapshot");
+        let keys = fd.keys();
+        ok(keys.length === 4 && keys[2] === 2, "keys() snapshot");
+        let ents = fd.entries();
+        ok(ents.length === 4 && ents[1][0] === 1 && ents[1][1] === 2, "entries() [index, value] pairs");
+
+        // --- iteration protocol: for..of and spread ---
+        let acc2 = 0; for (let x of fd) { acc2 += x; }
+        ok(acc2 === 10, "for..of iterates a TypedArray (@@iterator)");
+        let spread = [...fd];
+        ok(spread.length === 4 && spread[3] === 4, "spread expands a TypedArray");
+
+        // --- BigInt64Array / BigUint64Array ---
+        let bi = BigInt64Array.from([1n, 2n, 3n]);
+        ok(bi.length === 3 && bi[0] === 1n, "BigInt64Array.from bigints");
+        eq(typeof bi[0], "bigint", "BigInt64Array elements are bigints");
+        ok(bi.reduce((x, y) => x + y, 0n) === 6n, "BigInt64Array.reduce over bigints");
+        let bu = new BigUint64Array(1); bu[0] = 18446744073709551615n;
+        ok(bu[0] === 18446744073709551615n, "BigUint64Array holds UINT64_MAX");
+
+        // --- Float32Array map ---
+        let f32 = Float32Array.from([1.5, 2.5, 3.5]);
+        ok(f32.map(x => x * 2)[1] === 5, "Float32Array.map");
     })();
 
     // =========================================================================
