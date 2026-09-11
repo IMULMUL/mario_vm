@@ -57,10 +57,12 @@
 //       from/of, wrapping & clamping writes, subarray/slice/set/fill/reverse/
 //       copyWithin/sort/indexOf/includes/find/every/some/forEach/map/filter/
 //       reduce/reduceRight/at/join/toString/values/keys/entries/@@iterator)
+//   36. Proxy / Reflect (get/set/has/deleteProperty/ownKeys/apply/construct/
+//       prototype/extensibility/descriptor traps, revocable, invariants, and
+//       all 13 Reflect statics)
 //
 // Deliberately EXCLUDED (each would need a subsystem this minimal engine lacks):
 //   - RegExp: no /pattern/ literals, no regex-based match/split/replace.
-//   - Proxy / Reflect: no metaprogramming traps.
 //   - ES Modules: import/export; this is a single-file script engine.
 // =============================================================================
 
@@ -1809,6 +1811,154 @@ section("15. async / await");
         // --- Float32Array map ---
         let f32 = Float32Array.from([1.5, 2.5, 3.5]);
         ok(f32.map(x => x * 2)[1] === 5, "Float32Array.map");
+    })();
+
+    // =========================================================================
+    section("36. Proxy / Reflect (metaprogramming traps)");
+    // =========================================================================
+    (function () {
+        // --- get / set traps with a logging handler ---
+        const log = [];
+        const target = { a: 1, b: 2 };
+        const p = new Proxy(target, {
+            get(t, k, r) { log.push("get:" + String(k)); return t[k]; },
+            set(t, k, v, r) { log.push("set:" + String(k)); t[k] = v; return true; }
+        });
+        eq(p.a, 1, "get trap returns the target value");
+        eq(p.b, 2, "get trap on a second key");
+        p.c = 3;
+        eq(target.c, 3, "set trap writes through to the target");
+        deepEq(log, ["get:a", "get:b", "set:c"], "handler logged get/get/set in order");
+        ok(log.length === 3, "a simple set fired ONLY the set trap (no get)");
+
+        // --- compound assignment / ++ fire get-then-set (spec order) ---
+        const order = [];
+        const ct = { n: 10 };
+        const cp = new Proxy(ct, {
+            get(t, k) { order.push("get"); return t[k]; },
+            set(t, k, v) { order.push("set"); t[k] = v; return true; }
+        });
+        cp.n += 5;
+        eq(ct.n, 15, "p.n += 5 updated the target to 15");
+        deepEq(order, ["get", "set"], "compound assignment fired get then set");
+        const o2 = [];
+        const t2 = { m: 1 };
+        const p2 = new Proxy(t2, {
+            get(t, k) { o2.push("g"); return t[k]; },
+            set(t, k, v) { o2.push("s"); t[k] = v; return true; }
+        });
+        p2.m++;
+        eq(t2.m, 2, "p.m++ incremented the target");
+        deepEq(o2, ["g", "s"], "postfix ++ fired get then set");
+
+        // --- has / deleteProperty traps ---
+        const ht = { x: 1, y: 2 };
+        let hasCalls = 0, delCalls = 0;
+        const hp = new Proxy(ht, {
+            has(t, k) { hasCalls++; return k in t; },
+            deleteProperty(t, k) { delCalls++; delete t[k]; return true; }
+        });
+        ok("x" in hp, "'x' in p routes the has trap (true)");
+        ok(!("z" in hp), "'z' in p routes the has trap (false)");
+        eq(hasCalls, 2, "has trap called twice");
+        delete hp.y;
+        eq(delCalls, 1, "deleteProperty trap called once");
+        ok(!("y" in ht), "deleteProperty removed y from the target");
+
+        // --- ownKeys trap ---
+        const ot = { a: 1, b: 2, c: 3 };
+        const op = new Proxy(ot, { ownKeys(t) { return ["a", "b"]; } });
+        deepEq(Object.keys(op), ["a", "b"], "Object.keys routes the ownKeys trap");
+        deepEq(Reflect.ownKeys(op), ["a", "b"], "Reflect.ownKeys routes the ownKeys trap");
+        const op2 = new Proxy({ k: 1, j: 2 }, {});
+        deepEq(Object.keys(op2).sort(), ["j", "k"], "no ownKeys trap -> the target's keys");
+
+        // --- apply / construct traps ---
+        const fn = function (a, b) { return a + b; };
+        const ap = new Proxy(fn, { apply(t, thisArg, args) { return args[0] * args[1]; } });
+        eq(ap(3, 4), 12, "apply trap intercepts the call (3*4)");
+        const apd = new Proxy(fn, {});
+        eq(apd(3, 4), 7, "no apply trap -> forwards to the target (3+4)");
+        function Ctor(v) { this.v = v; }
+        const pcx = new Proxy(Ctor, { construct(t, args, nt) { return { made: args[0], tag: "trapped" }; } });
+        const inst = new pcx(9);
+        eq(inst.made, 9, "construct trap receives the args");
+        eq(inst.tag, "trapped", "construct trap's return object wins");
+        const pcd = new Proxy(Ctor, {});
+        const inst2 = new pcd(5);
+        eq(inst2.v, 5, "no construct trap -> forwards to the target ctor");
+
+        // --- prototype / extensibility / descriptor traps ---
+        const proto = { hi: 1 };
+        const pt = {};
+        const pp = new Proxy(pt, { getPrototypeOf(t) { return proto; } });
+        eq(Object.getPrototypeOf(pp), proto, "getPrototypeOf trap");
+        eq(Reflect.getPrototypeOf(pp), proto, "Reflect.getPrototypeOf trap");
+        const t2e = {};
+        const p2e = new Proxy(t2e, { isExtensible(t) { return true; }, preventExtensions(t) { Object.preventExtensions(t); return true; } });
+        eq(Object.isExtensible(p2e), true, "isExtensible trap");
+        eq(Object.preventExtensions(p2e), p2e, "preventExtensions returns the proxy");
+        const t3d = {};
+        const p3d = new Proxy(t3d, { defineProperty(t, k, d) { Object.defineProperty(t, k, d); return true; } });
+        Object.defineProperty(p3d, "z", { value: 42, enumerable: true, configurable: true, writable: true });
+        eq(t3d.z, 42, "defineProperty trap wrote to the target");
+        const t4d = { q: 7 };
+        const p4d = new Proxy(t4d, { getOwnPropertyDescriptor(t, k) { return { value: 100, enumerable: true, configurable: true }; } });
+        const desc = Object.getOwnPropertyDescriptor(p4d, "q");
+        eq(desc.value, 100, "getOwnPropertyDescriptor trap");
+
+        // --- default forwarding (empty handler) ---
+        const ft = { a: 1 };
+        const fp = new Proxy(ft, {});
+        eq(fp.a, 1, "empty handler get forwards to the target");
+        ok(Object.isExtensible(fp), "empty handler isExtensible forwards (true)");
+        eq(Reflect.get(fp, "a"), 1, "Reflect.get forwards");
+
+        // --- Proxy.revocable ---
+        const rt = { a: 1 };
+        const rev = Proxy.revocable(rt, { get(t, k) { return t[k]; } });
+        eq(rev.proxy.a, 1, "a revocable proxy works before revoke");
+        rev.revoke();
+        throws(() => rev.proxy.a, "get after revoke throws TypeError");
+        throws(() => { rev.proxy.a = 2; }, "set after revoke throws TypeError");
+        throws(() => "a" in rev.proxy, "has after revoke throws TypeError");
+
+        // --- invariants / TypeErrors ---
+        throws(() => new Proxy(null, {}), "a non-object target throws TypeError");
+        throws(() => new Proxy({}, null), "a non-object handler throws TypeError");
+        throws(() => new Proxy(5, {}), "a primitive target throws TypeError");
+        const sp = new Proxy({}, { set() { return false; } });
+        throws(() => { sp.x = 1; }, "a set trap returning false throws TypeError");
+        const nonCallable = new Proxy({}, {});
+        throws(() => nonCallable(1), "apply on a non-callable target throws TypeError");
+
+        // --- Reflect statics on plain objects (all 13) ---
+        const ro = { a: 1, b: 2 };
+        eq(Reflect.get(ro, "a"), 1, "Reflect.get");
+        eq(Reflect.set(ro, "c", 3), true, "Reflect.set returns true");
+        eq(ro.c, 3, "Reflect.set wrote the value");
+        ok(Reflect.has(ro, "a"), "Reflect.has (own)");
+        ok(!Reflect.has(ro, "zz"), "Reflect.has (missing)");
+        eq(Reflect.deleteProperty(ro, "b"), true, "Reflect.deleteProperty returns true");
+        ok(!("b" in ro), "Reflect.deleteProperty removed b");
+        deepEq(Reflect.ownKeys({ x: 1, y: 2 }).sort(), ["x", "y"], "Reflect.ownKeys");
+        const rd = Reflect.getOwnPropertyDescriptor(ro, "a");
+        eq(rd.value, 1, "Reflect.getOwnPropertyDescriptor value");
+        ok(rd.enumerable, "Reflect.getOwnPropertyDescriptor enumerable");
+        eq(Reflect.defineProperty(ro, "e", { value: 5, enumerable: true, configurable: true, writable: true }), true, "Reflect.defineProperty returns true");
+        eq(ro.e, 5, "Reflect.defineProperty wrote the value");
+        eq(Reflect.apply(function (x) { return this.k + x; }, { k: 10 }, [5]), 15, "Reflect.apply with a thisArg");
+        function RC(v) { this.v = v; }
+        const rci = Reflect.construct(RC, [8]);
+        eq(rci.v, 8, "Reflect.construct");
+        ok(rci instanceof RC, "Reflect.construct instanceof");
+        const rpr = { base: 1 };
+        const rnp = {};
+        eq(Reflect.setPrototypeOf(rnp, rpr), true, "Reflect.setPrototypeOf returns true");
+        eq(Reflect.getPrototypeOf(rnp), rpr, "Reflect.setPrototypeOf applied");
+        ok(Reflect.isExtensible(rnp), "Reflect.isExtensible true");
+        eq(Reflect.preventExtensions(rnp), true, "Reflect.preventExtensions returns true");
+        ok(!Reflect.isExtensible(rnp), "Reflect.isExtensible now false");
     })();
 
     // =========================================================================

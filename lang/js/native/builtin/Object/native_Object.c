@@ -23,8 +23,10 @@ var_t* native_Object_create(vm_t* vm, var_t* env, void* data) {
 }
 
 var_t* native_Object_getPrototypeOf(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
+	(void)data;
 	var_t* obj = get_obj(env, "obj");
+	if(var_is_proxy(obj))
+		return proxy_get_prototype(vm, obj);   // getPrototypeOf trap (owned/NULL)
 	return var_get_prototype(obj);
 }
 
@@ -158,6 +160,13 @@ var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
 	var_t* obj = get_obj(env, "obj");
 	const char* name = get_str(env, "name");
 	var_t* descriptor = get_obj(env, "descriptor");
+	if(var_is_proxy(obj)) {
+		var_t* keyv = var_new_str(vm, name);
+		var_ref(keyv);                                       // own it across the trap borrow
+		proxy_define_property(vm, obj, keyv, descriptor);    // defineProperty trap
+		var_unref(keyv);
+		return obj;
+	}
 	var_t* v = var_find_own_member_var(descriptor, "value");
 	node_t* node = var_add(obj, name, v);
 
@@ -203,6 +212,22 @@ static void own_keys_cb(const char* key, void* value, void* user_data) {
 static void var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only) {
 	if(var == NULL)
 		return;
+	if(var_is_proxy(var)) {
+		/* ownKeys trap (or the default forward to the target). proxy_own_keys returns
+		 * a fresh refs=0 array; copy its elements into the caller's keys_var. */
+		var_t* pk = proxy_own_keys(vm, var, false, enum_only);
+		if(pk != NULL) {
+			uint32_t sz = var_array_size(pk), j;
+			vm->gc.gc_defer++;   // keys_var/pk unrooted while we build
+			for(j = 0; j < sz; j++) {
+				var_t* kv = var_array_get_var(pk, (int32_t)j);
+				var_array_add(keys_var, (kv != NULL) ? kv : var_new(vm));
+			}
+			vm->gc.gc_defer--;
+			var_unref(pk);
+		}
+		return;
+	}
 	vm->gc.gc_defer++; // keys_var is unrooted here; see var_properties_num().
 	hash_map_t* seen = hash_map_new();
 	own_keys_cb_data d;
@@ -439,6 +464,13 @@ var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) 
 	const char* name = get_func_arg_str(env, 1);
 	if(obj == NULL)
 		return var_new(vm);
+	if(var_is_proxy(obj)) {
+		var_t* keyv = var_new_str(vm, name);
+		var_ref(keyv);                                          // own it across the trap borrow
+		var_t* d = proxy_get_own_descriptor(vm, obj, keyv);     // gOPD trap (owned/NULL)
+		var_unref(keyv);
+		return (d != NULL) ? d : var_new(vm);
+	}
 	node_t* n = var_find_own_member(obj, name);
 	if(n == NULL || n->be_inherited)
 		return var_new(vm);
@@ -465,6 +497,10 @@ var_t* native_Object_setPrototypeOf(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_func_arg(env, 0);
 	var_t* proto = get_func_arg(env, 1);
+	if(obj != NULL && var_is_proxy(obj)) {
+		proxy_set_prototype(vm, obj, proto);   // setPrototypeOf trap
+		return obj;
+	}
 	if(obj != NULL && proto != NULL)
 		var_set_prototype(obj, proto);
 	return obj != NULL ? obj : var_new(vm);
@@ -520,12 +556,18 @@ var_t* native_Object_isSealed(vm_t* vm, var_t* env, void* data) {
 	return var_new_bool(vm, n != NULL);
 }
 
-/* Object.preventExtensions(obj) / isExtensible: hidden flag, mirrors seal. */
+/* Object.preventExtensions(obj) / isExtensible: hidden flag, mirrors seal. The
+ * flag is OBJ_NO_EXT so a plain target frozen here is also seen as non-extensible
+ * by the proxy preventExtensions invariant (mario_is_extensible). */
 var_t* native_Object_preventExtensions(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_func_arg(env, 0);
+	if(obj != NULL && var_is_proxy(obj)) {
+		proxy_prevent_extensions(vm, obj);   // preventExtensions trap
+		return obj;
+	}
 	if(obj != NULL) {
-		node_t* mark = var_add(obj, "@noext", var_new_bool(vm, true));
+		node_t* mark = var_add(obj, OBJ_NO_EXT, var_new_bool(vm, true));
 		if(mark != NULL)
 			mark->invisable = 1;
 	}
@@ -535,7 +577,9 @@ var_t* native_Object_preventExtensions(vm_t* vm, var_t* env, void* data) {
 var_t* native_Object_isExtensible(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_func_arg(env, 0);
-	node_t* n = (obj != NULL) ? var_find_own_member(obj, "@noext") : NULL;
+	if(obj != NULL && var_is_proxy(obj))
+		return var_new_bool(vm, proxy_is_extensible(vm, obj));   // isExtensible trap
+	node_t* n = (obj != NULL) ? var_find_own_member(obj, OBJ_NO_EXT) : NULL;
 	return var_new_bool(vm, n == NULL);
 }
 

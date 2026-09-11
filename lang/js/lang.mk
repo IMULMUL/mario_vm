@@ -23,6 +23,8 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH_BUILTIN)/Map/native_Map.o \
 	$(NATIVES_PATH_BUILTIN)/Set/native_Set.o \
 	$(NATIVES_PATH_BUILTIN)/Symbol/native_Symbol.o \
+	$(NATIVES_PATH_BUILTIN)/Proxy/native_Proxy.o \
+	$(NATIVES_PATH_BUILTIN)/Reflect/native_Reflect.o \
 	\
 	$(NATIVES_PATH)/natives.o  \
 	$(NATIVES_PATH)/JSON/JSON.o \

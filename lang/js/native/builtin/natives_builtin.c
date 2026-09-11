@@ -13,6 +13,8 @@
 #include "Map/native_Map.h"
 #include "Set/native_Set.h"
 #include "Symbol/native_Symbol.h"
+#include "Proxy/native_Proxy.h"
+#include "Reflect/native_Reflect.h"
 
 #ifdef __cplusplus /* __cplusplus */
 extern "C" {
@@ -33,6 +35,8 @@ void reg_builtin_natives(vm_t* vm) {
 	reg_native_Map(vm);
 	reg_native_Set(vm);
 	reg_native_Symbol(vm);
+	reg_native_Proxy(vm);
+	reg_native_Reflect(vm);
 }
 
 #ifdef __cplusplus /* __cplusplus */

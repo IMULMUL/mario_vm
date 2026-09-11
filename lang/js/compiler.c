@@ -2247,16 +2247,24 @@ bool expr(lex_t* l, bytecode_t* bc) {
     } else if (pre == LEX_PLUSPLUS) {
         /* A prefix `++a[i]` / `--a[i]` steps through the binding node: retarget a
          * subscript operand to the write-variant so a TypedArray element yields a
-         * synthetic @@taslot target (normal arrays are unaffected). */
-        if (bc->cindex > 0 && OP(bc->code_buf[bc->cindex - 1]) == INSTR_ARRAY_AT) {
+         * synthetic @@taslot target, and a member operand (`.x`) to GETW so a proxy
+         * yields its @@proxyslot sentinel and an accessor its [obj,node] pair
+         * (normal arrays/objects are unaffected). */
+        if (bc->cindex > 0) {
             PC last = bc->code_buf[bc->cindex - 1];
-            bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+            if (OP(last) == INSTR_ARRAY_AT)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+            else if (OP(last) == INSTR_GET)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
         }
         bc_gen(bc, INSTR_PPLUS_PRE);
     } else if (pre == LEX_MINUSMINUS) {
-        if (bc->cindex > 0 && OP(bc->code_buf[bc->cindex - 1]) == INSTR_ARRAY_AT) {
+        if (bc->cindex > 0) {
             PC last = bc->code_buf[bc->cindex - 1];
-            bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+            if (OP(last) == INSTR_ARRAY_AT)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+            else if (OP(last) == INSTR_GET)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
         }
         bc_gen(bc, INSTR_MMINUS_PRE);
     }
@@ -2268,16 +2276,23 @@ bool expr(lex_t* l, bytecode_t* bc) {
             return false;
         }
         if (op == LEX_PLUSPLUS) {
-            /* Postfix `a[i]++`: same subscript retarget as the prefix form. */
-            if (bc->cindex > 0 && OP(bc->code_buf[bc->cindex - 1]) == INSTR_ARRAY_AT) {
+            /* Postfix `a[i]++` / `a.x++`: same subscript/member retarget as the
+             * prefix form, so a proxy member yields its @@proxyslot sentinel. */
+            if (bc->cindex > 0) {
                 PC last = bc->code_buf[bc->cindex - 1];
-                bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+                if (OP(last) == INSTR_ARRAY_AT)
+                    bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+                else if (OP(last) == INSTR_GET)
+                    bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
             }
             bc_gen(bc, INSTR_PPLUS);
         } else if (op == LEX_MINUSMINUS) {
-            if (bc->cindex > 0 && OP(bc->code_buf[bc->cindex - 1]) == INSTR_ARRAY_AT) {
+            if (bc->cindex > 0) {
                 PC last = bc->code_buf[bc->cindex - 1];
-                bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+                if (OP(last) == INSTR_ARRAY_AT)
+                    bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+                else if (OP(last) == INSTR_GET)
+                    bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
             }
             bc_gen(bc, INSTR_MMINUS);
         } else {
@@ -2458,13 +2473,23 @@ bool base(lex_t* l, bytecode_t* bc) {
          * retarget that fetch to the write-variant so a runtime setter is
          * invoked. This must run before the RHS is compiled, since the RHS
          * appends instructions after the target's final INSTR_GET.
+         * The arithmetic compound assigns (`+= -= *= /= %= **=`) retarget the
+         * member fetch too: a proxy target then yields its @@proxyslot write
+         * sentinel (handle_math resolves it through the get trap and writes back
+         * through the set trap) and an accessor yields its [obj,node] pair, while
+         * a plain object member is unchanged (GETW == GET for it). The logical
+         * assigns (`||= &&= ??=`) keep the read form because handle_logic_assign
+         * installs through the binding node and does not model write sentinels.
          * Likewise a subscript target (`a[i] op= ..`) retargets INSTR_ARRAY_AT to
          * the write-variant INSTR_ARRAY_AT_W for EVERY assignment op: normal
          * arrays behave identically (the W handler delegates to the same push),
          * while a TypedArray receiver yields a synthetic @@taslot write target. */
+        bool arith_compound = (op == LEX_PLUSEQUAL || op == LEX_MINUSEQUAL ||
+                               op == LEX_MULTIEQUAL || op == LEX_DIVEQUAL ||
+                               op == LEX_MODEQUAL || op == LEX_POWEREQUAL);
         if (bc->cindex > 0) {
             PC last = bc->code_buf[bc->cindex - 1];
-            if (op == '=' && OP(last) == INSTR_GET) {
+            if ((op == '=' || arith_compound) && OP(last) == INSTR_GET) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
             } else if (OP(last) == INSTR_ARRAY_AT) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
