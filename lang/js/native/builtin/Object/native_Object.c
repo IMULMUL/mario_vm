@@ -222,6 +222,10 @@ static bool var_is_nan(var_t* v) {
 		float f = *(float*)v->value;
 		return f != f;
 	}
+	if(v->type == V_FLOAT64) {
+		double d = *(double*)v->value;
+		return d != d;
+	}
 	return false;
 }
 
@@ -265,13 +269,19 @@ var_t* native_Object_is(vm_t* vm, var_t* env, void* data) {
 		return var_new_bool(vm, true);
 	if(an != bn)
 		return var_new_bool(vm, false);
-	/* +0 !== -0 */
+	/* +0 !== -0 (checked per matching float tag, before the generic compare). */
 	if(a != NULL && b != NULL && a->value != NULL && b->value != NULL &&
-			a->type == V_FLOAT && b->type == V_FLOAT) {
-		float fa = *(float*)a->value, fb = *(float*)b->value;
-		if(fa == 0.0f && fb == 0.0f) {
-			/* 1/+0 == +inf, 1/-0 == -inf: distinguishes the two zeros. */
-			return var_new_bool(vm, (1.0f / fa) == (1.0f / fb));
+			a->type == b->type) {
+		if(a->type == V_FLOAT) {
+			float fa = *(float*)a->value, fb = *(float*)b->value;
+			if(fa == 0.0f && fb == 0.0f)
+				/* 1/+0 == +inf, 1/-0 == -inf: distinguishes the two zeros. */
+				return var_new_bool(vm, (1.0f / fa) == (1.0f / fb));
+		}
+		else if(a->type == V_FLOAT64) {
+			double da = *(double*)a->value, db = *(double*)b->value;
+			if(da == 0.0 && db == 0.0)
+				return var_new_bool(vm, (1.0 / da) == (1.0 / db));
 		}
 	}
 	if(a == NULL || b == NULL)
@@ -280,7 +290,9 @@ var_t* native_Object_is(vm_t* vm, var_t* env, void* data) {
 		return var_new_bool(vm, false);
 	switch(a->type) {
 		case V_INT: return var_new_bool(vm, *(int*)a->value == *(int*)b->value);
+		case V_INT64: return var_new_bool(vm, *(int64_t*)a->value == *(int64_t*)b->value);
 		case V_FLOAT: return var_new_bool(vm, *(float*)a->value == *(float*)b->value);
+		case V_FLOAT64: return var_new_bool(vm, *(double*)a->value == *(double*)b->value);
 		case V_BOOL: return var_new_bool(vm, var_get_bool(a) == var_get_bool(b));
 		case V_STRING: return var_new_bool(vm, strcmp(var_get_str(a), var_get_str(b)) == 0);
 		/* undefined and null are singletons by value: two distinct var_t's of the

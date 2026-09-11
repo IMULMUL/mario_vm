@@ -18,53 +18,83 @@ extern "C" {
 #define F_MAX(a,b)          ((a)>(b) ? (a) : (b))
 #define F_SGN(a)            ((a)>0 ? 1 : ((a)<0 ? -1 : 0 ))
 #define F_RNG(a,min,max)    ((a)<(min) ? min : ((a)>(max) ? max : a ))
-#define F_ROUND(a)          ((a)>0 ? (int) ((a)+0.5) : (int) ((a)-0.5) )
 
-/* Box a double as a JS Number. Mario distinguishes V_INT and V_FLOAT, but JS has
- * one Number type: Math.trunc(5.9) must Object.is-match the integer literal 5.
- * Return an int when the value is integral (within a tiny tolerance for libm
- * noise such as log10(1000) == 2.9999999999999996) and fits an int32, else a
- * float. Mirrors the int/float choice math_op() makes for the ** operator. */
+/* Box a double as a JS Number. Mario distinguishes the integer lanes (V_INT /
+ * V_INT64) from the canonical double (V_FLOAT64), but JS has one Number type:
+ * Math.trunc(5.9) must Object.is-match the integer literal 5. Return an integer
+ * when the value is integral (within a tiny tolerance for libm noise such as
+ * log10(1000) == 2.9999999999999996) and fits int32 -> V_INT or int64 -> V_INT64;
+ * otherwise return a canonical double V_FLOAT64. Mirrors math_op()'s boxing for
+ * the `**` operator so arithmetic and Math agree on integral results. */
 static var_t* math_num(vm_t* vm, double r) {
 	if(!isnan(r) && !isinf(r)) {
 		double rr = floor(r);
-		if(fabs(r - rr) < 1e-9 && rr >= -2147483648.0 && rr <= 2147483647.0)
-			return var_new_int(vm, (int)rr);
+		if(fabs(r - rr) < 1e-9 &&
+		   rr >= -9223372036854775808.0 && rr < 9223372036854775808.0) {
+			int64_t ii = (int64_t)rr;
+			if(ii >= -2147483648LL && ii <= 2147483647LL)
+				return var_new_int(vm, (int)ii);
+			return var_new_int64(vm, ii);
+		}
 	}
-	return var_new_float(vm, (float)r);
+	return var_new_float64(vm, r);
+}
+
+/* Shared min/max: exact in int64 when both operands are integers, else a
+ * canonical double (NaN propagates, matching JS). */
+static var_t* math_minmax(vm_t* vm, var_t* a, var_t* b, bool want_min) {
+	if(a == NULL || b == NULL)
+		return NULL;
+	bool ai = (a->type == V_INT || a->type == V_INT64);
+	bool bi = (b->type == V_INT || b->type == V_INT64);
+	if(ai && bi) {
+		int64_t ia = var_get_int64(a), ib = var_get_int64(b);
+		int64_t r = want_min ? (ia < ib ? ia : ib) : (ia > ib ? ia : ib);
+		if(r >= -2147483648LL && r <= 2147483647LL)
+			return var_new_int(vm, (int)r);
+		return var_new_int64(vm, r);
+	}
+	double da = var_get_float64(a), db = var_get_float64(b);
+	if(da != da) return var_new_float64(vm, da);
+	if(db != db) return var_new_float64(vm, db);
+	double r = want_min ? (da < db ? da : db) : (da > db ? da : db);
+	return var_new_float64(vm, r);
 }
 
 //Math.abs(x) - returns absolute of given value
 var_t* native_math_abs(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
+	(void)data;
 	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL || n->var == NULL)
 		return NULL;
 
-	if (n->var->type == V_INT) {
-		return var_new_int(vm, (F_ABS(var_get_int(n->var))));
-	}	
-	else if (n->var->type == V_FLOAT) {
-		return var_new_float(vm, (F_ABS(var_get_float(n->var))));
-	}
-	return NULL;
+	var_t* v = n->var;
+	if(v->type == V_INT)
+		return var_new_int(vm, F_ABS(var_get_int(v)));
+	if(v->type == V_INT64)
+		return var_new_int64(vm, (int64_t)F_ABS(var_get_int64(v)));
+	/* float32/float64 (and any coercible input): canonical double magnitude. */
+	return var_new_float64(vm, fabs(var_get_float64(v)));
 }
 
-//Math.round(a) - returns nearest round of given value
+//Math.round(a) - nearest integer (JS semantics: floor(a + 0.5))
 var_t* native_math_round(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
+	(void)data;
 	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL || n->var == NULL)
 		return NULL;
 
-	if (n->var->type == V_FLOAT) 
-		return var_new_float(vm, (F_ROUND(var_get_float(n->var))));
-	return var_new_int(vm, (F_ROUND(var_get_int(n->var))));
+	var_t* v = n->var;
+	if(v->type == V_INT)
+		return var_new_int(vm, var_get_int(v));
+	if(v->type == V_INT64)
+		return var_new_int64(vm, var_get_int64(v));
+	return math_num(vm, floor(var_get_float64(v) + 0.5));
 }
 
 //Math.min(a,b) - returns minimum of two given values 
 var_t* native_math_min(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
+	(void)data;
 	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL) return NULL;
 	var_t* varA = n->var;
@@ -73,17 +103,12 @@ var_t* native_math_min(vm_t* vm, var_t* env, void *data) {
 	if(n == NULL) return NULL;
 	var_t* varB = n->var;
 
-	if(varA == NULL || varB == NULL)
-		return NULL;
-
-	if (varA->type == V_INT && varB->type == V_INT)
-		return var_new_int(vm, F_MIN(var_get_int(varA), var_get_int(varB)));
-	return var_new_float(vm, F_MIN(var_get_float(varA), var_get_float(varB)));
+	return math_minmax(vm, varA, varB, true);
 }
 
 //Math.max(a,b) - returns maximum of two given values  
 var_t* native_math_max(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
+	(void)data;
 	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL) return NULL;
 	var_t* varA = n->var;
@@ -92,17 +117,12 @@ var_t* native_math_max(vm_t* vm, var_t* env, void *data) {
 	if(n == NULL) return NULL;
 	var_t* varB = n->var;
 
-	if(varA == NULL || varB == NULL)
-		return NULL;
-
-	if (varA->type == V_INT && varB->type == V_INT)
-		return var_new_int(vm, F_MAX(var_get_int(varA), var_get_int(varB)));
-	return var_new_float(vm, F_MAX(var_get_float(varA), var_get_float(varB)));
+	return math_minmax(vm, varA, varB, false);
 }
 
 //Math.range(x,a,b) - returns value limited between two given values  
 var_t* native_math_range(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
+	(void)data;
 	node_t* n = var_find_own_member(env, "x");
 	if(n == NULL) return NULL;
 	var_t* varX = n->var;
@@ -118,176 +138,170 @@ var_t* native_math_range(vm_t* vm, var_t* env, void *data) {
 	if(varX == NULL || varA == NULL || varB == NULL)
 		return NULL;
 
-	if (varX->type == V_INT)
+	if(varX->type == V_INT && varA->type == V_INT && varB->type == V_INT)
 		return var_new_int(vm, F_RNG(var_get_int(varX), var_get_int(varA), var_get_int(varB)));
-	return var_new_float(vm, F_RNG(var_get_float(varX), var_get_float(varA), var_get_float(varB)));
+	return var_new_float64(vm, F_RNG(var_get_float64(varX), var_get_float64(varA), var_get_float64(varB)));
 }
 
 //Math.sign(a) - returns sign of given value (-1==negative,0=zero,1=positive)
 var_t* native_math_sign(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
+	(void)data;
 	node_t* n = var_find_own_member(env, "a");
 	if(n == NULL) return NULL;
 	var_t* var = n->var;
+	if(var == NULL) return NULL;
 
-	if (var->type == V_INT) 
+	if(var->type == V_INT)
 		return var_new_int(vm, F_SGN(var_get_int(var)));
-	return var_new_float(vm, F_SGN(var_get_float(var)));
+	if(var->type == V_INT64) {
+		int64_t x = var_get_int64(var);
+		return var_new_int(vm, x > 0 ? 1 : (x < 0 ? -1 : 0));
+	}
+	double d = var_get_float64(var);
+	if(d != d) return var_new_float64(vm, NAN);
+	if(d > 0) return var_new_float64(vm, 1.0);
+	if(d < 0) return var_new_float64(vm, -1.0);
+	return var_new_float64(vm, d); /* preserves +0 / -0 */
 }
 
 //Math.PI() - returns PI value
 var_t* native_math_PI(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)env; (void)data;
-	return var_new_float(vm, K_PI);
+	(void)env; (void)data;
+	return var_new_float64(vm, K_PI);
 }
 
 //Math.toDegrees(a) - returns degree value of a given angle in radians
 var_t* native_math_toDegrees(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(f));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(get_float64(env, "a")));
 }
 
 //Math.toRadians(a) - returns radians value of a given angle in degrees
 var_t* native_math_toRadians(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (K_PI/180.0)*(f));
+	(void)data;
+	return var_new_float64(vm, (K_PI/180.0)*(get_float64(env, "a")));
 }
+
+/* The trig / log / exp functions below carry a pre-existing non-standard
+ * (180/PI) degree-scaling quirk that is intentionally left untouched; only the
+ * numeric width is widened to canonical doubles (V_FLOAT64). */
 
 //Math.sin(a) - returns trig. sine of given angle in radians
 var_t* native_math_sin(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(sin(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(sin(get_float64(env, "a"))));
 }
 
 //Math.asin(a) - returns trig. arcsine of given angle in radians
 var_t* native_math_asin(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(asin(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(asin(get_float64(env, "a"))));
 }
 
 //Math.cos(a) - returns trig. cosine of given angle in radians
 var_t* native_math_cos(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(cos(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(cos(get_float64(env, "a"))));
 }
 
 //Math.acos(a) - returns trig. arccosine of given angle in radians
 var_t* native_math_acos(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(acos(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(acos(get_float64(env, "a"))));
 }
 
 //Math.tan(a) - returns trig. tangent of given angle in radians
 var_t* native_math_tan(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(tan(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(tan(get_float64(env, "a"))));
 }
 
 //Math.atan(a) - returns trig. arctangent of given angle in radians
 var_t* native_math_atan(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(atan(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(atan(get_float64(env, "a"))));
 }
 
 //Math.sinh(a) - returns trig. hyperbolic sine of given angle in radians
 var_t* native_math_sinh(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(sinh(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(sinh(get_float64(env, "a"))));
 }
 
 //Math.asinh(a) - returns trig. hyperbolic arcsine of given angle in radians
 var_t* native_math_asinh(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(asinh(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(asinh(get_float64(env, "a"))));
 }
 
 //Math.cosh(a) - returns trig. hyperbolic cosine of given angle in radians
 var_t* native_math_cosh(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(cosh(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(cosh(get_float64(env, "a"))));
 }
 
 //Math.acosh(a) - returns trig. hyperbolic arccosine of given angle in radians
 var_t* native_math_acosh(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(acosh(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(acosh(get_float64(env, "a"))));
 }
 
 //Math.tanh(a) - returns trig. hyperbolic tangent of given angle in radians
 var_t* native_math_tanh(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(tanh(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(tanh(get_float64(env, "a"))));
 }
 
-//Math.atan(a) - returns trig. hyperbolic arctangent of given angle in radians
+//Math.atanh(a) - returns trig. hyperbolic arctangent of given angle in radians
 var_t* native_math_atanh(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(atanh(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(atanh(get_float64(env, "a"))));
 }
 
 //Math.E() - returns E Neplero value
 var_t* native_math_E(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)env; (void)data;
-	return var_new_float(vm, K_E);
+	(void)env; (void)data;
+	return var_new_float64(vm, K_E);
 }
 
 //Math.log(a) - returns natural logaritm (base E) of given value
 var_t* native_math_log(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(log(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(log(get_float64(env, "a"))));
 }
 
 //Math.log10(a) - returns logaritm(base 10) of given value
 var_t* native_math_log10(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return math_num(vm, log10((double)f));
+	(void)data;
+	return math_num(vm, log10(get_float64(env, "a")));
 }
 
 //Math.log2(a) - returns logaritm(base 2) of given value
 var_t* native_math_log2(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return math_num(vm, log2((double)f));
+	(void)data;
+	return math_num(vm, log2(get_float64(env, "a")));
 }
 
 //Math.trunc(a) - removes the fractional part (toward zero), unlike round().
 var_t* native_math_trunc(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return math_num(vm, trunc((double)f));
+	(void)data;
+	return math_num(vm, trunc(get_float64(env, "a")));
 }
 
 //Math.cbrt(a) - cube root.
 var_t* native_math_cbrt(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return math_num(vm, cbrt((double)f));
+	(void)data;
+	return math_num(vm, cbrt(get_float64(env, "a")));
 }
 
 //Math.hypot(...) - sqrt(sum of squares) of all arguments (variadic).
 var_t* native_math_hypot(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
+	(void)data;
 	uint32_t n = get_func_args_num(env);
 	double sum = 0.0;
 	uint32_t i;
 	for(i = 0; i < n; i++) {
-		double v = (double)var_get_float(get_func_arg(env, i));
+		double v = var_get_float64(get_func_arg(env, i));
 		sum += v * v;
 	}
 	return math_num(vm, sqrt(sum));
@@ -295,9 +309,9 @@ var_t* native_math_hypot(vm_t* vm, var_t* env, void *data) {
 
 //Math.imul(a,b) - C-like 32-bit integer multiplication (wraps on overflow).
 var_t* native_math_imul(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	int32_t a = (int32_t)var_get_float(get_func_arg(env, 0));
-	int32_t b = (int32_t)var_get_float(get_func_arg(env, 1));
+	(void)data;
+	int32_t a = (int32_t)var_get_float64(get_func_arg(env, 0));
+	int32_t b = (int32_t)var_get_float64(get_func_arg(env, 1));
 	uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
 	int32_t r = (int32_t)(ua * ub);
 	return var_new_int(vm, (int)r);
@@ -305,8 +319,8 @@ var_t* native_math_imul(vm_t* vm, var_t* env, void *data) {
 
 //Math.clz32(a) - count leading zero bits of the 32-bit integer representation.
 var_t* native_math_clz32(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	uint32_t x = (uint32_t)(int32_t)var_get_float(get_func_arg(env, 0));
+	(void)data;
+	uint32_t x = (uint32_t)(int32_t)var_get_float64(get_func_arg(env, 0));
 	int count = 0;
 	if(x == 0)
 		return var_new_int(vm, 32);
@@ -319,42 +333,38 @@ var_t* native_math_clz32(vm_t* vm, var_t* env, void *data) {
 
 //Math.exp(a) - returns e raised to the power of a given number
 var_t* native_math_exp(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(exp(f)));
+	(void)data;
+	return var_new_float64(vm, (180.0/K_PI)*(exp(get_float64(env, "a"))));
 }
 
 //Math.pow(a,b) - returns the result of a number raised to a power (a)^(b)
 var_t* native_math_pow(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float fa = get_float(env, "a");
-	float fb = get_float(env, "b");
-	return var_new_float(vm, pow(fa, fb));
+	(void)data;
+	return math_num(vm, pow(get_float64(env, "a"), get_float64(env, "b")));
 }
 
 //Math.sqr(a) - returns square of given value
 var_t* native_math_sqr(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, f*f);
+	(void)data;
+	double d = get_float64(env, "a");
+	return math_num(vm, d*d);
 }
 
 //Math.sqrt(a) - returns square root of given value
 var_t* native_math_sqrt(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
-	float f = get_float(env, "a");
-	return var_new_float(vm, sqrtf(f));
+	(void)data;
+	return math_num(vm, sqrt(get_float64(env, "a")));
 }
 
 //Math.rand() - returns random double number
 var_t* native_math_rand(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)env; (void)data;
-	return var_new_float(vm, ((double)rand()/RAND_MAX));
+	(void)env; (void)data;
+	return var_new_float64(vm, ((double)rand()/RAND_MAX));
 }
 
 //Math.randInt(min, max) - returns random int number
 var_t* native_math_randInt(vm_t* vm, var_t* env, void *data) {
-	(void)vm; (void)data;
+	(void)data;
 	int min = get_int(env, "min");
 	int max = get_int(env, "max");
 	int val = min + (int)(rand()%(1+max-min));
@@ -365,15 +375,13 @@ var_t* native_math_randInt(vm_t* vm, var_t* env, void *data) {
 //Math.floor(a) - largest integer <= a (standard JS: floor(-1.2) == -2).
 var_t* native_math_floor(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	float f = get_float(env, "a");
-	return math_num(vm, floor((double)f));
+	return math_num(vm, floor(get_float64(env, "a")));
 }
 
 //Math.ceil(a) - smallest integer >= a (standard JS: ceil(1.2) == 2).
 var_t* native_math_ceil(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	float f = get_float(env, "a");
-	return math_num(vm, ceil((double)f));
+	return math_num(vm, ceil(get_float64(env, "a")));
 }
 
 //Math.atan2(y,x) - arctangent of y/x in RADIANS. Standard JS result; note the
@@ -381,16 +389,15 @@ var_t* native_math_ceil(vm_t* vm, var_t* env, void *data) {
 //is intentionally left untouched here.
 var_t* native_math_atan2(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	float fy = get_float(env, "y");
-	float fx = get_float(env, "x");
-	return var_new_float(vm, atan2((double)fy, (double)fx));
+	return var_new_float64(vm, atan2(get_float64(env, "y"), get_float64(env, "x")));
 }
 
-//Math.fround(a) - nearest 32-bit float. Mario's V_FLOAT already IS a 32-bit
-//float, so this is a value-preserving round-trip.
+//Math.fround(a) - nearest 32-bit float. This is the VM's ONLY intentional
+//float32 (V_FLOAT) producer; every other natural float result is a canonical
+//double (V_FLOAT64), so fround(x) is compared with === rather than Object.is.
 var_t* native_math_fround(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float(vm, get_float(env, "a"));
+	return var_new_float(vm, (float)get_float64(env, "a"));
 }
 
 

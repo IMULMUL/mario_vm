@@ -1,4 +1,5 @@
 #include "JSON.h"
+#include <errno.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -106,6 +107,22 @@ static bool lex_json_chkread(lex_t* lex, uint32_t expected_tk) {
 	return true;
 }
 
+/* JSON integers are boxed at the narrowest exact width: int32 -> V_INT, wider ->
+ * V_INT64, and beyond int64 -> the double the literal denotes (V_FLOAT64). The
+ * sign is applied here because the lexer emits it as a standalone token. */
+static var_t* json_parse_int(vm_t* vm, const char* str, bool neg) {
+	errno = 0;
+	long long ll = strtoll(str, NULL, 10);
+	if(errno == ERANGE) {
+		double d = strtod(str, NULL);
+		return var_new_float64(vm, neg ? -d : d);
+	}
+	if(neg) ll = -ll;
+	if(ll < -2147483648LL || ll > 2147483647LL)
+		return var_new_int64(vm, (int64_t)ll);
+	return var_new_int(vm, (int)ll);
+}
+
 static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 	/* JSON numbers may carry a leading sign, but the lexer emits '-' / '+' as a
 	 * standalone char token rather than folding it into the numeric literal.
@@ -117,14 +134,15 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 		bool neg = (l->tk=='-');
 		lex_json_get_next_token(l);
 		if (l->tk==LEX_INT) {
-			int i = atoi(l->tk_str->cstr);
+			var_t* r = json_parse_int(vm, l->tk_str->cstr, neg);
 			lex_json_chkread(l, LEX_INT);
-			return var_new_int(vm, neg ? -i : i);
+			return r;
 		}
 		else if (l->tk==LEX_FLOAT) {
-			float f = (float)atof(l->tk_str->cstr);
+			double d = strtod(l->tk_str->cstr, NULL);
+			var_t* r = var_new_float64(vm, neg ? -d : d);
 			lex_json_chkread(l, LEX_FLOAT);
-			return var_new_float(vm, neg ? -f : f);
+			return r;
 		}
 		return var_new(vm);
 	}
@@ -145,14 +163,15 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 		return var_new(vm);
 	}
 	else if (l->tk==LEX_INT) {
-		int i = atoi(l->tk_str->cstr);
+		var_t* r = json_parse_int(vm, l->tk_str->cstr, false);
 		lex_json_chkread(l, LEX_INT);
-		return var_new_int(vm, i);
+		return r;
 	}
 	else if (l->tk==LEX_FLOAT) {
-		float f = (float)atof(l->tk_str->cstr);
+		double d = strtod(l->tk_str->cstr, NULL);
+		var_t* r = var_new_float64(vm, d);
 		lex_json_chkread(l, LEX_FLOAT);
-		return var_new_float(vm, f);
+		return r;
 	}
 	else if (l->tk==LEX_STR) {
 		mstr_t* s = mstr_new(l->tk_str->cstr);
