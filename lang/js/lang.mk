@@ -16,6 +16,9 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH_BUILTIN)/String/native_String.o \
 	$(NATIVES_PATH_BUILTIN)/Array/native_Array.o \
 	$(NATIVES_PATH_BUILTIN)/Promise/native_Promise.o \
+	$(NATIVES_PATH_BUILTIN)/Map/native_Map.o \
+	$(NATIVES_PATH_BUILTIN)/Set/native_Set.o \
+	$(NATIVES_PATH_BUILTIN)/Symbol/native_Symbol.o \
 	\
 	$(NATIVES_PATH)/natives.o  \
 	$(NATIVES_PATH)/JSON/JSON.o \

@@ -6,6 +6,9 @@
 #include "Promise/native_Promise.h"
 #include "Console/native_Console.h"
 #include "Error/native_Error.h"
+#include "Map/native_Map.h"
+#include "Set/native_Set.h"
+#include "Symbol/native_Symbol.h"
 
 #ifdef __cplusplus /* __cplusplus */
 extern "C" {
@@ -19,6 +22,9 @@ void reg_builtin_natives(vm_t* vm) {
 	reg_native_Console(vm);
 	reg_native_Number(vm);
 	reg_native_Promise(vm);
+	reg_native_Map(vm);
+	reg_native_Set(vm);
+	reg_native_Symbol(vm);
 }
 
 #ifdef __cplusplus /* __cplusplus */

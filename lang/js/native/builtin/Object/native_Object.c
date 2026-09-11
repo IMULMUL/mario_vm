@@ -61,7 +61,14 @@ static void properties_callback(const char* key, void* value, void* user_data) {
 
 static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var, bool enumerable) {
 	uint32_t num = 0;
-	
+
+	/* keys_var and the transient var_new_str() results are held only by C locals
+	 * here, so they are invisible to gc(): an allocation-driven collection in the
+	 * middle of the walk would sweep keys_var (V_ST_GC, unreachable from a root)
+	 * and corrupt the prototype-chain traversal into an infinite loop. Defer gc
+	 * until the result array is fully built and handed back to the caller. */
+	vm->gc.gc_defer++;
+
 	// 创建并初始化哈希表，用于快速检查属性是否已经存在
 	hash_map_t* seen_properties = hash_map_new();
 	
@@ -97,7 +104,9 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 	
 	// 释放哈希表
 	hash_map_free(seen_properties, mario_free, NULL);
-	
+
+	vm->gc.gc_defer--;
+
 	return num;
 }
 
@@ -131,6 +140,261 @@ var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
 	return NULL;
 }
 
+/* ---- ES6+ Object statics ---- */
+
+/* Collect OWN property keys (no prototype chain). When enum_only is true,
+ * non-enumerable members are skipped. */
+typedef struct {
+	vm_t* vm;
+	var_t* keys_var;
+	bool enum_only;
+	hash_map_t* seen;
+} own_keys_cb_data;
+
+static void own_keys_cb(const char* key, void* value, void* user_data) {
+	(void)key;
+	own_keys_cb_data* d = (own_keys_cb_data*)user_data;
+	node_t* node = (node_t*)value;
+	if(node == NULL || node->be_inherited || node->invisable)
+		return;
+	if(d->enum_only && node->be_unenumerable)
+		return;
+	if(hash_map_get(d->seen, node->name) != NULL)
+		return;
+	hash_map_add(d->seen, node->name, (void*)"");
+	var_array_add(d->keys_var, var_new_str(d->vm, node->name));
+}
+
+static void var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only) {
+	if(var == NULL)
+		return;
+	vm->gc.gc_defer++; // keys_var is unrooted here; see var_properties_num().
+	hash_map_t* seen = hash_map_new();
+	own_keys_cb_data d;
+	d.vm = vm;
+	d.keys_var = keys_var;
+	d.enum_only = enum_only;
+	d.seen = seen;
+	hash_map_iterate(&var->children, own_keys_cb, &d);
+	hash_map_free(seen, mario_free, NULL);
+	vm->gc.gc_defer--;
+}
+
+static bool var_is_nan(var_t* v) {
+	if(v == NULL || v->value == NULL)
+		return false;
+	if(v->type == V_FLOAT) {
+		float f = *(float*)v->value;
+		return f != f;
+	}
+	return false;
+}
+
+static var_t* new_plain_obj(vm_t* vm) {
+	return var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
+}
+
+var_t* native_Object_assign(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	uint32_t argc = get_func_args_num(env);
+	var_t* target = argc > 0 ? get_func_arg(env, 0) : NULL;
+	if(target == NULL)
+		return var_new(vm);
+	uint32_t i;
+	for(i = 1; i < argc; i++) {
+		var_t* src = get_func_arg(env, i);
+		if(src == NULL)
+			continue;
+		var_t* keys = var_new_array(vm);
+		var_own_keys(vm, src, keys, true);
+		uint32_t sz = var_array_size(keys);
+		uint32_t j;
+		for(j = 0; j < sz; j++) {
+			var_t* kv = var_array_get_var(keys, (int32_t)j);
+			const char* k = var_get_str(kv);
+			var_t* v = var_find_own_member_var(src, k);
+			if(v != NULL)
+				var_add(target, k, v);
+		}
+		var_unref(keys);
+	}
+	return target;
+}
+
+var_t* native_Object_is(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* a = get_func_arg(env, 0);
+	var_t* b = get_func_arg(env, 1);
+	bool an = var_is_nan(a), bn = var_is_nan(b);
+	if(an && bn)
+		return var_new_bool(vm, true);
+	if(an != bn)
+		return var_new_bool(vm, false);
+	/* +0 !== -0 */
+	if(a != NULL && b != NULL && a->value != NULL && b->value != NULL &&
+			a->type == V_FLOAT && b->type == V_FLOAT) {
+		float fa = *(float*)a->value, fb = *(float*)b->value;
+		if(fa == 0.0f && fb == 0.0f) {
+			/* 1/+0 == +inf, 1/-0 == -inf: distinguishes the two zeros. */
+			return var_new_bool(vm, (1.0f / fa) == (1.0f / fb));
+		}
+	}
+	if(a == NULL || b == NULL)
+		return var_new_bool(vm, a == b);
+	if(a->type != b->type)
+		return var_new_bool(vm, false);
+	switch(a->type) {
+		case V_INT: return var_new_bool(vm, *(int*)a->value == *(int*)b->value);
+		case V_FLOAT: return var_new_bool(vm, *(float*)a->value == *(float*)b->value);
+		case V_BOOL: return var_new_bool(vm, var_get_bool(a) == var_get_bool(b));
+		case V_STRING: return var_new_bool(vm, strcmp(var_get_str(a), var_get_str(b)) == 0);
+		default: return var_new_bool(vm, a == b);
+	}
+}
+
+var_t* native_Object_values(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	var_t* ret = var_new_array(vm);
+	var_t* keys = var_new_array(vm);
+	var_own_keys(vm, obj, keys, true);
+	uint32_t sz = var_array_size(keys), j;
+	for(j = 0; j < sz; j++) {
+		const char* k = var_get_str(var_array_get_var(keys, (int32_t)j));
+		var_t* v = var_find_own_member_var(obj, k);
+		var_array_add(ret, v != NULL ? v : var_new(vm));
+	}
+	var_unref(keys);
+	return ret;
+}
+
+var_t* native_Object_entries(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	var_t* ret = var_new_array(vm);
+	var_t* keys = var_new_array(vm);
+	var_own_keys(vm, obj, keys, true);
+	uint32_t sz = var_array_size(keys), j;
+	for(j = 0; j < sz; j++) {
+		var_t* kv = var_array_get_var(keys, (int32_t)j);
+		const char* k = var_get_str(kv);
+		var_t* v = var_find_own_member_var(obj, k);
+		var_t* pair = var_new_array(vm);
+		var_array_add(pair, var_new_str(vm, k));
+		var_array_add(pair, v != NULL ? v : var_new(vm));
+		var_array_add(ret, pair);
+	}
+	var_unref(keys);
+	return ret;
+}
+
+var_t* native_Object_fromEntries(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = get_func_arg(env, 0);
+	var_t* ret = new_plain_obj(vm);
+	if(arr == NULL)
+		return ret;
+	uint32_t sz = var_array_size(arr), j;
+	for(j = 0; j < sz; j++) {
+		var_t* pair = var_array_get_var(arr, (int32_t)j);
+		if(pair == NULL)
+			continue;
+		var_t* kv = var_array_get_var(pair, 0);
+		var_t* vv = var_array_get_var(pair, 1);
+		if(kv != NULL)
+			var_add(ret, var_get_str(kv), vv != NULL ? vv : var_new(vm));
+	}
+	return ret;
+}
+
+var_t* native_Object_freeze(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	if(obj != NULL) {
+		var_t* keys = var_new_array(vm);
+		var_own_keys(vm, obj, keys, false);
+		uint32_t sz = var_array_size(keys), j;
+		for(j = 0; j < sz; j++) {
+			const char* k = var_get_str(var_array_get_var(keys, (int32_t)j));
+			node_t* n = var_find_own_member(obj, k);
+			if(n != NULL)
+				n->be_const = true;
+		}
+		var_unref(keys);
+		node_t* mark = var_add(obj, "@frozen", var_new_bool(vm, true));
+		if(mark != NULL)
+			mark->invisable = 1;
+	}
+	return obj != NULL ? obj : var_new(vm);
+}
+
+var_t* native_Object_isFrozen(vm_t* vm, var_t* env, void* data) {
+	(void)vm; (void)data;
+	var_t* obj = get_func_arg(env, 0);
+	node_t* n = obj != NULL ? var_find_own_member(obj, "@frozen") : NULL;
+	return var_new_bool(vm, n != NULL);
+}
+
+var_t* native_Object_getOwnPropertyNames(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	var_t* ret = var_new_array(vm);
+	var_own_keys(vm, obj, ret, false);
+	return ret;
+}
+
+var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	const char* name = get_func_arg_str(env, 1);
+	if(obj == NULL)
+		return var_new(vm);
+	node_t* n = var_find_own_member(obj, name);
+	if(n == NULL || n->be_inherited)
+		return var_new(vm);
+	var_t* d = new_plain_obj(vm);
+	var_add(d, "value", n->var != NULL ? n->var : var_new(vm));
+	var_add(d, "writable", var_new_bool(vm, !n->be_const));
+	var_add(d, "enumerable", var_new_bool(vm, !n->be_unenumerable));
+	var_add(d, "configurable", var_new_bool(vm, !n->be_const));
+	return d;
+}
+
+/* __obj_rest(src, excludedKeysArray): internal helper for object-rest
+ * destructuring `const { a, ...rest } = src`. Returns a new object holding
+ * src's own enumerable properties whose key is not in excludedKeysArray. */
+var_t* native_obj_rest(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* src = get_func_arg(env, 0);
+	var_t* excluded = get_func_arg(env, 1);
+	var_t* ret = new_plain_obj(vm);
+	if(src == NULL)
+		return ret;
+	var_t* keys = var_new_array(vm);
+	var_own_keys(vm, src, keys, true);
+	uint32_t sz = var_array_size(keys), j;
+	for(j = 0; j < sz; j++) {
+		const char* k = var_get_str(var_array_get_var(keys, (int32_t)j));
+		bool skip = false;
+		if(excluded != NULL) {
+			uint32_t esz = var_array_size(excluded), e;
+			for(e = 0; e < esz; e++) {
+				var_t* ev = var_array_get_var(excluded, (int32_t)e);
+				if(ev != NULL && strcmp(var_get_str(ev), k) == 0) {
+					skip = true;
+					break;
+				}
+			}
+		}
+		if(!skip) {
+			var_t* v = var_find_own_member_var(src, k);
+			var_add(ret, k, v != NULL ? v : var_new(vm));
+		}
+	}
+	var_unref(keys);
+	return ret;
+}
+
 #define CLS_OBJECT "Object"
 
 void reg_native_Object(vm_t* vm) {
@@ -140,6 +404,16 @@ void reg_native_Object(vm_t* vm) {
 	vm_reg_static(vm, cls, "hasOwnProperty(name)", native_Object_hasOwnProperty, NULL); 
 	vm_reg_static(vm, cls, "keys()", native_Object_keys, NULL); 
 	vm_reg_static(vm, cls, "defineProperty(obj, name, descriptor)", native_Object_defineProperty, NULL); 
+	vm_reg_static(vm, cls, "assign(target, s1)", native_Object_assign, NULL);
+	vm_reg_static(vm, cls, "is(a, b)", native_Object_is, NULL);
+	vm_reg_static(vm, cls, "values(obj)", native_Object_values, NULL);
+	vm_reg_static(vm, cls, "entries(obj)", native_Object_entries, NULL);
+	vm_reg_static(vm, cls, "fromEntries(arr)", native_Object_fromEntries, NULL);
+	vm_reg_static(vm, cls, "freeze(obj)", native_Object_freeze, NULL);
+	vm_reg_static(vm, cls, "isFrozen(obj)", native_Object_isFrozen, NULL);
+	vm_reg_static(vm, cls, "getOwnPropertyNames(obj)", native_Object_getOwnPropertyNames, NULL);
+	vm_reg_static(vm, cls, "getOwnPropertyDescriptor(obj, prop)", native_Object_getOwnPropertyDescriptor, NULL);
+	vm_reg_native(vm, NULL, "__obj_rest(src, excluded)", native_obj_rest, NULL);
 }
 
 #ifdef __cplusplus

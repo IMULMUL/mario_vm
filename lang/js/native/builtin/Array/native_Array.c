@@ -76,10 +76,16 @@ var_t* native_Array_forEach(vm_t* vm, var_t* env, void* data) {
 	for(i=0; i<sz; ++i) {
 		node_t* n = var_array_get(arr, i);
 		if(n != NULL) {
-			var_t* args = var_new(vm);
-			var_add(args, "", n->var);
-			var_add(args, "", var_new_int(vm, i));
-			var_add(args, "", arr);
+			/* Build callback args as a proper array in forward order
+			 * (element, index, array) then reverse, matching call_m_func's
+			 * contract (see native_Map_forEach). The old var_new/var_add form
+			 * was invisible to var_array_size, so the callback received no
+			 * arguments and its parameters were all undefined. */
+			var_t* args = var_new_array(vm);
+			var_array_add(args, n->var);
+			var_array_add(args, var_new_int(vm, i));
+			var_array_add(args, arr);
+			var_array_reverse(args);
 			var_t* res = call_m_func(vm, env, f, args);
 			var_unref(args);
 			if(res != NULL)	
@@ -87,6 +93,124 @@ var_t* native_Array_forEach(vm_t* vm, var_t* env, void* data) {
 		}
 	}
 	return NULL;
+}
+
+var_t* native_Array_map(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = get_obj(env, THIS);
+	var_t* f = get_obj(env, "f");
+	var_t* ret = var_new_array(vm);
+	if(f == NULL || f->type == V_UNDEF) {
+		var_instance_from(ret, arr);
+		return ret;
+	}
+	uint32_t sz = var_array_size(arr);
+	uint32_t i;
+	for(i=0; i<sz; ++i) {
+		node_t* n = var_array_get(arr, i);
+		if(n != NULL) {
+			/* callback args in forward order then reversed (call_m_func contract). */
+			var_t* args = var_new_array(vm);
+			var_array_add(args, n->var);
+			var_array_add(args, var_new_int(vm, i));
+			var_array_add(args, arr);
+			var_array_reverse(args);
+			var_t* res = call_m_func(vm, env, f, args);
+			var_unref(args);
+			if(res != NULL) {
+				var_array_add(ret, res); // ret takes a ref to res
+				var_unref(res);          // release call_m_func's ref
+			}
+		}
+	}
+	var_instance_from(ret, arr);
+	return ret;
+}
+
+var_t* native_Array_filter(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = get_obj(env, THIS);
+	var_t* f = get_obj(env, "f");
+	var_t* ret = var_new_array(vm);
+	if(f == NULL || f->type == V_UNDEF) {
+		var_instance_from(ret, arr);
+		return ret;
+	}
+	uint32_t sz = var_array_size(arr);
+	uint32_t i;
+	for(i=0; i<sz; ++i) {
+		node_t* n = var_array_get(arr, i);
+		if(n != NULL) {
+			var_t* args = var_new_array(vm);
+			var_array_add(args, n->var);
+			var_array_add(args, var_new_int(vm, i));
+			var_array_add(args, arr);
+			var_array_reverse(args);
+			var_t* res = call_m_func(vm, env, f, args);
+			var_unref(args);
+			bool keep = (res != NULL) && var_get_bool(res);
+			if(res != NULL)
+				var_unref(res);
+			if(keep)
+				var_array_add(ret, n->var); // shares the original element
+		}
+	}
+	var_instance_from(ret, arr);
+	return ret;
+}
+
+var_t* native_Array_reduce(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = get_obj(env, THIS);
+	var_t* f = get_obj(env, "f");
+	uint32_t sz = var_array_size(arr);
+
+	if(f == NULL || f->type == V_UNDEF)
+		return NULL;
+
+	var_t* acc = NULL;
+	bool acc_owned = false; // true once acc is a call_m_func result we must release
+	uint32_t start;
+	var_t* initial = get_obj(env, "initial");
+	if(initial != NULL && initial->type != V_UNDEF) {
+		acc = initial; // borrowed from env; do not free
+		start = 0;
+	}
+	else {
+		if(sz == 0)
+			return NULL; // JS throws here; return undefined instead
+		node_t* n0 = var_array_get(arr, 0);
+		acc = (n0 != NULL) ? n0->var : NULL; // borrowed from arr
+		start = 1;
+	}
+
+	uint32_t i;
+	for(i=start; i<sz; ++i) {
+		node_t* n = var_array_get(arr, i);
+		if(n == NULL)
+			continue;
+		var_t* args = var_new_array(vm);
+		var_array_add(args, (acc != NULL) ? acc : var_new(vm));
+		var_array_add(args, n->var);
+		var_array_add(args, var_new_int(vm, i));
+		var_array_add(args, arr);
+		var_array_reverse(args);
+		var_t* res = call_m_func(vm, env, f, args);
+		var_unref(args);
+		if(acc_owned && acc != NULL)
+			var_unref(acc); // release the previous owned accumulator
+		acc = res;          // owned (refs>=1)
+		acc_owned = true;
+	}
+
+	if(acc == NULL)
+		return NULL;
+	/* Return the accumulator borrowed (refs matching the VM contract): drop the
+	 * single reference call_m_func handed us, mirroring func_call's own refs--
+	 * for a script return. Guarded so we never underflow. */
+	if(acc_owned && acc->refs > 0)
+		acc->refs--;
+	return acc;
 }
 
 var_t* native_Array_reverse(vm_t* vm, var_t* env, void* data) {
@@ -215,6 +339,9 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, "constructor()", native_Array_constructor, NULL);
 	vm_reg_native(vm, cls, "toString()", native_Array_toString, NULL); 
 	vm_reg_native(vm, cls, "forEach(f)", native_Array_forEach, NULL); 
+	vm_reg_native(vm, cls, "map(f)", native_Array_map, NULL);
+	vm_reg_native(vm, cls, "filter(f)", native_Array_filter, NULL);
+	vm_reg_native(vm, cls, "reduce(f, initial)", native_Array_reduce, NULL);
 	vm_reg_native(vm, cls, "reverse()", native_Array_reverse, NULL); 
 	vm_reg_native(vm, cls, "concat()", native_Array_concat, NULL); 
 	vm_reg_native(vm, cls, "join(c)", native_Array_join, NULL); 

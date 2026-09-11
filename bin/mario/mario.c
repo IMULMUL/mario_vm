@@ -102,6 +102,11 @@ static int doargs(int argc, char* argv[]) {
 bool js_compile(bytecode_t *bc, const char* input);
 
 int main(int argc, char** argv) {
+	/* Line-buffer stdout so script output (console.log) appears promptly even
+	 * when redirected to a file or pipe, instead of being withheld until the
+	 * 4 KiB block fills or the process exits. */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	if(doargs(argc, argv) != 0) {
 		printf("Usage: mario (-c/d/a) <filename>\n");
 		return -1;

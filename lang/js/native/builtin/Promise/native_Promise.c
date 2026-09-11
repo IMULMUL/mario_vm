@@ -39,6 +39,46 @@ static var_t* get_promise_proto(vm_t* vm) {
     return NULL;
 }
 
+/* Whether `x` is a Promise instance: walk its prototype chain looking for the
+ * Promise prototype. Only promise objects carry a promise_data in ->value. */
+static bool is_promise(vm_t* vm, var_t* x) {
+    if (x == NULL || x->type != V_OBJECT) {
+        return false;
+    }
+    var_t* proto = get_promise_proto(vm);
+    if (proto == NULL) {
+        return false;
+    }
+    var_t* p = var_get_prototype(x);
+    int guard = 0;
+    while (p != NULL && guard++ < 64) {
+        if (p == proto) {
+            return true;
+        }
+        p = var_get_prototype(p);
+    }
+    return false;
+}
+
+/* __await(x): the runtime helper for the ES `await` operator in this
+ * synchronous implementation. It unwraps a (possibly nested) promise and
+ * yields the underlying value; non-promise values pass through unchanged.
+ * The returned var is borrowed - func_call keeps it alive across env
+ * teardown, so we must NOT add our own reference here. */
+var_t* native_await(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* x = get_obj(env, "x");
+    int guard = 0;
+    while (is_promise(vm, x) && guard++ < 64) {
+        promise_data* pd = (promise_data*)x->value;
+        if (pd == NULL || pd->value == NULL) {
+            return NULL; /* await of an empty/pending promise -> undefined */
+        }
+        x = pd->value;
+    }
+    return x;
+}
+
 var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* thisV = get_obj(env, THIS);
@@ -266,6 +306,12 @@ void reg_native_Promise(vm_t* vm) {
     vm_reg_native(vm, cls, "then(onFulfilled, onRejected)", native_PromiseThen, NULL);
     vm_reg_native(vm, cls, "catch(onRejected)", native_PromiseCatch, NULL);
     vm_reg_native(vm, cls, "finally(onFinally)", native_PromiseFinally, NULL);
+
+    /* Runtime helpers for the synchronous async/await support. These are
+     * registered as global (free) functions so the compiler can emit
+     * `INSTR_CALL "__await$1"` / `"__promise_resolve$1"`. */
+    vm_reg_native(vm, NULL, "__await(x)", native_await, NULL);
+    vm_reg_native(vm, NULL, "__promise_resolve(value)", native_PromiseResolve, NULL);
 }
 
 #ifdef __cplusplus
