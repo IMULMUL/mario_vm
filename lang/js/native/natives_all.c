@@ -1,6 +1,7 @@
 #include "mario.h"
 #include "natives_builtin.h"
 #include "natives.h"
+#include <math.h>
 
 static inline var_t* vm_load_var(vm_t* vm, const char* name, bool create) {
 	node_t* n = vm_load_node(vm, name, create);
@@ -18,6 +19,14 @@ static inline void load_basic_classes(vm_t* vm) {
 
 	var_t* console = new_obj(vm, "Console", 0);
 	var_add(vm->root, "console", console);
+
+	/* Global numeric constants. `undefined`/`null` are lexer keywords, but NaN and
+	 * Infinity are ordinary global bindings; without them `Infinity` resolved to
+	 * undefined (e.g. [1,[2,[3,[4]]]].flat(Infinity) only flattened one level) and
+	 * NaN was indistinguishable from undefined. Registered const + unenumerable on
+	 * vm->root, matching how a JS global value binding behaves. */
+	vm_reg_var(vm, NULL, "Infinity", var_new_float(vm, (float)INFINITY), true);
+	vm_reg_var(vm, NULL, "NaN", var_new_float(vm, (float)NAN), true);
 }
 
 void reg_all_natives(vm_t* vm) {

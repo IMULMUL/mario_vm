@@ -367,7 +367,13 @@ var_t* native_PromiseAll(vm_t* vm, var_t* env, void* data) {
 
     promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
     pd->state = PROMISE_STATE_FULFILLED;
-    pd->value = var_new_array(vm);
+    /* promise_free() unrefs pd->value, so promise_data must OWN a reference on the
+     * result array (matching native_PromiseResolve's var_ref(value)); @@keep adds a
+     * second gc-only ref. Without this own ref the array sat at refs=1 (anchor only)
+     * and, when a then-callback returned this promise, promise_unwrap()'s release of
+     * the promise let promise_free drop the array to 0 -- freeing the adopted value,
+     * so the chained .then saw undefined. */
+    pd->value = var_ref(var_new_array(vm));
     pd->fulfilled_callbacks = var_new_array(vm);
     pd->rejected_callbacks = var_new_array(vm);
 
@@ -447,7 +453,8 @@ var_t* native_PromiseAllSettled(vm_t* vm, var_t* env, void* data) {
 
     promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
     pd->state = PROMISE_STATE_FULFILLED;
-    pd->value = var_new_array(vm);
+    /* Own a ref on the result array; see the identical note in native_PromiseAll. */
+    pd->value = var_ref(var_new_array(vm));
     pd->fulfilled_callbacks = var_new_array(vm);
     pd->rejected_callbacks = var_new_array(vm);
 

@@ -24,4 +24,4 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH)/JSON/JSON.o \
 	$(NATIVES_PATH)/JSON/native_JSON.o \
 	$(NATIVES_PATH)/Date/native_Date.o \
-	#$(NATIVES_PATH)/Math/native_Math.o
+	$(NATIVES_PATH)/Math/native_Math.o

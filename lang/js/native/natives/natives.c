@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 void reg_natives(vm_t* vm) {
-	//reg_native_Math(vm);
+	reg_native_Math(vm);
 	reg_native_Date(vm);
 	reg_native_JSON(vm);
 }

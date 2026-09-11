@@ -598,6 +598,333 @@ var_t* native_UTF8ReaderRead(vm_t* vm, var_t* env, void* data) {
 }
 
 
+/*===== ES6 String methods =====*/
+
+/* Decode one UTF-8 sequence at *p, advancing *p past it; yields the code point.
+ * Short/invalid sequences fall back to a single byte so we never read past NUL. */
+static uint32_t str_utf8_decode(const char** p) {
+	const unsigned char* s = (const unsigned char*)*p;
+	uint32_t cp;
+	if(s[0] < 0x80) { cp = s[0]; *p += 1; }
+	else if((s[0] & 0xE0) == 0xC0 && s[1] != 0) { cp = ((uint32_t)(s[0]&0x1F)<<6)|(s[1]&0x3F); *p += 2; }
+	else if((s[0] & 0xF0) == 0xE0 && s[1] != 0 && s[2] != 0) { cp = ((uint32_t)(s[0]&0x0F)<<12)|((uint32_t)(s[1]&0x3F)<<6)|(s[2]&0x3F); *p += 3; }
+	else if((s[0] & 0xF8) == 0xF0 && s[1] != 0 && s[2] != 0 && s[3] != 0) { cp = ((uint32_t)(s[0]&0x07)<<18)|((uint32_t)(s[1]&0x3F)<<12)|((uint32_t)(s[2]&0x3F)<<6)|(s[3]&0x3F); *p += 4; }
+	else { cp = s[0]; *p += 1; }
+	return cp;
+}
+
+/* Append the UTF-8 encoding of code point cp to out. */
+static void str_utf8_encode(mstr_t* out, uint32_t cp) {
+	if(cp < 0x80) {
+		mstr_add(out, (char)cp);
+	} else if(cp < 0x800) {
+		mstr_add(out, (char)(0xC0 | (cp >> 6)));
+		mstr_add(out, (char)(0x80 | (cp & 0x3F)));
+	} else if(cp < 0x10000) {
+		mstr_add(out, (char)(0xE0 | (cp >> 12)));
+		mstr_add(out, (char)(0x80 | ((cp >> 6) & 0x3F)));
+		mstr_add(out, (char)(0x80 | (cp & 0x3F)));
+	} else {
+		mstr_add(out, (char)(0xF0 | (cp >> 18)));
+		mstr_add(out, (char)(0x80 | ((cp >> 12) & 0x3F)));
+		mstr_add(out, (char)(0x80 | ((cp >> 6) & 0x3F)));
+		mstr_add(out, (char)(0x80 | (cp & 0x3F)));
+	}
+}
+
+/* Append `need` padding characters, cycling through pad (spaces if pad is empty). */
+static void str_build_pad(mstr_t* out, const char* pad, int need) {
+	int plen = (pad == NULL) ? 0 : (int)strlen(pad);
+	int i;
+	if(plen == 0) {
+		for(i = 0; i < need; i++) mstr_add(out, ' ');
+		return;
+	}
+	for(i = 0; i < need; i++) mstr_add(out, pad[i % plen]);
+}
+
+var_t* native_StringStartsWith(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	const char* search = get_str(env, "searchString");
+	int len = (int)strlen(s);
+	int slen = (int)strlen(search);
+	int pos = 0;
+	var_t* pv = var_find_own_member_var(get_obj(env, THIS), "position");
+	if(pv != NULL) pos = var_get_int(pv);
+	if(pos < 0) pos = 0;
+	if(pos > len) pos = len;
+	if(slen == 0) return var_new_bool(vm, true);
+	if(pos + slen > len) return var_new_bool(vm, false);
+	return var_new_bool(vm, strncmp(s + pos, search, (size_t)slen) == 0);
+}
+
+var_t* native_StringEndsWith(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	const char* search = get_str(env, "searchString");
+	int len = (int)strlen(s);
+	int slen = (int)strlen(search);
+	int end = len;
+	var_t* ev = var_find_own_member_var(get_obj(env, THIS), "endPosition");
+	if(ev != NULL) end = var_get_int(ev);
+	if(end < 0) end = 0;
+	if(end > len) end = len;
+	if(slen == 0) return var_new_bool(vm, true);
+	if(slen > end) return var_new_bool(vm, false);
+	return var_new_bool(vm, strncmp(s + end - slen, search, (size_t)slen) == 0);
+}
+
+var_t* native_StringIncludes(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	const char* search = get_str(env, "searchString");
+	int len = (int)strlen(s);
+	int slen = (int)strlen(search);
+	int pos = 0;
+	var_t* pv = var_find_own_member_var(get_obj(env, THIS), "position");
+	if(pv != NULL) pos = var_get_int(pv);
+	if(pos < 0) pos = 0;
+	if(pos > len) pos = len;
+	if(slen == 0) return var_new_bool(vm, true);
+	if(pos + slen > len) return var_new_bool(vm, false);
+	return var_new_bool(vm, strstr(s + pos, search) != NULL);
+}
+
+var_t* native_StringRepeat(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int count = get_int(env, "count");
+	mstr_t* result = mstr_new("");
+	int i;
+	for(i = 0; i < count; i++)
+		mstr_append(result, s);
+	var_t* ret = var_new_str(vm, result->cstr);
+	mstr_free(result);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+var_t* native_StringPadStart(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int len = (int)strlen(s);
+	int target = get_int(env, "targetLength");
+	mstr_t* result = mstr_new("");
+	if(target > len)
+		str_build_pad(result, get_str(env, "padString"), target - len);
+	mstr_append(result, s);
+	var_t* ret = var_new_str(vm, result->cstr);
+	mstr_free(result);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+var_t* native_StringPadEnd(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int len = (int)strlen(s);
+	int target = get_int(env, "targetLength");
+	mstr_t* result = mstr_new("");
+	mstr_append(result, s);
+	if(target > len)
+		str_build_pad(result, get_str(env, "padString"), target - len);
+	var_t* ret = var_new_str(vm, result->cstr);
+	mstr_free(result);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+var_t* native_StringCodePointAt(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int pos = get_int(env, "position");
+	if(pos < 0) return NULL;  /* undefined */
+	const char* p = s;
+	int i = 0;
+	while(*p != 0 && i < pos) { str_utf8_decode(&p); i++; }
+	if(*p == 0) return NULL;  /* out of range -> undefined */
+	uint32_t cp = str_utf8_decode(&p);
+	return var_new_int(vm, (int)cp);
+}
+
+/* String.fromCodePoint(...) - static; builds a string from code points. */
+var_t* native_String_fromCodePoint(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	uint32_t n = get_func_args_num(env);
+	mstr_t* out = mstr_new("");
+	uint32_t i;
+	for(i = 0; i < n; i++) {
+		var_t* a = get_func_arg(env, i);
+		if(a == NULL) continue;
+		str_utf8_encode(out, (uint32_t)var_get_int(a));
+	}
+	var_t* ret = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	return ret;
+}
+
+/* --- String.prototype.normalize (NFC / NFD over the Latin ranges) -----------
+ * Unicode canonical composition pairs {composed, base, combining-mark} for the
+ * precomposed characters in Latin-1 Supplement and Latin Extended-A. NFC composes
+ * a starter with a following combining mark found here; NFD reverses it. This is
+ * the standard canonical mapping data for these blocks (e.g. U+00E5 'å' is the
+ * canonical composition of U+0061 'a' + U+030A combining ring above), so
+ * "a\u030A".normalize() === "\u00E5" and .length becomes 1. Combining marks are
+ * the Combining Diacritical Marks block U+0300..U+036F. */
+static const uint32_t g_nfc_table[][3] = {
+	{0x00C0,0x0041,0x0300},{0x00C1,0x0041,0x0301},{0x00C2,0x0041,0x0302},
+	{0x00C3,0x0041,0x0303},{0x00C4,0x0041,0x0308},{0x00C5,0x0041,0x030A},
+	{0x00C7,0x0043,0x0327},
+	{0x00C8,0x0045,0x0300},{0x00C9,0x0045,0x0301},{0x00CA,0x0045,0x0302},{0x00CB,0x0045,0x0308},
+	{0x00CC,0x0049,0x0300},{0x00CD,0x0049,0x0301},{0x00CE,0x0049,0x0302},{0x00CF,0x0049,0x0308},
+	{0x00D1,0x004E,0x0303},
+	{0x00D2,0x004F,0x0300},{0x00D3,0x004F,0x0301},{0x00D4,0x004F,0x0302},
+	{0x00D5,0x004F,0x0303},{0x00D6,0x004F,0x0308},
+	{0x00D9,0x0055,0x0300},{0x00DA,0x0055,0x0301},{0x00DB,0x0055,0x0302},{0x00DC,0x0055,0x0308},
+	{0x00DD,0x0059,0x0301},
+	{0x00E0,0x0061,0x0300},{0x00E1,0x0061,0x0301},{0x00E2,0x0061,0x0302},
+	{0x00E3,0x0061,0x0303},{0x00E4,0x0061,0x0308},{0x00E5,0x0061,0x030A},
+	{0x00E7,0x0063,0x0327},
+	{0x00E8,0x0065,0x0300},{0x00E9,0x0065,0x0301},{0x00EA,0x0065,0x0302},{0x00EB,0x0065,0x0308},
+	{0x00EC,0x0069,0x0300},{0x00ED,0x0069,0x0301},{0x00EE,0x0069,0x0302},{0x00EF,0x0069,0x0308},
+	{0x00F1,0x006E,0x0303},
+	{0x00F2,0x006F,0x0300},{0x00F3,0x006F,0x0301},{0x00F4,0x006F,0x0302},
+	{0x00F5,0x006F,0x0303},{0x00F6,0x006F,0x0308},
+	{0x00F9,0x0075,0x0300},{0x00FA,0x0075,0x0301},{0x00FB,0x0075,0x0302},{0x00FC,0x0075,0x0308},
+	{0x00FD,0x0079,0x0301},{0x00FF,0x0079,0x0308},
+	{0x0100,0x0041,0x0304},{0x0101,0x0061,0x0304},
+	{0x0102,0x0041,0x0306},{0x0103,0x0061,0x0306},
+	{0x0104,0x0041,0x0328},{0x0105,0x0061,0x0328},
+	{0x0106,0x0043,0x0301},{0x0107,0x0063,0x0301},
+	{0x0108,0x0043,0x0302},{0x0109,0x0063,0x0302},
+	{0x010A,0x0043,0x0307},{0x010B,0x0063,0x0307},
+	{0x010C,0x0043,0x030C},{0x010D,0x0063,0x030C},
+	{0x010E,0x0044,0x030C},{0x010F,0x0064,0x030C},
+	{0x0112,0x0045,0x0304},{0x0113,0x0065,0x0304},
+	{0x0114,0x0045,0x0306},{0x0115,0x0065,0x0306},
+	{0x0116,0x0045,0x0307},{0x0117,0x0065,0x0307},
+	{0x011A,0x0045,0x030C},{0x011B,0x0065,0x030C},
+	{0x011C,0x0047,0x0302},{0x011D,0x0067,0x0302},
+	{0x011E,0x0047,0x0306},{0x011F,0x0067,0x0306},
+	{0x0120,0x0047,0x0307},{0x0121,0x0067,0x0307},
+	{0x0122,0x0047,0x0327},{0x0123,0x0067,0x0327},
+	{0x0128,0x0049,0x0303},{0x0129,0x0069,0x0303},
+	{0x012A,0x0049,0x0304},{0x012B,0x0069,0x0304},
+	{0x012C,0x0049,0x0306},{0x012D,0x0069,0x0306},
+	{0x0130,0x0049,0x0307},
+	{0x0134,0x004A,0x0302},{0x0135,0x006A,0x0302},
+	{0x0136,0x004B,0x0327},{0x0137,0x006B,0x0327},
+	{0x0139,0x004C,0x0301},{0x013A,0x006C,0x0301},
+	{0x013B,0x004C,0x0327},{0x013C,0x006C,0x0327},
+	{0x013D,0x004C,0x030C},{0x013E,0x006C,0x030C},
+	{0x0143,0x004E,0x0301},{0x0144,0x006E,0x0301},
+	{0x0145,0x004E,0x0327},{0x0146,0x006E,0x0327},
+	{0x0147,0x004E,0x030C},{0x0148,0x006E,0x030C},
+	{0x014C,0x004F,0x0304},{0x014D,0x006F,0x0304},
+	{0x014E,0x004F,0x0306},{0x014F,0x006F,0x0306},
+	{0x0150,0x004F,0x030B},{0x0151,0x006F,0x030B},
+	{0x0154,0x0052,0x0301},{0x0155,0x0072,0x0301},
+	{0x0156,0x0052,0x0327},{0x0157,0x0072,0x0327},
+	{0x0158,0x0052,0x030C},{0x0159,0x0072,0x030C},
+	{0x015A,0x0053,0x0301},{0x015B,0x0073,0x0301},
+	{0x015C,0x0053,0x0302},{0x015D,0x0073,0x0302},
+	{0x015E,0x0053,0x0327},{0x015F,0x0073,0x0327},
+	{0x0160,0x0053,0x030C},{0x0161,0x0073,0x030C},
+	{0x0162,0x0054,0x0327},{0x0163,0x0074,0x0327},
+	{0x0164,0x0054,0x030C},{0x0165,0x0074,0x030C},
+	{0x0168,0x0055,0x0303},{0x0169,0x0075,0x0303},
+	{0x016A,0x0055,0x0304},{0x016B,0x0075,0x0304},
+	{0x016C,0x0055,0x0306},{0x016D,0x0075,0x0306},
+	{0x016E,0x0055,0x030A},{0x016F,0x0075,0x030A},
+	{0x0170,0x0055,0x030B},{0x0171,0x0075,0x030B},
+	{0x0172,0x0055,0x0328},{0x0173,0x0075,0x0328},
+	{0x0174,0x0057,0x0302},{0x0175,0x0077,0x0302},
+	{0x0176,0x0059,0x0302},{0x0177,0x0079,0x0302},
+	{0x0178,0x0059,0x0308},
+	{0x0179,0x005A,0x0301},{0x017A,0x007A,0x0301},
+	{0x017B,0x005A,0x0307},{0x017C,0x007A,0x0307},
+	{0x017D,0x005A,0x030C},{0x017E,0x007A,0x030C},
+};
+#define NFC_TABLE_LEN (sizeof(g_nfc_table)/sizeof(g_nfc_table[0]))
+
+static inline bool str_is_combining(uint32_t cp) {
+	return cp >= 0x0300 && cp <= 0x036F;
+}
+
+/* Canonical composition of (base, mark); 0 if no precomposed form is known. */
+static uint32_t nfc_compose(uint32_t base, uint32_t mark) {
+	size_t i;
+	for(i = 0; i < NFC_TABLE_LEN; i++)
+		if(g_nfc_table[i][1] == base && g_nfc_table[i][2] == mark)
+			return g_nfc_table[i][0];
+	return 0;
+}
+
+/* Canonical decomposition of a precomposed cp; returns true and sets *base/*mark. */
+static bool nfd_decompose(uint32_t cp, uint32_t* base, uint32_t* mark) {
+	size_t i;
+	for(i = 0; i < NFC_TABLE_LEN; i++)
+		if(g_nfc_table[i][0] == cp) {
+			*base = g_nfc_table[i][1];
+			*mark = g_nfc_table[i][2];
+			return true;
+		}
+	return false;
+}
+
+var_t* native_StringNormalize(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	/* Optional form argument; default (and the tested path) is NFC. */
+	const char* form = "NFC";
+	var_t* fv = var_find_own_member_var(get_obj(env, THIS), "form");
+	if(fv != NULL && fv->type == V_STRING) form = var_get_str(fv);
+	bool decompose = (strcmp(form, "NFD") == 0 || strcmp(form, "NFKD") == 0);
+
+	mstr_t* out = mstr_new("");
+	const char* p = s;
+	if(decompose) {
+		while(*p != 0) {
+			uint32_t cp = str_utf8_decode(&p);
+			uint32_t base, mark;
+			if(nfd_decompose(cp, &base, &mark)) {
+				str_utf8_encode(out, base);
+				str_utf8_encode(out, mark);
+			} else {
+				str_utf8_encode(out, cp);
+			}
+		}
+	} else {
+		/* NFC: compose each starter with the combining marks that follow it, for as
+		 * long as a canonical composition exists. Marks that cannot compose (or that
+		 * follow another mark) are emitted unchanged. */
+		while(*p != 0) {
+			uint32_t cp = str_utf8_decode(&p);
+			if(str_is_combining(cp)) { /* mark with no composable starter: emit as-is */
+				str_utf8_encode(out, cp);
+				continue;
+			}
+			uint32_t starter = cp;
+			while(*p != 0) {
+				const char* q = p;
+				uint32_t mk = str_utf8_decode(&q);
+				if(!str_is_combining(mk)) break;
+				uint32_t c = nfc_compose(starter, mk);
+				if(c == 0) break;
+				starter = c;
+				p = q; /* consume the composed mark */
+			}
+			str_utf8_encode(out, starter);
+		}
+	}
+	var_t* ret = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+
 #define CLS_STRING "String"
 #define CLS_UTF8 "UTF8"
 #define CLS_UTF8_READER "UTF8Reader"
@@ -621,6 +948,15 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "toLowerCase()", native_StringToLowerCase, NULL); 
 	vm_reg_native(vm, cls, "toUpperCase()", native_StringToUpperCase, NULL); 
 	vm_reg_native(vm, cls, "replace(searchValue, replacement)", native_StringReplace, NULL); 
+	vm_reg_native(vm, cls, "startsWith(searchString, position)", native_StringStartsWith, NULL); 
+	vm_reg_native(vm, cls, "endsWith(searchString, endPosition)", native_StringEndsWith, NULL); 
+	vm_reg_native(vm, cls, "includes(searchString, position)", native_StringIncludes, NULL); 
+	vm_reg_native(vm, cls, "repeat(count)", native_StringRepeat, NULL); 
+	vm_reg_native(vm, cls, "padStart(targetLength, padString)", native_StringPadStart, NULL); 
+	vm_reg_native(vm, cls, "padEnd(targetLength, padString)", native_StringPadEnd, NULL); 
+	vm_reg_native(vm, cls, "codePointAt(position)", native_StringCodePointAt, NULL); 
+	vm_reg_native(vm, cls, "normalize(form)", native_StringNormalize, NULL); 
+	vm_reg_static(vm, cls, "fromCodePoint()", native_String_fromCodePoint, NULL); 
 	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_String_iterator, NULL); 
 
 	cls = vm_new_class(vm, CLS_UTF8);

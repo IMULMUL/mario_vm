@@ -20,6 +20,20 @@ extern "C" {
 #define F_RNG(a,min,max)    ((a)<(min) ? min : ((a)>(max) ? max : a ))
 #define F_ROUND(a)          ((a)>0 ? (int) ((a)+0.5) : (int) ((a)-0.5) )
 
+/* Box a double as a JS Number. Mario distinguishes V_INT and V_FLOAT, but JS has
+ * one Number type: Math.trunc(5.9) must Object.is-match the integer literal 5.
+ * Return an int when the value is integral (within a tiny tolerance for libm
+ * noise such as log10(1000) == 2.9999999999999996) and fits an int32, else a
+ * float. Mirrors the int/float choice math_op() makes for the ** operator. */
+static var_t* math_num(vm_t* vm, double r) {
+	if(!isnan(r) && !isinf(r)) {
+		double rr = floor(r);
+		if(fabs(r - rr) < 1e-9 && rr >= -2147483648.0 && rr <= 2147483647.0)
+			return var_new_int(vm, (int)rr);
+	}
+	return var_new_float(vm, (float)r);
+}
+
 //Math.abs(x) - returns absolute of given value
 var_t* native_math_abs(vm_t* vm, var_t* env, void *data) {
 	(void)vm; (void)data;
@@ -242,7 +256,65 @@ var_t* native_math_log(vm_t* vm, var_t* env, void *data) {
 var_t* native_math_log10(vm_t* vm, var_t* env, void *data) {
 	(void)vm; (void)data;
 	float f = get_float(env, "a");
-	return var_new_float(vm, (180.0/K_PI)*(log10(f)));
+	return math_num(vm, log10((double)f));
+}
+
+//Math.log2(a) - returns logaritm(base 2) of given value
+var_t* native_math_log2(vm_t* vm, var_t* env, void *data) {
+	(void)vm; (void)data;
+	float f = get_float(env, "a");
+	return math_num(vm, log2((double)f));
+}
+
+//Math.trunc(a) - removes the fractional part (toward zero), unlike round().
+var_t* native_math_trunc(vm_t* vm, var_t* env, void *data) {
+	(void)vm; (void)data;
+	float f = get_float(env, "a");
+	return math_num(vm, trunc((double)f));
+}
+
+//Math.cbrt(a) - cube root.
+var_t* native_math_cbrt(vm_t* vm, var_t* env, void *data) {
+	(void)vm; (void)data;
+	float f = get_float(env, "a");
+	return math_num(vm, cbrt((double)f));
+}
+
+//Math.hypot(...) - sqrt(sum of squares) of all arguments (variadic).
+var_t* native_math_hypot(vm_t* vm, var_t* env, void *data) {
+	(void)vm; (void)data;
+	uint32_t n = get_func_args_num(env);
+	double sum = 0.0;
+	uint32_t i;
+	for(i = 0; i < n; i++) {
+		double v = (double)var_get_float(get_func_arg(env, i));
+		sum += v * v;
+	}
+	return math_num(vm, sqrt(sum));
+}
+
+//Math.imul(a,b) - C-like 32-bit integer multiplication (wraps on overflow).
+var_t* native_math_imul(vm_t* vm, var_t* env, void *data) {
+	(void)vm; (void)data;
+	int32_t a = (int32_t)var_get_float(get_func_arg(env, 0));
+	int32_t b = (int32_t)var_get_float(get_func_arg(env, 1));
+	uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
+	int32_t r = (int32_t)(ua * ub);
+	return var_new_int(vm, (int)r);
+}
+
+//Math.clz32(a) - count leading zero bits of the 32-bit integer representation.
+var_t* native_math_clz32(vm_t* vm, var_t* env, void *data) {
+	(void)vm; (void)data;
+	uint32_t x = (uint32_t)(int32_t)var_get_float(get_func_arg(env, 0));
+	int count = 0;
+	if(x == 0)
+		return var_new_int(vm, 32);
+	while((x & 0x80000000u) == 0) {
+		count++;
+		x <<= 1;
+	}
+	return var_new_int(vm, count);
 }
 
 //Math.exp(a) - returns e raised to the power of a given number
@@ -320,8 +392,16 @@ void reg_native_Math(vm_t* vm) {
 	vm_reg_static(vm, cls, "E()", native_math_E, NULL);
 	vm_reg_static(vm, cls, "log(a)", native_math_log, NULL);
 	vm_reg_static(vm, cls, "log10(a)", native_math_log10, NULL);
+	vm_reg_static(vm, cls, "log2(a)", native_math_log2, NULL);
 	vm_reg_static(vm, cls, "exp(a)", native_math_exp, NULL);
 	vm_reg_static(vm, cls, "pow(a,b)", native_math_pow, NULL);
+
+	/* ES6 Math additions */
+	vm_reg_static(vm, cls, "trunc(a)", native_math_trunc, NULL);
+	vm_reg_static(vm, cls, "cbrt(a)", native_math_cbrt, NULL);
+	vm_reg_static(vm, cls, "hypot()", native_math_hypot, NULL);
+	vm_reg_static(vm, cls, "imul(a,b)", native_math_imul, NULL);
+	vm_reg_static(vm, cls, "clz32(a)", native_math_clz32, NULL);
 
 	vm_reg_static(vm, cls, "sqr(a)", native_math_sqr, NULL);
 	vm_reg_static(vm, cls, "sqrt(a)", native_math_sqrt, NULL);    

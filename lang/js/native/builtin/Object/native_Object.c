@@ -7,6 +7,13 @@ extern "C" {
 
 /** Object */
 
+/* Defined below (ES6 statics section); forward-declared for native_Object_keys. */
+static void var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only);
+
+/* From native_Symbol.c: resolve a "@@S:..." property-key string back to its
+ * canonical symbol object (borrowed ref). Used by getOwnPropertySymbols. */
+extern var_t* symbol_lookup_by_key(vm_t* vm, const char* key);
+
 var_t* native_Object_create(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 	var_t* proto = get_obj(env, "proto");
@@ -113,10 +120,13 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 
 var_t* native_Object_keys(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* obj = get_obj(env, THIS);
-
+	/* Object.keys(obj) is a static: the target is argument 0, NOT `this` (which
+	 * is the Object constructor). Using THIS enumerated Object's own (unenumerable
+	 * statics) members and returned []. Match native_Object_values/entries: own
+	 * enumerable string keys only, no prototype chain. */
+	var_t* obj = get_func_arg(env, 0);
 	var_t* keys = var_new_array(vm);
-	uint32_t num = var_properties_num(vm, obj, keys, true);	
+	var_own_keys(vm, obj, keys, true);
 	return keys;
 }
 
@@ -273,6 +283,12 @@ var_t* native_Object_is(vm_t* vm, var_t* env, void* data) {
 		case V_FLOAT: return var_new_bool(vm, *(float*)a->value == *(float*)b->value);
 		case V_BOOL: return var_new_bool(vm, var_get_bool(a) == var_get_bool(b));
 		case V_STRING: return var_new_bool(vm, strcmp(var_get_str(a), var_get_str(b)) == 0);
+		/* undefined and null are singletons by value: two distinct var_t's of the
+		 * same type are still Object.is-equal. Without these cases they fell to the
+		 * default pointer compare and Object.is(undefined, undefined) was false,
+		 * breaking every eq(x, undefined) assertion. Types already match here. */
+		case V_UNDEF:
+		case V_NULL: return var_new_bool(vm, true);
 		default: return var_new_bool(vm, a == b);
 	}
 }
@@ -368,6 +384,43 @@ var_t* native_Object_getOwnPropertyNames(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* Object.getOwnPropertySymbols(obj): the symbol keys of obj's OWN properties.
+ * A symbol-keyed member is stored under the symbol's "@@S:..." key string (see
+ * handle_memberv / var_symbol_key) and marked non-enumerable; resolve each such
+ * own member back to its canonical symbol object via the symbol registry. */
+typedef struct {
+	vm_t* vm;
+	var_t* arr;
+} own_syms_cb_data;
+
+static void own_syms_cb(const char* key, void* value, void* user_data) {
+	(void)key;
+	own_syms_cb_data* d = (own_syms_cb_data*)user_data;
+	node_t* node = (node_t*)value;
+	if(node == NULL || node->be_inherited || node->invisable || node->name == NULL)
+		return;
+	if(strncmp(node->name, SYMKEY_PREFIX, strlen(SYMKEY_PREFIX)) != 0)
+		return;
+	var_t* sym = symbol_lookup_by_key(d->vm, node->name);
+	if(sym != NULL)
+		var_array_add(d->arr, sym); /* var_array_add (node_new) refs it */
+}
+
+var_t* native_Object_getOwnPropertySymbols(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	var_t* ret = var_new_array(vm);
+	if(obj == NULL)
+		return ret;
+	vm->gc.gc_defer++; /* ret is unrooted here; see var_own_keys(). */
+	own_syms_cb_data d;
+	d.vm = vm;
+	d.arr = ret;
+	hash_map_iterate(&obj->children, own_syms_cb, &d);
+	vm->gc.gc_defer--;
+	return ret;
+}
+
 var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_func_arg(env, 0);
@@ -437,6 +490,7 @@ void reg_native_Object(vm_t* vm) {
 	vm_reg_static(vm, cls, "freeze(obj)", native_Object_freeze, NULL);
 	vm_reg_static(vm, cls, "isFrozen(obj)", native_Object_isFrozen, NULL);
 	vm_reg_static(vm, cls, "getOwnPropertyNames(obj)", native_Object_getOwnPropertyNames, NULL);
+	vm_reg_static(vm, cls, "getOwnPropertySymbols(obj)", native_Object_getOwnPropertySymbols, NULL);
 	vm_reg_static(vm, cls, "getOwnPropertyDescriptor(obj, prop)", native_Object_getOwnPropertyDescriptor, NULL);
 	vm_reg_native(vm, NULL, "__obj_rest(src, excluded)", native_obj_rest, NULL);
 	/* for-in lowering (stmt_for_in) calls this by INSTR_CALL "__enum_keys$1". */

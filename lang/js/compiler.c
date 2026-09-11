@@ -218,6 +218,11 @@ void lex_get_js_str(lex_t* lex) {
                     mstr_add(lex->tk_str, (char)strtol(buf, 0, 16));
                 }
                 break;
+                case 'u':
+                    /* ES6 \uXXXX / \u{...} escape (emits UTF-8, combines surrogate
+                     * pairs); leaves curr_ch on the last consumed char. */
+                    lex_read_u_escape(lex);
+                break;
                 default:
                     if (lex->curr_ch >= '0' && lex->curr_ch <= '7') {
                         // octal digits

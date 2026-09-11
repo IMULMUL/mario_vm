@@ -21,6 +21,8 @@ extern "C" {
 
 static uint32_t g_sym_id = 0;
 
+static var_t* get_registry(vm_t* vm); /* defined below */
+
 static var_t* make_symbol(vm_t* vm, var_t* proto, const char* key, const char* desc) {
     var_t* sym = var_new_obj(vm, proto, NULL, NULL);
     var_t* d = var_new_str(vm, desc ? desc : "");
@@ -53,13 +55,32 @@ var_t* native_Symbol_call(vm_t* vm, var_t* env, void* data) {
     const char* desc = get_str(env, "desc");
     char key[96];
     snprintf(key, sizeof(key), "%s%s#%u", SYMKEY_PREFIX, desc ? desc : "", g_sym_id++);
-    return make_symbol(vm, proto, key, desc); /* refs=0, owned by caller */
+    var_t* sym = make_symbol(vm, proto, key, desc); /* refs=0, owned by caller */
+    /* Also register the symbol in the global registry (keyed by its unique key)
+     * so Object.getOwnPropertySymbols can map an object's symbol-keyed member --
+     * which is stored under the key STRING -- back to the identical symbol var. */
+    var_t* registry = get_registry(vm);
+    if (registry != NULL) {
+        node_t* rn = var_add(registry, key, sym);
+        if (rn != NULL) { rn->be_unenumerable = 1; rn->invisable = 1; }
+    }
+    return sym;
 }
 
 static var_t* get_registry(vm_t* vm) {
     var_t* symfn = var_find_own_member_var(vm->root, "Symbol");
     if (symfn == NULL) return NULL;
     return var_find_own_member_var(symfn, "@@registry");
+}
+
+/* Look up the canonical symbol object for a property-key string (the "@@S:..."
+ * name an object member carries when keyed by a symbol). Returns a borrowed ref
+ * (owned by the registry) or NULL if the key is not a registered symbol. */
+var_t* symbol_lookup_by_key(vm_t* vm, const char* key) {
+    if (key == NULL) return NULL;
+    var_t* registry = get_registry(vm);
+    if (registry == NULL) return NULL;
+    return var_find_own_member_var(registry, key);
 }
 
 var_t* native_Symbol_for(vm_t* vm, var_t* env, void* data) {
@@ -121,6 +142,9 @@ void reg_native_Symbol(vm_t* vm) {
         var_t* s = make_symbol(vm, proto, wk[i].key, desc);
         node_t* n = var_add(symfn, wk[i].name, s);
         if (n != NULL) { n->be_unenumerable = 1; n->be_const = 1; }
+        /* Also index by key so getOwnPropertySymbols can resolve well-known keys. */
+        node_t* rn = var_add(registry, wk[i].key, s);
+        if (rn != NULL) { rn->be_unenumerable = 1; rn->invisable = 1; }
     }
 
     vm_reg_native_on(vm, symfn, "for(key)", native_Symbol_for, proto);
