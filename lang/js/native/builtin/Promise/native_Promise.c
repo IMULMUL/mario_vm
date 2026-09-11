@@ -31,6 +31,30 @@ static void promise_free(void* p) {
     mario_free(pd);
 }
 
+/* The gc mark phase ignores refcounts: anything reachable only from the
+ * C-side promise_data would be swept while the promise object is alive
+ * (same hazard as Set/Map's C storage). Mirror the C-held vars into a
+ * hidden @@keep member so they stay gc-reachable. */
+static void promise_anchor(vm_t* vm, var_t* promise, promise_data* pd) {
+    vm->gc.gc_defer++; /* rebuild window: entries are unreachable between remove and re-add */
+    var_t* keep = var_find_own_member_var(promise, "@@keep");
+    if (keep == NULL) {
+        node_t* kn = var_add(promise, "@@keep", var_new_array(vm));
+        kn->invisable = 1;
+        kn->be_unenumerable = 1;
+        keep = kn->var;
+    }
+    var_t* arr = var_find_own_member_var(keep, "_ARRAY_");
+    if (arr != NULL) {
+        var_remove_all(arr); /* frees the buckets and leaves them NULL */
+        hash_map_init(&arr->children);
+    }
+    if (pd->value) var_array_add(keep, pd->value);
+    if (pd->fulfilled_callbacks) var_array_add(keep, pd->fulfilled_callbacks);
+    if (pd->rejected_callbacks) var_array_add(keep, pd->rejected_callbacks);
+    vm->gc.gc_defer--;
+}
+
 static var_t* get_promise_proto(vm_t* vm) {
     node_t* n = vm_load_node(vm, CLS_PROMISE, false);
     if (n != NULL && n->var != NULL) {
@@ -60,6 +84,25 @@ static bool is_promise(vm_t* vm, var_t* x) {
     return false;
 }
 
+/* Promise adoption: a then-callback returning a promise resolves the chained
+ * promise with that promise's settled value, not the promise object itself.
+ * Consumes the ref carried by `result` when swapping it for the inner value. */
+static var_t* promise_unwrap(vm_t* vm, var_t* result) {
+    int guard = 0;
+    while (result != NULL && is_promise(vm, result) && guard++ < 64) {
+        promise_data* rpd = (promise_data*)result->value;
+        var_t* inner = (rpd != NULL) ? rpd->value : NULL;
+        if (inner == NULL) { /* pending/empty promise -> undefined */
+            var_unref(result);
+            return NULL;
+        }
+        var_ref(inner);
+        var_unref(result);
+        result = inner;
+    }
+    return result;
+}
+
 /* __await(x): the runtime helper for the ES `await` operator in this
  * synchronous implementation. It unwraps a (possibly nested) promise and
  * yields the underlying value; non-promise values pass through unchanged.
@@ -79,6 +122,57 @@ var_t* native_await(vm_t* vm, var_t* env, void* data) {
     return x;
 }
 
+/* The executor's resolve/reject arguments: native closures whose data points
+ * at the promise var. The promise stays alive across the executor call (it is
+ * stack-anchored by the constructor), and these fns are members of the promise
+ * itself, so the bare data pointer can not outlive its target in the
+ * synchronous flows exercised here. */
+static var_t* native_promise_resolve_cb(vm_t* vm, var_t* env, void* data) {
+    var_t* promise = (var_t*)data;
+    var_t* value = get_obj(env, "value");
+    promise_data* pd = (promise_data*)promise->value;
+    if (pd != NULL && pd->state == PROMISE_STATE_PENDING) {
+        pd->state = PROMISE_STATE_FULFILLED;
+        pd->value = (value != NULL) ? var_ref(value) : var_ref(var_new(vm));
+        promise_anchor(vm, promise, pd);
+        uint32_t n = var_array_size(pd->fulfilled_callbacks);
+        for (uint32_t i = 0; i < n; i++) {
+            var_t* cb = var_array_get_var(pd->fulfilled_callbacks, i);
+            if (cb != NULL && cb->is_func) {
+                var_t* args = var_new_array(vm);
+                var_array_add(args, pd->value);
+                var_t* r = call_m_func(vm, promise, cb, args);
+                if (r != NULL) var_unref(r);
+                var_unref(args);
+            }
+        }
+    }
+    return NULL;
+}
+
+static var_t* native_promise_reject_cb(vm_t* vm, var_t* env, void* data) {
+    var_t* promise = (var_t*)data;
+    var_t* reason = get_obj(env, "reason");
+    promise_data* pd = (promise_data*)promise->value;
+    if (pd != NULL && pd->state == PROMISE_STATE_PENDING) {
+        pd->state = PROMISE_STATE_REJECTED;
+        pd->value = (reason != NULL) ? var_ref(reason) : var_ref(var_new(vm));
+        promise_anchor(vm, promise, pd);
+        uint32_t n = var_array_size(pd->rejected_callbacks);
+        for (uint32_t i = 0; i < n; i++) {
+            var_t* cb = var_array_get_var(pd->rejected_callbacks, i);
+            if (cb != NULL && cb->is_func) {
+                var_t* args = var_new_array(vm);
+                var_array_add(args, pd->value);
+                var_t* r = call_m_func(vm, promise, cb, args);
+                if (r != NULL) var_unref(r);
+                var_unref(args);
+            }
+        }
+    }
+    return NULL;
+}
+
 var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* thisV = get_obj(env, THIS);
@@ -92,16 +186,32 @@ var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
 
     var_t* obj = var_new_obj_no_proto(vm, pd, promise_free);
     var_instance_from(obj, thisV);
+    promise_anchor(vm, obj, pd);
+    var_ref(obj); /* off the gc list: the executor call below may trigger a gc */
+    vm_push(vm, obj); /* stack-anchored so its children get gc-marked during the call */
 
     if (executor != NULL) {
+        node_t* rn = vm_reg_native_on(vm, obj, "__resolve(value)", native_promise_resolve_cb, obj);
+        node_t* jn = vm_reg_native_on(vm, obj, "__reject(reason)", native_promise_reject_cb, obj);
+        rn->invisable = 1;
+        rn->be_unenumerable = 1;
+        jn->invisable = 1;
+        jn->be_unenumerable = 1;
+
         var_t* resolve_args = var_new_array(vm);
-        var_array_add(resolve_args, var_new_str(vm, "resolve"));
-        var_array_add(resolve_args, var_new_str(vm, "reject"));
+        var_array_add(resolve_args, rn->var);
+        var_array_add(resolve_args, jn->var);
 
         call_m_func(vm, obj, executor, resolve_args);
         var_unref(resolve_args);
     }
 
+    /* vm_pop would unref the anchor, putting obj back on the gc list where the
+     * gc it may itself trigger sweeps it before we return. vm_pop2 keeps the
+     * ref; drop both (anchor + ours) bare so obj stays OFF the gc list until
+     * func_call re-refs it as the return value. */
+    vm_pop2(vm);
+    obj->refs -= 2;
     return obj;
 }
 
@@ -118,6 +228,7 @@ var_t* native_PromiseResolve(vm_t* vm, var_t* env, void* data) {
 
     var_t* proto = get_promise_proto(vm);
     var_t* promise = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, promise, pd);
 
     return promise;
 }
@@ -135,6 +246,7 @@ var_t* native_PromiseReject(vm_t* vm, var_t* env, void* data) {
 
     var_t* proto = get_promise_proto(vm);
     var_t* promise = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, promise, pd);
 
     return promise;
 }
@@ -163,35 +275,42 @@ var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
 
     var_t* proto = var_get_prototype(promise);
     var_t* newPromise = var_new_obj(vm, proto, newPd, promise_free);
+    promise_anchor(vm, newPromise, newPd);
+    var_ref(newPromise); /* off the gc list: the callback calls below may trigger a gc */
+    vm_push(vm, newPromise); /* stack-anchored so its children get gc-marked during callbacks */
 
     if (pd->state == PROMISE_STATE_FULFILLED && onFulfilled != NULL) {
         var_t* args = var_new_array(vm);
         var_array_add(args, pd->value);
         var_t* result = call_m_func(vm, promise, onFulfilled, args);
-        if (newPd->value) {
-            var_unref(newPd->value);
-        }
+        result = promise_unwrap(vm, result);
+        var_t* old = newPd->value;
         if (result != NULL) {
-            newPd->value = var_ref(result);
-            var_unref(result);
+            newPd->value = result; /* adopt the ref result already carries */
         } else {
-            newPd->value = var_new_null(vm);
+            newPd->value = var_ref(var_new_null(vm));
+        }
+        promise_anchor(vm, newPromise, newPd); /* gc-reachable before any unref below */
+        if (old) {
+            var_unref(old);
         }
         var_unref(args);
     } else if (pd->state == PROMISE_STATE_REJECTED && onRejected != NULL) {
         var_t* args = var_new_array(vm);
         var_array_add(args, pd->value);
         var_t* result = call_m_func(vm, promise, onRejected, args);
-        if (newPd->value) {
-            var_unref(newPd->value);
-        }
+        result = promise_unwrap(vm, result);
+        var_t* old = newPd->value;
         if (result != NULL) {
-            newPd->value = var_ref(result);
-            var_unref(result);
+            newPd->value = result; /* adopt the ref result already carries */
         } else {
-            newPd->value = var_new_null(vm);
+            newPd->value = var_ref(var_new_null(vm));
         }
         newPd->state = PROMISE_STATE_FULFILLED;
+        promise_anchor(vm, newPromise, newPd); /* gc-reachable before any unref below */
+        if (old) {
+            var_unref(old);
+        }
         var_unref(args);
     } else if (pd->state == PROMISE_STATE_PENDING) {
         if (onFulfilled != NULL) {
@@ -202,6 +321,8 @@ var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
         }
     }
 
+    vm_pop2(vm); /* pop the anchor keeping its ref (vm_pop could gc-sweep newPromise) */
+    newPromise->refs -= 2; /* drop anchor ref + ours; stays off the gc list for the return */
     return newPromise;
 }
 
@@ -211,6 +332,7 @@ var_t* native_PromiseCatch(vm_t* vm, var_t* env, void* data) {
     var_t* onRejected = get_obj(env, "onRejected");
 
     var_t* new_env = var_new(vm);
+    var_ref(new_env); /* keep it off the gc list while Then may run callbacks */
     var_add(new_env, THIS, promise);
     var_t* null_var = var_new_null(vm);
     var_add(new_env, "onFulfilled", null_var);
@@ -228,6 +350,7 @@ var_t* native_PromiseFinally(vm_t* vm, var_t* env, void* data) {
     var_t* onFinally = get_obj(env, "onFinally");
 
     var_t* new_env = var_new(vm);
+    var_ref(new_env); /* keep it off the gc list while Then may run callbacks */
     var_add(new_env, THIS, promise);
     var_add(new_env, "onFulfilled", onFinally);
     var_add(new_env, "onRejected", onFinally);
@@ -252,7 +375,21 @@ var_t* native_PromiseAll(vm_t* vm, var_t* env, void* data) {
         uint32_t len = var_array_size(promises);
         for (uint32_t i = 0; i < len; i++) {
             var_t* item = var_array_get_var(promises, i);
-            if (item != NULL) {
+            if (item == NULL) {
+                continue;
+            }
+            if (is_promise(vm, item)) {
+                promise_data* ipd = (promise_data*)item->value;
+                if (ipd != NULL && ipd->state == PROMISE_STATE_REJECTED) {
+                    /* reject fast: the result adopts the first rejection reason */
+                    pd->state = PROMISE_STATE_REJECTED;
+                    var_t* old = pd->value;
+                    pd->value = ipd->value ? var_ref(ipd->value) : var_ref(var_new(vm));
+                    if (old != NULL) var_unref(old);
+                    break;
+                }
+                var_array_add(pd->value, (ipd != NULL && ipd->value != NULL) ? ipd->value : var_new(vm));
+            } else {
                 var_array_add(pd->value, item);
             }
         }
@@ -260,6 +397,7 @@ var_t* native_PromiseAll(vm_t* vm, var_t* env, void* data) {
 
     var_t* proto = get_promise_proto(vm);
     var_t* result = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, result, pd);
     return result;
 }
 
@@ -276,24 +414,77 @@ var_t* native_PromiseRace(vm_t* vm, var_t* env, void* data) {
 
     if (promises != NULL && promises->is_array) {
         uint32_t len = var_array_size(promises);
-        if (len > 0) {
-            var_t* first = var_array_get_var(promises, 0);
-            if (first != NULL) {
-                pd->state = PROMISE_STATE_FULFILLED;
-                pd->value = var_ref(first);
+        /* settle with the first already-settled entry (pending ones lose the race) */
+        for (uint32_t i = 0; i < len; i++) {
+            var_t* item = var_array_get_var(promises, i);
+            if (item == NULL) {
+                continue;
             }
-        } else {
-            pd->state = PROMISE_STATE_FULFILLED;
-            pd->value = var_new_array(vm);
+            if (is_promise(vm, item)) {
+                promise_data* ipd = (promise_data*)item->value;
+                if (ipd != NULL && ipd->state != PROMISE_STATE_PENDING) {
+                    pd->state = ipd->state;
+                    pd->value = ipd->value ? var_ref(ipd->value) : var_ref(var_new(vm));
+                    break;
+                }
+            } else {
+                pd->state = PROMISE_STATE_FULFILLED;
+                pd->value = var_ref(item);
+                break;
+            }
         }
-    } else {
-        pd->state = PROMISE_STATE_FULFILLED;
-        pd->value = var_new_array(vm);
     }
 
     var_t* proto = get_promise_proto(vm);
     var_t* result = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, result, pd);
     return result;
+}
+
+var_t* native_PromiseAllSettled(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* promises = get_obj(env, "promises");
+
+    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    pd->state = PROMISE_STATE_FULFILLED;
+    pd->value = var_new_array(vm);
+    pd->fulfilled_callbacks = var_new_array(vm);
+    pd->rejected_callbacks = var_new_array(vm);
+
+    if (promises != NULL && promises->is_array) {
+        uint32_t len = var_array_size(promises);
+        for (uint32_t i = 0; i < len; i++) {
+            var_t* item = var_array_get_var(promises, i);
+            var_t* entry = var_new_obj(vm, NULL, NULL, NULL);
+            if (item != NULL && is_promise(vm, item)) {
+                promise_data* ipd = (promise_data*)item->value;
+                if (ipd != NULL && ipd->state == PROMISE_STATE_REJECTED) {
+                    var_add(entry, "status", var_new_str(vm, "rejected"));
+                    var_add(entry, "reason", ipd->value);
+                } else {
+                    var_add(entry, "status", var_new_str(vm, "fulfilled"));
+                    var_add(entry, "value", (ipd != NULL) ? ipd->value : NULL);
+                }
+            } else {
+                var_add(entry, "status", var_new_str(vm, "fulfilled"));
+                var_add(entry, "value", item);
+            }
+            var_array_add(pd->value, entry);
+        }
+    }
+
+    var_t* proto = get_promise_proto(vm);
+    var_t* result = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, result, pd);
+    return result;
+}
+
+/* Synchronous VM without an event loop: setTimeout never fires its callback.
+ * A delayed promise therefore simply stays pending, which is exactly what
+ * Promise.race semantics need here. */
+static var_t* native_setTimeout(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data;
+    return NULL;
 }
 
 void reg_native_Promise(vm_t* vm) {
@@ -302,6 +493,7 @@ void reg_native_Promise(vm_t* vm) {
     vm_reg_static(vm, cls, "resolve(value)", native_PromiseResolve, NULL);
     vm_reg_static(vm, cls, "reject(reason)", native_PromiseReject, NULL);
     vm_reg_static(vm, cls, "all(promises)", native_PromiseAll, NULL);
+    vm_reg_static(vm, cls, "allSettled(promises)", native_PromiseAllSettled, NULL);
     vm_reg_static(vm, cls, "race(promises)", native_PromiseRace, NULL);
     vm_reg_native(vm, cls, "then(onFulfilled, onRejected)", native_PromiseThen, NULL);
     vm_reg_native(vm, cls, "catch(onRejected)", native_PromiseCatch, NULL);
@@ -312,6 +504,7 @@ void reg_native_Promise(vm_t* vm) {
      * `INSTR_CALL "__await$1"` / `"__promise_resolve$1"`. */
     vm_reg_native(vm, NULL, "__await(x)", native_await, NULL);
     vm_reg_native(vm, NULL, "__promise_resolve(value)", native_PromiseResolve, NULL);
+    vm_reg_native(vm, NULL, "setTimeout(cb, ms)", native_setTimeout, NULL);
 }
 
 #ifdef __cplusplus

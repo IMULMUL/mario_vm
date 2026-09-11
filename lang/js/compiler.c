@@ -784,6 +784,11 @@ static int g_async_depth = 0;
  * for that body and then cleared, so nested definitions default to sync. */
 static int g_async_pending = 0;
 
+/* Set when the immediately preceding subscript kept its receiver on the stack
+ * (INSTR_ARRAY_AT_M) because a call `(` follows, telling the postfix `(` case
+ * to emit INSTR_CALLXO (bind that receiver as `this`) instead of INSTR_CALLX. */
+static int g_arrat_recv = 0;
+
 /** Parse a function's parameter list (starting at '(') and body, emitting the
  *  argument-name instructions expected by func_def plus the body bytecode.
  *  Supports ES6 default parameters and a trailing rest parameter. The caller
@@ -1196,6 +1201,22 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, LEX_R_NEW)) {
         return false;
     }
+    /* ES6 `new.target`: the constructor of the current invocation, or undefined
+     * for a plain call. `new` is already consumed; a following `.` + `target`
+     * is the meta-property, not a constructor expression. */
+    if (l->tk == '.') {
+        if (!lex_chkread(l, '.')) {
+            return false;
+        }
+        if (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "target") == 0) {
+            if (!lex_chkread(l, LEX_ID)) {
+                return false;
+            }
+            bc_gen_str(bc, INSTR_LOAD, "@new.target");
+            return true;
+        }
+        return false;
+    }
     mstr_t* class_name = mstr_new("");
     mstr_cpy(class_name, l->tk_str->cstr);
 
@@ -1390,6 +1411,20 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
                 mstr_free(id);
                 return false;
             }
+            /* ES6 `__proto__: v` in an object literal sets the object's
+             * [[Prototype]] instead of defining an own "__proto__" property. */
+            if (strcmp(id->cstr, "__proto__") == 0) {
+                bc_gen(bc, INSTR_SET_PROTO);
+                mstr_free(id);
+                lex_skip_empty(l);
+                if (l->tk != '}') {
+                    if (!lex_chkread(l, ',')) {
+                        return false;
+                    }
+                }
+                lex_skip_empty(l);
+                continue;
+            }
         } else if (l->tk == '(') { // ES6 method shorthand: name(params){body}
             bc_gen(bc, is_gen_method ? INSTR_FUNC_GEN : INSTR_FUNC);
             // func_params_and_body reads g_async_depth, so establish the async
@@ -1493,7 +1528,13 @@ bool factor_array_access(lex_t* l, bytecode_t* bc, mstr_t* name, bool member) {
     if (!lex_chkread(l, ']')) {
         return false;
     }
-    bc_gen(bc, INSTR_ARRAY_AT);
+    /* `name[key](...)`: keep the receiver so the following call binds `this`. */
+    if (l->tk == '(') {
+        bc_gen(bc, INSTR_ARRAY_AT_M);
+        g_arrat_recv = 1;
+    } else {
+        bc_gen(bc, INSTR_ARRAY_AT);
+    }
     return true;
 }
 
@@ -1801,7 +1842,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             if (!lex_chkread(l, LEX_R_AFUNCTION)) {
                 return false;
             }
-            bc_set_instr(bc, pc, INSTR_FUNC, 0);
+            bc_set_instr(bc, pc, INSTR_FUNC_ARROW, 0);
             factor_def_afunc(l, bc);
         } else {
             bc_remove_instr(bc, pc, 1);
@@ -1931,7 +1972,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
                 if (!lex_chkread(l, LEX_R_AFUNCTION)) {
                     return false;
                 }
-                bc_gen(bc, INSTR_FUNC);
+                bc_gen(bc, INSTR_FUNC_ARROW);
                 bc_gen_str(bc, INSTR_LOAD, name->cstr);
                 factor_def_afunc(l, bc);
             } else {
@@ -1955,6 +1996,25 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             if (!factor(l, bc, true)) {
                 return false;
             }
+        } else if (l->tk == LEX_OPTCHAIN) { // ES2020 optional chaining `?.member`
+            /* The base value is already on the stack. OPT_GET short-circuits a
+             * nullish base to undefined, and because each `?.` re-checks the
+             * value the previous link produced, a chain like `a?.b?.c` collapses
+             * to undefined as soon as any link is nullish. */
+            if (!lex_chkread(l, LEX_OPTCHAIN)) {
+                return false;
+            }
+            if (l->tk == LEX_ID) {
+                mstr_t* name = mstr_new(l->tk_str->cstr);
+                if (!lex_chkread(l, LEX_ID)) {
+                    mstr_free(name);
+                    return false;
+                }
+                bc_gen_str(bc, INSTR_OPT_GET, name->cstr);
+                mstr_free(name);
+            } else {
+                return false;
+            }
         } else if (l->tk == '[') { // subscript on the value on the stack
             if (!lex_chkread(l, '[')) {
                 return false;
@@ -1965,23 +2025,33 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             if (!lex_chkread(l, ']')) {
                 return false;
             }
-            bc_gen(bc, INSTR_ARRAY_AT);
+            /* `v[key](...)`: keep the receiver so the following call binds `this`. */
+            if (l->tk == '(') {
+                bc_gen(bc, INSTR_ARRAY_AT_M);
+                g_arrat_recv = 1;
+            } else {
+                bc_gen(bc, INSTR_ARRAY_AT);
+            }
         } else if (l->tk == '(') {
             /* ES6 call on a value already on the stack: an IIFE
              * `(function(){...})()`, `(expr)(args)`, or a curried `f()()`.
              * call_func pushes the args above the callable value; CALLX picks
              * the value back off and invokes it with runtime/known arity. */
+            /* Capture a receiver kept by a just-compiled `v[key]` BEFORE arg
+             * compilation (nested calls would overwrite the flag). */
+            int recv = g_arrat_recv;
+            g_arrat_recv = 0;
             bool has_spread = false;
             int arg_num = call_func(l, bc, &has_spread);
             if (arg_num < 0) {
                 return false;
             }
             if (has_spread) {
-                bc_gen_str(bc, INSTR_CALLX_SPREAD, "");
+                bc_gen_str(bc, recv ? INSTR_CALLXO_SPREAD : INSTR_CALLX_SPREAD, "");
             } else {
                 mstr_t* s = mstr_new("");
                 gen_func_name("", arg_num, s);
-                bc_gen_str(bc, INSTR_CALLX, s->cstr);
+                bc_gen_str(bc, recv ? INSTR_CALLXO : INSTR_CALLX, s->cstr);
                 mstr_free(s);
             }
         } else if (l->tk == '`') {
@@ -2242,6 +2312,21 @@ bool ternary(lex_t* l, bytecode_t* bc) {
         return false;
     }
 
+    /* ES2020 `a ?? b`: binds looser than ||/&& (handled in logic) and tighter
+     * than the conditional below. NULLISH short-circuits: if the LHS on the
+     * stack is non-nullish it jumps past the RHS keeping the LHS as the result;
+     * otherwise it pops the nullish LHS and falls through to evaluate the RHS. */
+    while (l->tk == LEX_NULLISH) {
+        if (!lex_chkread(l, LEX_NULLISH)) {
+            return false;
+        }
+        PC pc1 = bc_reserve(bc); //keep for the short-circuit jump
+        if (!base(l, bc)) {
+            return false;
+        }
+        bc_set_instr(bc, pc1, INSTR_NULLISH, ILLEGAL_PC);
+    }
+
     if (l->tk == '?') {
         PC pc1 = bc_reserve(bc); //keep for jump
         if (!lex_chkread(l, '?')) {
@@ -2274,6 +2359,9 @@ bool base(lex_t* l, bytecode_t* bc) {
 			l->tk == LEX_DIVEQUAL ||
 			l->tk == LEX_MODEQUAL ||
 			l->tk == LEX_POWEREQUAL ||
+			l->tk == LEX_OREQUALOR ||
+			l->tk == LEX_ANDEQUALAND ||
+			l->tk == LEX_NULLISHEQUAL ||
 	        l->tk == LEX_MINUSEQUAL) {
         LEX_TYPES op = (LEX_TYPES)l->tk;
         if (!lex_chkread(l, l->tk)) {
@@ -2307,6 +2395,12 @@ bool base(lex_t* l, bytecode_t* bc) {
             bc_gen(bc, INSTR_MODEQ);
         } else if (op == LEX_POWEREQUAL) {
             bc_gen(bc, INSTR_POWEQ);
+        } else if (op == LEX_OREQUALOR) {
+            bc_gen(bc, INSTR_OREQ);
+        } else if (op == LEX_ANDEQUALAND) {
+            bc_gen(bc, INSTR_ANDEQ);
+        } else if (op == LEX_NULLISHEQUAL) {
+            bc_gen(bc, INSTR_NULLISHEQ);
         }
 		else {
 			return false;
@@ -2761,7 +2855,9 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
     bc_gen_str(bc, INSTR_SAFE_VAR, "__for_in_keys");
     bc_gen_str(bc, INSTR_LOAD, "__for_in_keys");
     bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
-    bc_gen_str(bc, INSTR_CALLO, "keys");
+    /* JS for-in semantics: arrays yield their indices as strings, objects yield
+     * own enumerable keys. Handled by the native __enum_keys(o) helper. */
+    bc_gen_str(bc, INSTR_CALL, "__enum_keys$1");
     bc_gen(bc, INSTR_ASIGN);
     bc_gen(bc, INSTR_POP);
 
@@ -2785,7 +2881,7 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
     bc_gen(bc, INSTR_POP);
     
     // Condition: check if the current member is not empty or undefined
-    bc_set_instr(bc, pc_condition, INSTR_JMP, bc->cindex);
+    PC cond_pc = bc->cindex;
     
     // Load the object and current index
     bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
@@ -2810,15 +2906,17 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
         return false;
     }
     
-    // Increment index
+    // Increment index  (also the `continue` target, so the index always advances)
+    PC incr_pc = bc->cindex;
     bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
     bc_gen(bc, INSTR_PPLUS);
     bc_gen(bc, INSTR_POP);
     
-    bc_add_instr(bc, pc_condition, INSTR_JMPB, ILLEGAL_PC); //jump to continue anchor;
+    bc_add_instr(bc, cond_pc, INSTR_JMPB, ILLEGAL_PC); //after increment -> condition check
     
     PC pc = bc_gen(bc, INSTR_LOOP_END);
     bc_set_instr(bc, pc_break, INSTR_JMP, pc - 1); // end anchor;
+    bc_set_instr(bc, pc_condition, INSTR_JMP, incr_pc); // continue anchor -> increment
     
     if (loop_var) {
         mstr_free(loop_var);
@@ -2835,27 +2933,24 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
         mstr_t* loop_var,
         opr_code_t var_op,
         lex_t* destr_pat,
-        opr_code_t destr_op) {
+        opr_code_t destr_op,
+        bool is_for_await) {
 
-    // store the iterable into a temporary variable
-    bc_gen_str(bc, INSTR_SAFE_VAR, "__for_of_obj");
-    bc_gen_str(bc, INSTR_LOAD, "__for_of_obj");
+    // __for_of_iter = GetIterator(<iterable>) via the iteration protocol
+    bc_gen_str(bc, INSTR_SAFE_VAR, "__for_of_iter");
+    bc_gen_str(bc, INSTR_LOAD, "__for_of_iter");
     if (!base(l, bc)) {
         return false;
     }
     if (!lex_chkread(l, ')')) {
         return false;
     }
+    bc_gen(bc, INSTR_GET_ITER); // pop iterable, push its iterator
     bc_gen(bc, INSTR_ASIGN);
     bc_gen(bc, INSTR_POP);
 
-    // __for_of_size = __for_of_obj.length()
-    bc_gen_str(bc, INSTR_SAFE_VAR, "__for_of_size");
-    bc_gen_str(bc, INSTR_LOAD, "__for_of_size");
-    bc_gen_str(bc, INSTR_LOAD, "__for_of_obj");
-    bc_gen_str(bc, INSTR_CALLO, "length");
-    bc_gen(bc, INSTR_ASIGN);
-    bc_gen(bc, INSTR_POP);
+    // __for_of_step holds the current { value, done } result from next()
+    bc_gen_str(bc, INSTR_SAFE_VAR, "__for_of_step");
 
     // declare the loop variable
     if (loop_var) {
@@ -2877,26 +2972,24 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
         }
     }
 
-    // __for_of_idx = 0
-    bc_gen_str(bc, INSTR_SAFE_VAR, "__for_of_idx");
-    bc_gen_str(bc, INSTR_LOAD, "__for_of_idx");
-    bc_gen_int(bc, INSTR_INT, 0);
+    /* condition anchor: fetch the next step, `__for_of_step = iter.next()`,
+     * then break out when `step.done` is truthy. `continue` re-enters here. */
+    PC cond_pc = bc->cindex;
+    bc_gen_str(bc, INSTR_LOAD, "__for_of_step");
+    bc_gen_str(bc, INSTR_LOAD, "__for_of_iter");
+    bc_gen_str(bc, INSTR_CALLO, "next");
     bc_gen(bc, INSTR_ASIGN);
     bc_gen(bc, INSTR_POP);
-
-    // condition anchor: idx < size
-    bc_set_instr(bc, pc_condition, INSTR_JMP, bc->cindex);
-    bc_gen_str(bc, INSTR_LOAD, "__for_of_idx");
-    bc_gen_str(bc, INSTR_LOAD, "__for_of_size");
-    bc_gen(bc, INSTR_LES);
+    bc_gen_str(bc, INSTR_LOAD, "__for_of_step");
+    bc_gen_str(bc, INSTR_GET, "done");
+    bc_gen(bc, INSTR_NOT); // continue while !done
     bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC);
 
-    // loop_var = __for_of_obj[idx]
+    // loop_var = __for_of_step.value
     if (loop_var) {
         bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
-        bc_gen_str(bc, INSTR_LOAD, "__for_of_obj");
-        bc_gen_str(bc, INSTR_LOAD, "__for_of_idx");
-        bc_gen(bc, INSTR_ARRAY_AT);
+        bc_gen_str(bc, INSTR_LOAD, "__for_of_step");
+        bc_gen_str(bc, INSTR_GET, "value");
         bc_gen(bc, INSTR_ASIGN);
         bc_gen(bc, INSTR_POP);
     }
@@ -2920,15 +3013,11 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
         return false;
     }
 
-    // idx++
-    bc_gen_str(bc, INSTR_LOAD, "__for_of_idx");
-    bc_gen(bc, INSTR_PPLUS);
-    bc_gen(bc, INSTR_POP);
-
-    bc_add_instr(bc, pc_condition, INSTR_JMPB, ILLEGAL_PC); //continue anchor;
+    bc_add_instr(bc, cond_pc, INSTR_JMPB, ILLEGAL_PC); // -> fetch next step
 
     PC pc = bc_gen(bc, INSTR_LOOP_END);
     bc_set_instr(bc, pc_break, INSTR_JMP, pc - 1); // end anchor;
+    bc_set_instr(bc, pc_condition, INSTR_JMP, cond_pc); // continue -> fetch next step
 
     if (loop_var) {
         mstr_free(loop_var);
@@ -2939,6 +3028,16 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
 bool stmt_for(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, LEX_R_FOR)) {
         return false;
+    }
+    /* ES2018 `for await (x of y)`: consume the optional `await`. The loop body
+     * then awaits each value produced by the async iterator. */
+    bool is_for_await = false;
+    if (l->tk == LEX_R_AWAIT) {
+        if (!lex_chkread(l, LEX_R_AWAIT)) {
+            return false;
+        }
+        is_for_await = true;
+        lex_skip_empty(l);
     }
     PC pc = bc_gen(bc, INSTR_LOOP);
     bc_add_instr(bc, pc, INSTR_JMP, pc + 3); //jmp to init.
@@ -3008,6 +3107,11 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             // Generate variable declaration bytecode
             if (loop_var) {
                 bc_gen_str(bc, var_op, loop_var->cstr);
+                /* ES6 for-let/const: declare the loop-scope temp that shuttles
+                 * the loop variable in/out of the per-iteration block below. */
+                if (var_op != INSTR_VAR) {
+                    bc_gen_str(bc, INSTR_SAFE_VAR, "__for_let_tmp");
+                }
             }
             if (l->tk == '=') {
                 lex_chkread(l, '=');
@@ -3049,11 +3153,11 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
         if (var_op == INSTR_CONST) var_op = INSTR_SAFE_VAR;
         if (destr_op == INSTR_CONST) destr_op = INSTR_SAFE_VAR;
         return stmt_for_of(l, bc, pc_condition, pc_break, loop_var, var_op,
-                loop_destr ? &pd_saved : NULL, destr_op);
+                loop_destr ? &pd_saved : NULL, destr_op, is_for_await);
     }
 
     // Standard for loop implementation
-    bc_set_instr(bc, pc_condition, INSTR_JMP, bc->cindex);
+    PC cond_pc = bc->cindex; //condition-check anchor (init falls through here)
     if (!base(l, bc)) { //condition
         if (loop_var) {
             mstr_free(loop_var);
@@ -3071,6 +3175,10 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
     PC pcl = bc_reserve(bc); //jump to loop .skip the iterrator
 
     PC pci = bc->cindex;  //iterator anchor;
+    /* `continue` jumps to the loop scope's pc_start (== pc_condition). Point it
+     * at the iterator so a continue advances the loop variable before re-testing
+     * the condition; otherwise `for(..;..;..) { continue; }` never terminates. */
+    bc_set_instr(bc, pc_condition, INSTR_JMP, pci);
     if (!base(l, bc)) { //iterator statement
         if (loop_var) {
             mstr_free(loop_var);
@@ -3085,9 +3193,30 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
     }
     bc_gen(bc, INSTR_POP); //pop the stack.
 
-    bc_add_instr(bc, pc_condition, INSTR_JMPB, ILLEGAL_PC); //jump to coninue anchor;
+    bc_add_instr(bc, cond_pc, INSTR_JMPB, ILLEGAL_PC); //after iterator -> condition check
 
     bc_set_instr(bc, pcl, INSTR_JMP, ILLEGAL_PC); // loop anchor;
+
+    /* ES6 `for (let i ...)`: every iteration gets its OWN binding of the loop
+     * variable, so closures made in the body capture that iteration's value.
+     * The body is wrapped in a block that re-declares the variable and copies
+     * its value in from (and back out to) the shared loop-scope binding via
+     * the hidden __for_let_tmp; handle_func captures the block var. */
+    bool per_iter = (loop_var != NULL && var_op != INSTR_VAR);
+    if (per_iter) {
+        // __for_let_tmp = i
+        bc_gen_str(bc, INSTR_LOAD, "__for_let_tmp");
+        bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+        bc_gen(bc, INSTR_ASIGN);
+        bc_gen(bc, INSTR_POP);
+        bc_gen(bc, INSTR_BLOCK);
+        // let i(block) = __for_let_tmp
+        bc_gen_str(bc, INSTR_SAFE_VAR, loop_var->cstr);
+        bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+        bc_gen_str(bc, INSTR_LOAD, "__for_let_tmp");
+        bc_gen(bc, INSTR_ASIGN);
+        bc_gen(bc, INSTR_POP);
+    }
 
     // Loop body
     if (!stmt_loop_block(l, bc)) {
@@ -3095,6 +3224,25 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             mstr_free(loop_var);
         }
         return false;
+    }
+
+    if (per_iter) {
+        /* Copy the (possibly body-modified) block binding back out so the step
+         * expression sees it. Skipped for `const`: the binding cannot have
+         * changed and re-assigning a const loop variable would throw. */
+        if (var_op == INSTR_SAFE_VAR) {
+            bc_gen_str(bc, INSTR_LOAD, "__for_let_tmp");
+            bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+            bc_gen(bc, INSTR_ASIGN);
+            bc_gen(bc, INSTR_POP);
+        }
+        bc_gen(bc, INSTR_BLOCK_END);
+        if (var_op == INSTR_SAFE_VAR) {
+            bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+            bc_gen_str(bc, INSTR_LOAD, "__for_let_tmp");
+            bc_gen(bc, INSTR_ASIGN);
+            bc_gen(bc, INSTR_POP);
+        }
     }
 
     bc_add_instr(bc, pci, INSTR_JMPB, ILLEGAL_PC); //jump to iterator anchor;
@@ -3261,13 +3409,54 @@ bool statement(lex_t* l, bytecode_t* bc) {
         if (!stmt_block(l, bc, false)) {
             return false;
         }
+    } else if (l->tk == '[') {
+        /* `[a, b] = rhs` is a destructuring *assignment* (targets already
+         * declared); anything else starting with '[' is an array-literal
+         * expression statement. Peek past the balanced pattern: a single '='
+         * right after the closing ']' means destructuring. Restore the lexer
+         * either way before compiling. */
+        lex_t saved = *l;
+        mstr_t* saved_str = mstr_new(l->tk_str->cstr);
+        bool is_destr = false;
+        if (skip_balanced_pattern(l)) {
+            lex_skip_empty(l);
+            if (l->tk == '=') {
+                is_destr = true;
+            }
+        }
+        *l = saved;
+        mstr_cpy(l->tk_str, saved_str->cstr);
+        mstr_free(saved_str);
+
+        if (is_destr) {
+            /* decl_op = 0: the leaves are existing bindings, not new ones. */
+            if (!stmt_var_destructure(l, bc, 0)) {
+                return false;
+            }
+            if (is_stmt_end(l->tk)) {
+                if (!lex_chkread_stmt_end(l)) {
+                    return false;
+                }
+            }
+        } else if (!stmt_strict(l, bc)) {
+            if (!base(l, bc)) {
+                return false;
+            }
+            if (is_stmt_end(l->tk)) {
+                if (!lex_chkread_stmt_end(l)) {
+                    return false;
+                }
+            }
+            pop = true;
+        }
     } else if (l->tk == LEX_STR || 
                l->tk == LEX_INT || l->tk == LEX_FLOAT ||
-               l->tk == '[' || l->tk == '`' ||
+               l->tk == '`' ||
                l->tk == LEX_ID ||
                l->tk == LEX_PLUSPLUS ||
                l->tk == LEX_MINUSMINUS ||
                l->tk == '(' || l->tk == '!' || l->tk == LEX_R_NEW ||
+               l->tk == LEX_R_AWAIT ||
                l->tk == '-') {
         if (!stmt_strict(l, bc)) {
             /* Execute a simple statement that only contains basic arithmetic... */

@@ -150,9 +150,17 @@ void utf8_to_str(utf8_t* utf8, mstr_t* str) {
 
 /** String */
 var_t* native_StringConstructor(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
-	const char* s = get_str(env, "str");
-	var_t* thisV = var_new_str(vm, s);
+	(void)data;
+	/* String(x) is a conversion, not a byte reinterpretation: get_str() would
+	 * read a number's raw value bytes as a C string (String(10) -> "\n").
+	 * var_to_str() applies JS ToString for every type (numbers -> decimal,
+	 * objects/symbols -> their toString()). String() with no arg yields "". */
+	var_t* arg = get_obj(env, "str");
+	mstr_t* s = mstr_new("");
+	if(arg != NULL)
+		var_to_str(arg, s);
+	var_t* thisV = var_new_str(vm, s->cstr);
+	mstr_free(s);
 
 	var_instance_from(thisV, get_obj(env, THIS));
 	return thisV;
@@ -594,6 +602,12 @@ var_t* native_UTF8ReaderRead(vm_t* vm, var_t* env, void* data) {
 #define CLS_UTF8 "UTF8"
 #define CLS_UTF8_READER "UTF8Reader"
 
+var_t* native_String_iterator(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* this_v = get_obj(env, THIS);
+	return vm_new_string_iterator(vm, this_v); /* refs=0 */
+}
+
 void reg_native_String(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_STRING);
 	vm_reg_native(vm, cls, "constructor(str)", native_StringConstructor, NULL); 
@@ -607,6 +621,7 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "toLowerCase()", native_StringToLowerCase, NULL); 
 	vm_reg_native(vm, cls, "toUpperCase()", native_StringToUpperCase, NULL); 
 	vm_reg_native(vm, cls, "replace(searchValue, replacement)", native_StringReplace, NULL); 
+	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_String_iterator, NULL); 
 
 	cls = vm_new_class(vm, CLS_UTF8);
 	vm_reg_native(vm, cls, "constructor(str)", native_UTF8Constructor, NULL); 

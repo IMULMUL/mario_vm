@@ -82,6 +82,23 @@ static int32_t map_find(map_data* md, var_t* key) {
 static void map_sync_size(var_t* this_v, map_data* md) {
     var_t* szm = var_find_own_member_var(this_v, "size");
     if (szm != NULL) var_set_int(szm, (int)md->size);
+    /* GC only marks vars reachable from root/stack/scopes; entries held solely
+     * by the C arrays would be swept even with refs held. Mirror them into the
+     * hidden "@@keep" array so the collector sees them through the Map itself. */
+    var_t* keep = var_find_own_member_var(this_v, "@@keep");
+    if (keep != NULL) {
+        var_t* arr = var_find_own_member_var(keep, "_ARRAY_");
+        if (arr != NULL) {
+            this_v->vm->gc.gc_defer++; /* entries are gc-unreachable between remove and re-add */
+            var_remove_all(arr); /* frees the buckets and leaves them NULL */
+            hash_map_init(&arr->children);
+            for (uint32_t i = 0; i < md->size; ++i) {
+                var_array_add(keep, md->keys[i]);
+                var_array_add(keep, md->vals[i]);
+            }
+            this_v->vm->gc.gc_defer--;
+        }
+    }
 }
 
 /* core insert/update; takes owning refs on key & value only when new */
@@ -91,6 +108,7 @@ static void map_set_impl(var_t* this_v, map_data* md, var_t* key, var_t* value) 
         var_t* old = md->vals[idx];
         md->vals[idx] = var_ref(value);
         var_unref(old);
+        map_sync_size(this_v, md); /* re-anchor the new value in "@@keep" */
         return;
     }
     if (md->size >= md->cap) map_grow(md);
@@ -111,6 +129,10 @@ var_t* native_Map_constructor(vm_t* vm, var_t* env, void* data) {
     var_t* sz = var_new_int(vm, 0);
     node_t* sn = var_add(this_v, "size", sz);
     sn->be_unenumerable = 1;
+
+    node_t* kn = var_add(this_v, "@@keep", var_new_array(vm)); /* GC anchor, see map_sync_size */
+    kn->invisable = 1;
+    kn->be_unenumerable = 1;
 
     /* optional iterable of [key, value] pairs */
     var_t* iter = get_obj(env, "iterable");
@@ -240,6 +262,42 @@ var_t* native_Map_entries(vm_t* vm, var_t* env, void* data) {
     return arr;
 }
 
+/* ES6: Map is iterable; [Symbol.iterator] === entries, yielding [key, value]
+ * pairs in insertion order. The iterator drives a snapshot array. */
+var_t* native_Map_iterator(vm_t* vm, var_t* env, void* data) {
+    var_t* arr = native_Map_entries(vm, env, data); /* refs=0; iterator adopts it */
+    return vm_new_array_iterator(vm, arr);
+}
+
+#define CLS_WEAKMAP "WeakMap"
+
+var_t* native_WeakMap_constructor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* this_v = get_obj(env, THIS);
+    map_data* md = (map_data*)mario_malloc(sizeof(map_data));
+    md->keys = NULL; md->vals = NULL; md->size = 0; md->cap = 0;
+    this_v->value = md;
+    this_v->free_func = map_free;
+
+    node_t* kn = var_add(this_v, "@@keep", var_new_array(vm)); /* GC anchor, see map_sync_size */
+    kn->invisable = 1;
+    kn->be_unenumerable = 1;
+    return this_v;
+}
+
+var_t* native_WeakMap_set(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* this_v = get_obj(env, THIS);
+    map_data* md = get_map(this_v);
+    var_t* key = get_obj(env, "key");
+    if (key == NULL || key->type != V_OBJECT) {
+        vm_throw_native(vm, "Invalid value used as weak map key");
+        return NULL;
+    }
+    map_set_impl(this_v, md, key, get_obj(env, "value"));
+    return this_v;
+}
+
 void reg_native_Map(vm_t* vm) {
     var_t* cls = vm_new_class(vm, CLS_MAP);
     vm_reg_native(vm, cls, "constructor(iterable)", native_Map_constructor, NULL);
@@ -252,6 +310,17 @@ void reg_native_Map(vm_t* vm) {
     vm_reg_native(vm, cls, "keys()", native_Map_keys, NULL);
     vm_reg_native(vm, cls, "values()", native_Map_values, NULL);
     vm_reg_native(vm, cls, "entries()", native_Map_entries, NULL);
+    vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_Map_iterator, NULL);
+
+    /* ES6 WeakMap: same storage/identity semantics as Map but keys must be
+     * objects. True weakness is not observable from scripts here, so entries
+     * keep their keys alive like Map does. get/has/delete are shared. */
+    var_t* wcls = vm_new_class(vm, CLS_WEAKMAP);
+    vm_reg_native(vm, wcls, "constructor()", native_WeakMap_constructor, NULL);
+    vm_reg_native(vm, wcls, "set(key, value)", native_WeakMap_set, NULL);
+    vm_reg_native(vm, wcls, "get(key)", native_Map_get, NULL);
+    vm_reg_native(vm, wcls, "has(key)", native_Map_has, NULL);
+    vm_reg_native(vm, wcls, "delete(key)", native_Map_delete, NULL);
 }
 
 #ifdef __cplusplus

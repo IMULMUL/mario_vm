@@ -75,6 +75,21 @@ static int32_t set_find(set_data* sd, var_t* v) {
 static void set_sync_size(var_t* this_v, set_data* sd) {
     var_t* szm = var_find_own_member_var(this_v, "size");
     if (szm != NULL) var_set_int(szm, (int)sd->size);
+    /* GC only marks vars reachable from root/stack/scopes; items held solely by
+     * the C array would be swept even with refs held. Mirror them into the
+     * hidden "@@keep" array so the collector sees them through the Set itself. */
+    var_t* keep = var_find_own_member_var(this_v, "@@keep");
+    if (keep != NULL) {
+        var_t* arr = var_find_own_member_var(keep, "_ARRAY_");
+        if (arr != NULL) {
+            this_v->vm->gc.gc_defer++; /* items are gc-unreachable between remove and re-add */
+            var_remove_all(arr); /* frees the buckets and leaves them NULL */
+            hash_map_init(&arr->children);
+            for (uint32_t i = 0; i < sd->size; ++i)
+                var_array_add(keep, sd->items[i]);
+            this_v->vm->gc.gc_defer--;
+        }
+    }
 }
 
 static void set_add_impl(var_t* this_v, set_data* sd, var_t* v) {
@@ -95,6 +110,10 @@ var_t* native_Set_constructor(vm_t* vm, var_t* env, void* data) {
     var_t* sz = var_new_int(vm, 0);
     node_t* sn = var_add(this_v, "size", sz);
     sn->be_unenumerable = 1;
+
+    node_t* kn = var_add(this_v, "@@keep", var_new_array(vm)); /* GC anchor, see set_sync_size */
+    kn->invisable = 1;
+    kn->be_unenumerable = 1;
 
     var_t* iter = get_obj(env, "iterable");
     if (iter != NULL && iter->type == V_OBJECT && iter->is_array) {
@@ -193,6 +212,42 @@ var_t* native_Set_entries(vm_t* vm, var_t* env, void* data) {
     return arr;
 }
 
+/* ES6: Set is iterable. [Symbol.iterator] === values; returns a live snapshot
+ * iterator over the current values (insertion order). */
+var_t* native_Set_iterator(vm_t* vm, var_t* env, void* data) {
+    var_t* arr = native_Set_values(vm, env, data); /* refs=0; iterator adopts it */
+    return vm_new_array_iterator(vm, arr);
+}
+
+#define CLS_WEAKSET "WeakSet"
+
+var_t* native_WeakSet_constructor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* this_v = get_obj(env, THIS);
+    set_data* sd = (set_data*)mario_malloc(sizeof(set_data));
+    sd->items = NULL; sd->size = 0; sd->cap = 0;
+    this_v->value = sd;
+    this_v->free_func = set_free;
+
+    node_t* kn = var_add(this_v, "@@keep", var_new_array(vm)); /* GC anchor, see set_sync_size */
+    kn->invisable = 1;
+    kn->be_unenumerable = 1;
+    return this_v;
+}
+
+var_t* native_WeakSet_add(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* this_v = get_obj(env, THIS);
+    set_data* sd = get_set(this_v);
+    var_t* v = get_obj(env, "value");
+    if (v == NULL || v->type != V_OBJECT) {
+        vm_throw_native(vm, "Invalid value used in weak set");
+        return NULL;
+    }
+    set_add_impl(this_v, sd, v);
+    return this_v;
+}
+
 void reg_native_Set(vm_t* vm) {
     var_t* cls = vm_new_class(vm, CLS_SET);
     vm_reg_native(vm, cls, "constructor(iterable)", native_Set_constructor, NULL);
@@ -204,6 +259,15 @@ void reg_native_Set(vm_t* vm) {
     vm_reg_native(vm, cls, "values()", native_Set_values, NULL);
     vm_reg_native(vm, cls, "keys()", native_Set_values, NULL);
     vm_reg_native(vm, cls, "entries()", native_Set_entries, NULL);
+    vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_Set_iterator, NULL);
+
+    /* ES6 WeakSet: object members only (identity semantics). True weakness is
+     * not observable from scripts here, so members stay alive like Set's. */
+    var_t* wcls = vm_new_class(vm, CLS_WEAKSET);
+    vm_reg_native(vm, wcls, "constructor()", native_WeakSet_constructor, NULL);
+    vm_reg_native(vm, wcls, "add(value)", native_WeakSet_add, NULL);
+    vm_reg_native(vm, wcls, "has(value)", native_Set_has, NULL);
+    vm_reg_native(vm, wcls, "delete(value)", native_Set_delete, NULL);
 }
 
 #ifdef __cplusplus

@@ -334,6 +334,13 @@ var_t* native_Array_length(vm_t* vm, var_t* env, void* data) {
 
 #define CLS_ARRAY "Array"
 
+/* ES6: Array is iterable; [Symbol.iterator] yields each element. */
+var_t* native_Array_iterator(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* this_v = get_obj(env, THIS);
+	return vm_new_array_iterator(vm, this_v); /* refs=0 */
+}
+
 void reg_native_Array(vm_t* vm) {
   var_t* cls = vm_new_class(vm, CLS_ARRAY);
 	vm_reg_native(vm, cls, "constructor()", native_Array_constructor, NULL);
@@ -352,6 +359,7 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, "slice(start, end)", native_Array_slice, NULL); 
 	vm_reg_native(vm, cls, "isArray(obj)", native_Array_isArray, NULL); 
 	vm_reg_native(vm, cls, "length()", native_Array_length, NULL); 
+	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_Array_iterator, NULL); 
 }
 
 #ifdef __cplusplus

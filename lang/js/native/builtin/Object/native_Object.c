@@ -3,6 +3,7 @@ extern "C" {
 #endif
 
 #include "native_Object.h"
+#include <stdio.h>
 
 /** Object */
 
@@ -116,6 +117,30 @@ var_t* native_Object_keys(vm_t* vm, var_t* env, void* data) {
 
 	var_t* keys = var_new_array(vm);
 	uint32_t num = var_properties_num(vm, obj, keys, true);	
+	return keys;
+}
+
+/* for-in enumeration helper `__enum_keys(obj)`. Arrays yield their indices as
+ * strings ("0","1",...) first, matching JS for-in over arrays; then own and
+ * inherited enumerable string keys are appended (deduplicated) via
+ * var_properties_num. Returns a fresh array (refs=0). */
+var_t* native_enum_keys(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	var_t* keys = var_new_array(vm);
+	if(obj != NULL && obj->type == V_OBJECT) {
+		vm->gc.gc_defer++; /* keys unrooted while we build it */
+		if(obj->is_array) {
+			uint32_t n = var_array_size(obj);
+			for(uint32_t i = 0; i < n; i++) {
+				char buf[24];
+				snprintf(buf, sizeof(buf), "%u", i);
+				var_array_add(keys, var_new_str(vm, buf));
+			}
+		}
+		var_properties_num(vm, obj, keys, true);
+		vm->gc.gc_defer--;
+	}
 	return keys;
 }
 
@@ -414,6 +439,8 @@ void reg_native_Object(vm_t* vm) {
 	vm_reg_static(vm, cls, "getOwnPropertyNames(obj)", native_Object_getOwnPropertyNames, NULL);
 	vm_reg_static(vm, cls, "getOwnPropertyDescriptor(obj, prop)", native_Object_getOwnPropertyDescriptor, NULL);
 	vm_reg_native(vm, NULL, "__obj_rest(src, excluded)", native_obj_rest, NULL);
+	/* for-in lowering (stmt_for_in) calls this by INSTR_CALL "__enum_keys$1". */
+	vm_reg_native(vm, NULL, "__enum_keys(o)", native_enum_keys, NULL);
 }
 
 #ifdef __cplusplus
