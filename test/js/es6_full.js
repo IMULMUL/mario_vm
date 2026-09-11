@@ -40,22 +40,24 @@
 //   26. Array.at & String extras (at, trimStart/End/Left/Right, replaceAll)
 //   27. Promise.any (ES2021)
 //   28. JSON stringify / parse (compact output, negatives, floats, roundtrip)
-//   29. Date & typeof of constructors (Date.now, getTime, valueOf)
+//   29. Date & typeof of constructors (Date.now, getTime, valueOf, full field
+//       accessors, toISOString/toUTCString/toString, Date.parse/Date.UTC)
 //   30. undefined / null equality
 //   31. Added built-ins (Math.floor/ceil/atan2/fround/random, Array.splice/
 //       reduceRight, String.charAt/charCodeAt/substring/concat/fromCharCode/
 //       lastIndexOf/localeCompare, Number.toFixed/toPrecision/valueOf/
 //       MAX_VALUE/MIN_VALUE) && logical `&&`/`||` operand-return semantics
+//   32. 64-bit numbers (exact large integer literals & arithmetic, int64/double
+//       promotion, double precision, Number.MAX_SAFE_INTEGER/MAX_VALUE)
 //
 // Deliberately EXCLUDED (each would need a subsystem this minimal engine lacks):
 //   - RegExp: no /pattern/ literals, no regex-based match/split/replace.
 //   - Proxy / Reflect: no metaprogramming traps.
 //   - TypedArrays / ArrayBuffer / DataView: no binary buffers.
-//   - BigInt: the number model is 32-bit int / 32-bit float only.
+//   - BigInt: arbitrary-precision integers. The number model is int32 (V_INT),
+//     int64 (V_INT64), float32 (V_FLOAT, Math.fround only) and double (V_FLOAT64,
+//     the canonical float); int64 is fixed-width, not arbitrary precision.
 //   - ES Modules: import/export; this is a single-file script engine.
-//   - Full Date field accessors & parsing (getFullYear/getMonth/parse/
-//     toISOString): a 32-bit number cannot hold a Unix-ms timestamp exactly, so
-//     only Date.now, the constructor, getTime and valueOf are provided.
 // =============================================================================
 
 // --- Runtime shim ------------------------------------------------------------
@@ -1216,9 +1218,8 @@ section("15. async / await");
         class Local {}
         eq(typeof Local, "function", "typeof a script class is 'function'");
 
-        // Date.now(): a non-negative, monotonic epoch-ms number. The VM's 32-bit
-        // number model cannot hold ms exactly (a float32 quantises ~1.7e12 to
-        // 131072-ms steps), so only sign/magnitude/ordering are asserted here.
+        // Date.now(): a non-negative, monotonic epoch-ms number, stored exactly
+        // as an int64 (V_INT64) so a Unix-ms timestamp round-trips without loss.
         eq(typeof Date.now(), "number", "Date.now() is a number");
         ok(Date.now() >= 0, "Date.now() is non-negative");
         const n0 = Date.now(), n1 = Date.now();
@@ -1233,10 +1234,68 @@ section("15. async / await");
         ok(d.getTime() >= 0, "getTime() is non-negative");
         eq(typeof d.valueOf(), "number", "valueOf() is a number");
 
-        // A Date built from an explicit time round-trips it (getTime() is a
-        // float, so compare with ===, which coerces, rather than Object.is).
+        // A Date built from an explicit time round-trips it exactly. getTime()
+        // is an int64, so === (which coerces across numeric tags) matches the
+        // int32/int64 literal; Object.is would be type-strict across tags.
         ok(new Date(86400000).getTime() === 86400000, "new Date(t).getTime() round-trips");
         ok(new Date(0).getTime() === 0, "new Date(0).getTime() is 0");
+        ok(new Date(1600000000000).getTime() === 1600000000000, "a 1.6e12 ms timestamp is exact");
+
+        // toISOString() renders the exact UTC instant (YYYY-MM-DDTHH:MM:SS.sssZ).
+        eq(new Date(0).toISOString(), "1970-01-01T00:00:00.000Z", "epoch toISOString");
+        eq(new Date(86400000).toISOString(), "1970-01-02T00:00:00.000Z", "day 1 toISOString");
+        eq(new Date(-1).toISOString(), "1969-12-31T23:59:59.999Z", "one ms before epoch");
+        eq(new Date(1600000000000).toISOString(), "2020-09-13T12:26:40.000Z", "a 2020 instant");
+        eq(new Date(0).toJSON(), new Date(0).toISOString(), "toJSON matches toISOString");
+        eq(new Date(0).toUTCString(), "Thu, 01 Jan 1970 00:00:00 GMT", "epoch toUTCString");
+
+        // UTC field accessors (TZ-independent).
+        const day1 = new Date(86400000);
+        eq(day1.getUTCFullYear(), 1970, "getUTCFullYear");
+        eq(day1.getUTCMonth(), 0, "getUTCMonth is 0-based");
+        eq(day1.getUTCDate(), 2, "getUTCDate");
+        eq(day1.getUTCDay(), 5, "getUTCDay (1970-01-02 was a Friday)");
+        eq(day1.getUTCHours(), 0, "getUTCHours");
+        eq(day1.getUTCMinutes(), 0, "getUTCMinutes");
+        eq(day1.getUTCSeconds(), 0, "getUTCSeconds");
+        eq(day1.getUTCMilliseconds(), 0, "getUTCMilliseconds");
+        const t = new Date(1600000000000);
+        eq(t.getUTCFullYear(), 2020, "2020 getUTCFullYear");
+        eq(t.getUTCMonth(), 8, "2020-09 getUTCMonth");
+        eq(t.getUTCDate(), 13, "2020-09-13 getUTCDate");
+        eq(t.getUTCHours(), 12, "getUTCHours of a 2020 instant");
+        eq(t.getUTCMinutes(), 26, "getUTCMinutes of a 2020 instant");
+        eq(t.getUTCSeconds(), 40, "getUTCSeconds of a 2020 instant");
+
+        // Local-time constructor: composing then reading back the local fields is
+        // a TZ-independent round-trip regardless of the host zone.
+        const local = new Date(2020, 0, 1);
+        eq(local.getFullYear(), 2020, "local compose getFullYear");
+        eq(local.getMonth(), 0, "local compose getMonth");
+        eq(local.getDate(), 1, "local compose getDate");
+        const local2 = new Date(2021, 6, 4, 13, 30, 15, 250);
+        eq(local2.getFullYear(), 2021, "local compose (full) getFullYear");
+        eq(local2.getMonth(), 6, "local compose (full) getMonth");
+        eq(local2.getDate(), 4, "local compose (full) getDate");
+        eq(local2.getHours(), 13, "local compose getHours");
+        eq(local2.getMinutes(), 30, "local compose getMinutes");
+        eq(local2.getSeconds(), 15, "local compose getSeconds");
+        eq(local2.getMilliseconds(), 250, "local compose getMilliseconds");
+        ok(typeof local.getTimezoneOffset() === "number", "getTimezoneOffset is a number");
+
+        // Date.parse / Date.UTC (cross-tag numeric equality uses ===).
+        ok(Date.parse(new Date(1600000000000).toISOString()) === 1600000000000,
+            "Date.parse round-trips toISOString");
+        ok(Date.parse("1970-01-01T00:00:00.000Z") === 0, "Date.parse of the epoch");
+        ok(Date.parse("2020-09-13T12:26:40.000Z") === 1600000000000, "Date.parse ISO instant");
+        ok(Date.parse("2020-01-01") === Date.UTC(2020, 0, 1), "a date-only string parses as UTC");
+        ok(new Date("2020-09-13T12:26:40.000Z").getTime() === 1600000000000,
+            "the string constructor uses Date.parse");
+        ok(Date.UTC(1970, 0, 1) === 0, "Date.UTC of the epoch");
+        ok(Date.UTC(2020, 0, 1) === 1577836800000, "Date.UTC(2020,0,1)");
+        eq(new Date(Date.UTC(2020, 0, 1)).getUTCFullYear(), 2020, "Date.UTC composes a UTC instant");
+        ok(Date.parse("not a date") !== Date.parse("not a date"), "Date.parse of garbage is NaN");
+        eq(new Date("not a date").toISOString(), "Invalid Date", "an invalid Date stringifies safely");
     })();
 
     // =========================================================================
