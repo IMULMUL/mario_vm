@@ -3,6 +3,7 @@ extern "C" {
 #endif
 
 #include "native_String.h"
+#include <math.h>   /* NAN for charCodeAt's out-of-range result */
 
 /**======utf8 functions======*/
 
@@ -935,6 +936,220 @@ var_t* native_String_iterator(vm_t* vm, var_t* env, void* data) {
 	return vm_new_string_iterator(vm, this_v); /* refs=0 */
 }
 
+/* ASCII whitespace test matching native_StringTrim's set (space plus the
+ * 9..13 control blanks), written by code range so no locale header is needed. */
+static bool str_is_space(char c) {
+	unsigned char u = (unsigned char)c;
+	return u == ' ' || (u >= 9 && u <= 13);
+}
+
+/* ES2019: trimStart (alias trimLeft) - strip leading whitespace. */
+var_t* native_StringTrimStart(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int len = (int)strlen(s);
+	int start = 0;
+	while(start < len && str_is_space(s[start])) start++;
+	var_t* ret = var_new_str2(vm, s + start, len - start);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+/* ES2019: trimEnd (alias trimRight) - strip trailing whitespace. */
+var_t* native_StringTrimEnd(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int len = (int)strlen(s);
+	int end = len;
+	while(end > 0 && str_is_space(s[end - 1])) end--;
+	var_t* ret = var_new_str2(vm, s, end);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+/* ES2022: String.prototype.at(index) - code-point aware; a negative index counts
+ * back from the end and an out-of-range index yields undefined. */
+var_t* native_StringAt(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int count = 0;
+	const char* p = s;
+	while(*p != 0) { str_utf8_decode(&p); count++; }
+	int idx = get_int(env, "index");
+	if(idx < 0) idx += count;
+	if(idx < 0 || idx >= count) return NULL; /* undefined */
+	p = s;
+	int i = 0;
+	while(i < idx) { str_utf8_decode(&p); i++; }
+	const char* start = p;
+	str_utf8_decode(&p);
+	var_t* ret = var_new_str2(vm, start, (int)(p - start));
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+/* ES2021: String.prototype.replaceAll(search, replacement) - replaces every
+ * non-overlapping occurrence. An empty search inserts replacement around each
+ * code point and at both ends, matching the spec ("-a-b-" for "ab"). */
+var_t* native_StringReplaceAll(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	const char* searchValue = get_str(env, "searchValue");
+	const char* replacement = get_str(env, "replacement");
+	int searchLen = (int)strlen(searchValue);
+	mstr_t* result = mstr_new("");
+	if(searchLen == 0) {
+		const char* p = s;
+		mstr_append(result, replacement);
+		while(*p != 0) {
+			str_utf8_encode(result, str_utf8_decode(&p));
+			mstr_append(result, replacement);
+		}
+	} else {
+		int len = (int)strlen(s);
+		int i = 0;
+		while(i < len) {
+			if(i + searchLen <= len && strncmp(s + i, searchValue, searchLen) == 0) {
+				mstr_append(result, replacement);
+				i += searchLen;
+			} else {
+				mstr_add(result, s[i]);
+				i++;
+			}
+		}
+	}
+	var_t* ret = var_new_str(vm, result->cstr);
+	mstr_free(result);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+/* String.prototype.charAt(index): the single character at index as a string, or
+ * "" when index is out of range or negative. Walks code points like at(); unlike
+ * at() a negative index is NOT counted from the end (spec: it yields ""). */
+var_t* native_StringCharAt(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int idx = get_int(env, "index");
+	if(idx < 0) {
+		var_t* e = var_new_str(vm, "");
+		var_instance_from(e, get_obj(env, THIS));
+		return e;
+	}
+	const char* p = s;
+	int i = 0;
+	while(*p != 0 && i < idx) { str_utf8_decode(&p); i++; }
+	if(*p == 0) {
+		var_t* e = var_new_str(vm, "");
+		var_instance_from(e, get_obj(env, THIS));
+		return e;
+	}
+	const char* start = p;
+	str_utf8_decode(&p);
+	var_t* ret = var_new_str2(vm, start, (int)(p - start));
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+/* String.prototype.charCodeAt(index): numeric code of the character at index, or
+ * NaN when out of range. NOTE: Mario stores text as UTF-8 and decodes whole code
+ * points, so for astral characters this returns the code point rather than a
+ * UTF-16 surrogate half; identical to spec for the BMP. */
+var_t* native_StringCharCodeAt(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int idx = get_int(env, "index");
+	if(idx < 0)
+		return var_new_float(vm, NAN);
+	const char* p = s;
+	int i = 0;
+	while(*p != 0 && i < idx) { str_utf8_decode(&p); i++; }
+	if(*p == 0)
+		return var_new_float(vm, NAN);
+	uint32_t cp = str_utf8_decode(&p);
+	return var_new_int(vm, (int)cp);
+}
+
+/* String.prototype.substring(start[, end]): like slice but with substring's
+ * clamping rules - negatives and NaN become 0 (no wrap-from-end), values are
+ * clamped to length, and start/end are swapped when start > end. Byte indices,
+ * consistent with slice()/substr() in this file. */
+var_t* native_StringSubstring(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int len = (int)strlen(s);
+	int start = get_int(env, "start");
+	int end = len;
+	var_t* endVar = get_obj(env, "end");
+	if(endVar != NULL && endVar->type != V_UNDEF)
+		end = var_get_int(endVar);
+	if(start < 0) start = 0;
+	if(end < 0) end = 0;
+	if(start > len) start = len;
+	if(end > len) end = len;
+	if(start > end) { int t = start; start = end; end = t; }
+	var_t* ret = var_new_str2(vm, s + start, end - start);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+/* String.prototype.concat(...strs): this followed by each argument, each run
+ * through JS ToString. var_to_str() RESETS its mstr (it overwrites, not appends),
+ * so each argument is stringified into a scratch buffer and then appended. */
+var_t* native_StringConcat(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	mstr_t* out = mstr_new(get_str(env, THIS));
+	mstr_t* tmp = mstr_new("");
+	uint32_t n = get_func_args_num(env);
+	uint32_t i;
+	for(i=0; i<n; i++) {
+		var_t* a = get_func_arg(env, i);
+		if(a == NULL) { mstr_append(out, "undefined"); continue; }
+		var_to_str(a, tmp);
+		mstr_append(out, tmp->cstr);
+	}
+	var_t* ret = var_new_str(vm, out->cstr);
+	mstr_free(tmp);
+	mstr_free(out);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+/* String.prototype.lastIndexOf(search[, fromIndex]): the greatest index <=
+ * fromIndex at which `search` occurs, or -1. Mirrors indexOf()'s byte-based
+ * scanning but keeps the last match instead of the first. */
+var_t* native_StringLastIndexOf(vm_t* vm, var_t* env, void* data) {
+	(void)vm; (void)data;
+	const char* s = get_str(env, THIS);
+	const char* searchValue = get_str(env, "searchValue");
+	int len = (int)strlen(s);
+	int searchLen = (int)strlen(searchValue);
+	int fromIndex = len;
+	var_t* fromIndexVar = get_obj(env, "fromIndex");
+	if(fromIndexVar != NULL && fromIndexVar->type != V_UNDEF)
+		fromIndex = var_get_int(fromIndexVar);
+	if(fromIndex > len) fromIndex = len;
+	if(searchLen == 0)
+		return var_new_int(vm, fromIndex < 0 ? 0 : fromIndex);
+	int i;
+	int lastFound = -1;
+	for(i=0; i + searchLen <= len && i <= fromIndex; i++) {
+		if(strncmp(s+i, searchValue, searchLen) == 0)
+			lastFound = i;
+	}
+	return var_new_int(vm, lastFound);
+}
+
+/* String.prototype.localeCompare(other): -1 / 0 / 1 by code-point order. NOTE:
+ * this is a plain lexicographic comparison, not true locale-aware collation. */
+var_t* native_StringLocaleCompare(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	const char* other = get_str(env, "compareString");
+	int c = strcmp(s, other);
+	return var_new_int(vm, c < 0 ? -1 : (c > 0 ? 1 : 0));
+}
+
 void reg_native_String(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_STRING);
 	vm_reg_native(vm, cls, "constructor(str)", native_StringConstructor, NULL); 
@@ -957,7 +1172,23 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "codePointAt(position)", native_StringCodePointAt, NULL); 
 	vm_reg_native(vm, cls, "normalize(form)", native_StringNormalize, NULL); 
 	vm_reg_static(vm, cls, "fromCodePoint()", native_String_fromCodePoint, NULL); 
+	/* fromCharCode takes UTF-16 code units; identical to fromCodePoint for the
+	 * BMP, so it reuses the same implementation. */
+	vm_reg_static(vm, cls, "fromCharCode()", native_String_fromCodePoint, NULL); 
 	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_String_iterator, NULL); 
+
+	vm_reg_native(vm, cls, "at(index)", native_StringAt, NULL);
+	vm_reg_native(vm, cls, "trimStart()", native_StringTrimStart, NULL);
+	vm_reg_native(vm, cls, "trimEnd()", native_StringTrimEnd, NULL);
+	vm_reg_native(vm, cls, "trimLeft()", native_StringTrimStart, NULL);
+	vm_reg_native(vm, cls, "trimRight()", native_StringTrimEnd, NULL);
+	vm_reg_native(vm, cls, "replaceAll(searchValue, replacement)", native_StringReplaceAll, NULL);
+	vm_reg_native(vm, cls, "charAt(index)", native_StringCharAt, NULL);
+	vm_reg_native(vm, cls, "charCodeAt(index)", native_StringCharCodeAt, NULL);
+	vm_reg_native(vm, cls, "substring(start, end)", native_StringSubstring, NULL);
+	vm_reg_native(vm, cls, "concat()", native_StringConcat, NULL);
+	vm_reg_native(vm, cls, "lastIndexOf(searchValue, fromIndex)", native_StringLastIndexOf, NULL);
+	vm_reg_native(vm, cls, "localeCompare(compareString)", native_StringLocaleCompare, NULL);
 
 	cls = vm_new_class(vm, CLS_UTF8);
 	vm_reg_native(vm, cls, "constructor(str)", native_UTF8Constructor, NULL); 

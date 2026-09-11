@@ -362,6 +362,38 @@ var_t* native_math_randInt(vm_t* vm, var_t* env, void *data) {
 }
 
 
+//Math.floor(a) - largest integer <= a (standard JS: floor(-1.2) == -2).
+var_t* native_math_floor(vm_t* vm, var_t* env, void *data) {
+	(void)data;
+	float f = get_float(env, "a");
+	return math_num(vm, floor((double)f));
+}
+
+//Math.ceil(a) - smallest integer >= a (standard JS: ceil(1.2) == 2).
+var_t* native_math_ceil(vm_t* vm, var_t* env, void *data) {
+	(void)data;
+	float f = get_float(env, "a");
+	return math_num(vm, ceil((double)f));
+}
+
+//Math.atan2(y,x) - arctangent of y/x in RADIANS. Standard JS result; note the
+//degree-scaling in atan()/sin() above is a pre-existing non-standard quirk that
+//is intentionally left untouched here.
+var_t* native_math_atan2(vm_t* vm, var_t* env, void *data) {
+	(void)data;
+	float fy = get_float(env, "y");
+	float fx = get_float(env, "x");
+	return var_new_float(vm, atan2((double)fy, (double)fx));
+}
+
+//Math.fround(a) - nearest 32-bit float. Mario's V_FLOAT already IS a 32-bit
+//float, so this is a value-preserving round-trip.
+var_t* native_math_fround(vm_t* vm, var_t* env, void *data) {
+	(void)data;
+	return var_new_float(vm, get_float(env, "a"));
+}
+
+
 #define CLS_MATH "Math"
 
 void reg_native_Math(vm_t* vm) {
@@ -402,6 +434,14 @@ void reg_native_Math(vm_t* vm) {
 	vm_reg_static(vm, cls, "hypot()", native_math_hypot, NULL);
 	vm_reg_static(vm, cls, "imul(a,b)", native_math_imul, NULL);
 	vm_reg_static(vm, cls, "clz32(a)", native_math_clz32, NULL);
+
+	/* Standard JS names that were previously missing. random() reuses the
+	 * existing non-standard rand() implementation ([0,1) via rand()/RAND_MAX). */
+	vm_reg_static(vm, cls, "floor(a)", native_math_floor, NULL);
+	vm_reg_static(vm, cls, "ceil(a)", native_math_ceil, NULL);
+	vm_reg_static(vm, cls, "atan2(y,x)", native_math_atan2, NULL);
+	vm_reg_static(vm, cls, "fround(a)", native_math_fround, NULL);
+	vm_reg_static(vm, cls, "random()", native_math_rand, NULL);
 
 	vm_reg_static(vm, cls, "sqr(a)", native_math_sqr, NULL);
 	vm_reg_static(vm, cls, "sqrt(a)", native_math_sqrt, NULL);    

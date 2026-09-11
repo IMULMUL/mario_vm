@@ -388,6 +388,142 @@ var_t* native_Array_slice(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* Array.prototype.reduceRight(f[, initial]): identical to reduce() but walks the
+ * array from the last element down to the first. Callback signature is the same
+ * (acc, element, index, array). Mirrors reduce()'s accumulator-ownership and
+ * gc_defer contract verbatim; only the loop direction and the no-initial seed
+ * (last element instead of first) differ. */
+var_t* native_Array_reduceRight(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = get_obj(env, THIS);
+	var_t* f = get_obj(env, "f");
+	int32_t sz = (int32_t)var_array_size(arr);
+
+	if(f == NULL || f->type == V_UNDEF)
+		return NULL;
+
+	var_t* acc = NULL;
+	bool acc_owned = false;
+	int32_t start;
+	var_t* initial = get_obj(env, "initial");
+	if(initial != NULL && initial->type != V_UNDEF) {
+		acc = initial; // borrowed from env; do not free
+		start = sz - 1;
+	}
+	else {
+		if(sz == 0)
+			return NULL; // JS throws here; return undefined instead
+		node_t* n0 = var_array_get(arr, sz-1);
+		acc = (n0 != NULL) ? n0->var : NULL; // borrowed from arr
+		start = sz - 2;
+	}
+
+	int32_t i;
+	vm->gc.gc_defer++; /* acc + transient args unrooted across callbacks */
+	for(i=start; i>=0; --i) {
+		node_t* n = var_array_get(arr, i);
+		if(n == NULL)
+			continue;
+		var_t* args = var_new_array(vm);
+		var_array_add(args, (acc != NULL) ? acc : var_new(vm));
+		var_array_add(args, n->var);
+		var_array_add(args, var_new_int(vm, (int)i));
+		var_array_add(args, arr);
+		var_array_reverse(args);
+		var_t* res = call_m_func(vm, env, f, args);
+		var_unref(args);
+		if(acc_owned && acc != NULL)
+			var_unref(acc); // release the previous owned accumulator
+		acc = res;          // owned (refs>=1)
+		acc_owned = true;
+	}
+	vm->gc.gc_defer--;
+
+	if(acc == NULL)
+		return NULL;
+	if(acc_owned && acc->refs > 0)
+		acc->refs--; // drop call_m_func's ref, matching reduce()'s return contract
+	return acc;
+}
+
+/* Array.prototype.splice(start, deleteCount, ...items): removes deleteCount
+ * elements at start, inserts items in their place, mutates `this`, and returns
+ * the removed elements. Mario arrays are hash-maps keyed by stringified index
+ * with NO re-indexing on removal (var_array_remove just drops key "i"), and
+ * var_array_add appends at key==size assuming contiguity. So an in-place shift
+ * is not possible; instead partition the elements into temp arrays, empty the
+ * array, then rebuild it as before + items + after. var_array_add refs each
+ * element into the temp arrays, so they survive the emptying (which frees the
+ * array's nodes and would otherwise drop their only reference). The whole body
+ * runs under gc_defer: the temp arrays are unrooted refs=0 locals across the
+ * allocations below. */
+var_t* native_Array_splice(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = get_obj(env, THIS);
+	if(arr == NULL || !arr->is_array)
+		return var_new_array(vm);
+	int32_t sz = (int32_t)var_array_size(arr);
+
+	int32_t start = get_int(env, "start");
+	if(start < 0) start = sz + start;
+	if(start < 0) start = 0;
+	if(start > sz) start = sz;
+
+	var_t* dcVar = get_obj(env, "deleteCount");
+	int32_t deleteCount;
+	if(dcVar == NULL || dcVar->type == V_UNDEF)
+		deleteCount = sz - start;
+	else {
+		deleteCount = var_get_int(dcVar);
+		if(deleteCount < 0) deleteCount = 0;
+		if(deleteCount > sz - start) deleteCount = sz - start;
+	}
+
+	uint32_t argc = get_func_args_num(env);
+	uint32_t nItems = (argc > 2) ? (argc - 2) : 0;
+
+	vm->gc.gc_defer++;
+
+	var_t* before = var_new_array(vm);
+	var_t* removed = var_new_array(vm);
+	var_t* after = var_new_array(vm);
+	int32_t i;
+	for(i=0; i<start; ++i) {
+		var_t* v = var_array_get_var(arr, i);
+		if(v != NULL) var_array_add(before, v);
+	}
+	for(i=start; i<start+deleteCount; ++i) {
+		var_t* v = var_array_get_var(arr, i);
+		if(v != NULL) var_array_add(removed, v);
+	}
+	for(i=start+deleteCount; i<sz; ++i) {
+		var_t* v = var_array_get_var(arr, i);
+		if(v != NULL) var_array_add(after, v);
+	}
+
+	for(i=0; i<sz; ++i)                 // empty arr (elements live in the temps)
+		var_array_del(arr, i);
+
+	uint32_t bs = var_array_size(before), as = var_array_size(after), j;
+	for(j=0; j<bs; ++j) {
+		var_t* v = var_array_get_var(before, (int32_t)j);
+		if(v != NULL) var_array_add(arr, v);
+	}
+	for(j=0; j<nItems; ++j) {
+		var_t* item = get_func_arg(env, 2+j);
+		if(item != NULL) var_array_add(arr, item);
+	}
+	for(j=0; j<as; ++j) {
+		var_t* v = var_array_get_var(after, (int32_t)j);
+		if(v != NULL) var_array_add(arr, v);
+	}
+
+	var_unref(before);                  // their elements now belong to arr
+	var_unref(after);
+	vm->gc.gc_defer--;
+	return removed;
+}
+
 var_t* native_Array_isArray(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 	var_t* obj = get_obj(env, "obj");
@@ -829,6 +965,20 @@ var_t* native_Array_iterator(vm_t* vm, var_t* env, void* data) {
 	return vm_new_array_iterator(vm, this_v); /* refs=0 */
 }
 
+/* ES2022: Array.prototype.at(index) - supports negative (relative) indices and
+ * yields undefined when the resolved index falls outside [0, length). */
+var_t* native_Array_at(vm_t* vm, var_t* env, void* data) {
+	(void)vm; (void)data;
+	var_t* arr = get_obj(env, THIS);
+	int32_t sz = (int32_t)var_array_size(arr);
+	var_t* idx_v = get_obj(env, "index");
+	int32_t i = (idx_v == NULL || idx_v->type == V_UNDEF) ? 0 : (int32_t)var_get_float(idx_v);
+	if(i < 0) i += sz;
+	if(i < 0 || i >= sz)
+		return NULL; /* undefined for out-of-range */
+	return var_array_get_var(arr, i); /* borrowed; func_call adds the stack ref */
+}
+
 void reg_native_Array(vm_t* vm) {
   var_t* cls = vm_new_class(vm, CLS_ARRAY);
 	vm_reg_native(vm, cls, "constructor()", native_Array_constructor, NULL);
@@ -837,6 +987,8 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, "map(f)", native_Array_map, NULL);
 	vm_reg_native(vm, cls, "filter(f)", native_Array_filter, NULL);
 	vm_reg_native(vm, cls, "reduce(f, initial)", native_Array_reduce, NULL);
+	vm_reg_native(vm, cls, "reduceRight(f, initial)", native_Array_reduceRight, NULL);
+	vm_reg_native(vm, cls, "splice(start, deleteCount)", native_Array_splice, NULL);
 	vm_reg_native(vm, cls, "reverse()", native_Array_reverse, NULL); 
 	vm_reg_native(vm, cls, "concat()", native_Array_concat, NULL); 
 	vm_reg_native(vm, cls, "join(c)", native_Array_join, NULL); 
@@ -869,6 +1021,7 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, "some(f)", native_Array_some, NULL);
 	vm_reg_native(vm, cls, "every(f)", native_Array_every, NULL);
 	vm_reg_native(vm, cls, "sort(f)", native_Array_sort, NULL);
+	vm_reg_native(vm, cls, "at(index)", native_Array_at, NULL);
 }
 
 #ifdef __cplusplus

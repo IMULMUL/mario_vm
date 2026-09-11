@@ -34,6 +34,28 @@
 //   20. Exponent operator, new.target, typeof/instanceof edge cases
 //   21. Closures & the classic loop-capture (let vs var)
 //   22. Tail-position / recursion & destructuring corner cases
+//   23. Global functions & globalThis (isNaN, parseInt, parseFloat, Number.*)
+//   24. Error subtypes & AggregateError (TypeError, RangeError, ...)
+//   25. Object statics (hasOwn, setPrototypeOf, seal, preventExtensions, ...)
+//   26. Array.at & String extras (at, trimStart/End/Left/Right, replaceAll)
+//   27. Promise.any (ES2021)
+//   28. JSON stringify / parse (compact output, negatives, floats, roundtrip)
+//   29. Date & typeof of constructors (Date.now, getTime, valueOf)
+//   30. undefined / null equality
+//   31. Added built-ins (Math.floor/ceil/atan2/fround/random, Array.splice/
+//       reduceRight, String.charAt/charCodeAt/substring/concat/fromCharCode/
+//       lastIndexOf/localeCompare, Number.toFixed/toPrecision/valueOf/
+//       MAX_VALUE/MIN_VALUE) && logical `&&`/`||` operand-return semantics
+//
+// Deliberately EXCLUDED (each would need a subsystem this minimal engine lacks):
+//   - RegExp: no /pattern/ literals, no regex-based match/split/replace.
+//   - Proxy / Reflect: no metaprogramming traps.
+//   - TypedArrays / ArrayBuffer / DataView: no binary buffers.
+//   - BigInt: the number model is 32-bit int / 32-bit float only.
+//   - ES Modules: import/export; this is a single-file script engine.
+//   - Full Date field accessors & parsing (getFullYear/getMonth/parse/
+//     toISOString): a 32-bit number cannot hold a Unix-ms timestamp exactly, so
+//     only Date.now, the constructor, getTime and valueOf are provided.
 // =============================================================================
 
 // --- Runtime shim ------------------------------------------------------------
@@ -982,6 +1004,352 @@ section("15. async / await");
         function pair() { return [1, 2]; }
         const [pa, pb] = pair();
         eq(pa + pb, 3, "destructure a function's array result");
+    })();
+
+    // =========================================================================
+    section("23. Global functions & globalThis");
+    // =========================================================================
+    (function () {
+        eq(typeof globalThis, "object", "globalThis is an object");
+        ok(globalThis === globalThis, "globalThis is self-referential");
+        ok(typeof globalThis.parseInt === "function", "globals hang off globalThis");
+
+        // The global isNaN coerces its argument first (unlike Number.isNaN).
+        eq(isNaN(NaN), true, "isNaN(NaN)");
+        eq(isNaN("foo"), true, "isNaN coerces a non-numeric string");
+        eq(isNaN("12"), false, "isNaN('12') is numeric");
+        eq(isNaN(undefined), true, "isNaN(undefined) -> NaN");
+        eq(isNaN(null), false, "isNaN(null) -> 0");
+
+        eq(parseInt("42"), 42, "parseInt decimal");
+        eq(parseInt("42abc"), 42, "parseInt stops at the first invalid digit");
+        eq(parseInt("  7  "), 7, "parseInt skips surrounding whitespace");
+        eq(parseInt("ff", 16), 255, "parseInt honours an explicit radix");
+        eq(parseInt("101", 2), 5, "parseInt binary radix");
+        ok(isNaN(parseInt("abc")), "parseInt of garbage is NaN");
+        eq(parseFloat("3.14"), 3.14, "parseFloat decimal");
+        eq(parseFloat("2.5abc"), 2.5, "parseFloat stops at the first invalid digit");
+        ok(isNaN(parseFloat("x")), "parseFloat of garbage is NaN");
+
+        eq(Number.isInteger(3), true, "Number.isInteger(3)");
+        eq(Number.isInteger(3.5), false, "Number.isInteger(3.5)");
+        eq(Number.isNaN(NaN), true, "Number.isNaN(NaN)");
+        eq(Number.isNaN("x"), false, "Number.isNaN never coerces");
+        eq(Number.isFinite(1), true, "Number.isFinite(1)");
+        eq(Number.isFinite(Infinity), false, "Number.isFinite(Infinity)");
+        eq(Number.isSafeInteger(5), true, "Number.isSafeInteger(5)");
+    })();
+
+    // =========================================================================
+    section("24. Error subtypes & AggregateError");
+    // =========================================================================
+    (function () {
+        const e = new TypeError("bad");
+        eq(e.message, "bad", "TypeError carries its message");
+        eq(e.name, "TypeError", "TypeError reports its name");
+        ok(e instanceof TypeError, "TypeError instanceof TypeError");
+        ok(e instanceof Error, "a subtype is instanceof Error");
+        eq(typeof e, "object", "an error is an object");
+
+        // Every standard subtype names itself and is an Error.
+        eq(new RangeError("m").name, "RangeError", "RangeError name");
+        ok(new RangeError("m") instanceof Error, "RangeError instanceof Error");
+        eq(new ReferenceError("m").name, "ReferenceError", "ReferenceError name");
+        ok(new ReferenceError("m") instanceof Error, "ReferenceError instanceof Error");
+        eq(new SyntaxError("m").name, "SyntaxError", "SyntaxError name");
+        ok(new SyntaxError("m") instanceof Error, "SyntaxError instanceof Error");
+        eq(new EvalError("m").name, "EvalError", "EvalError name");
+        ok(new EvalError("m") instanceof Error, "EvalError instanceof Error");
+        eq(new URIError("m").name, "URIError", "URIError name");
+        ok(new URIError("m") instanceof Error, "URIError instanceof Error");
+
+        // Distinct instances keep distinct messages.
+        const a = new TypeError("first"), b = new TypeError("second");
+        eq(a.message, "first", "first instance keeps its own message");
+        eq(b.message, "second", "second instance keeps its own message");
+
+        // Error.prototype.toString() -> "Name: message"
+        eq(new TypeError("x").toString(), "TypeError: x", "toString is 'Name: message'");
+        eq(new RangeError().toString(), "RangeError", "toString omits an empty message");
+        eq(String(new Error("boom")), "Error: boom", "String(error) uses toString");
+
+        // A thrown subtype is caught as itself.
+        let caught = null;
+        try { throw new RangeError("out"); } catch (err) { caught = err; }
+        ok(caught instanceof RangeError, "a thrown subtype is caught as itself");
+        eq(caught.message, "out", "the caught error keeps its message");
+
+        // AggregateError (ES2021): an error that holds a list of errors.
+        const agg = new AggregateError([new Error("e1"), new Error("e2")], "multi");
+        eq(agg.name, "AggregateError", "AggregateError name");
+        eq(agg.message, "multi", "AggregateError message");
+        eq(agg.errors.length, 2, "AggregateError holds the errors iterable");
+        ok(agg instanceof Error, "AggregateError instanceof Error");
+    })();
+
+    // =========================================================================
+    section("25. Object statics (ES6+ / ES2022)");
+    // =========================================================================
+    (function () {
+        eq(Object.hasOwn({ a: 1 }, "a"), true, "Object.hasOwn finds an own key");
+        eq(Object.hasOwn({ a: 1 }, "b"), false, "Object.hasOwn rejects a missing key");
+        eq(Object.is(NaN, NaN), true, "Object.is treats NaN as same-value equal");
+        eq(Object.is(0, -0), false, "Object.is distinguishes +0 from -0");
+
+        const proto = { x: 1 };
+        const child = Object.create(proto);
+        ok(Object.getPrototypeOf(child) === proto, "getPrototypeOf(create(o)) is o");
+        const re = {};
+        Object.setPrototypeOf(re, proto);
+        eq(re.x, 1, "setPrototypeOf rewires the prototype chain");
+
+        const descriptors = Object.getOwnPropertyDescriptors({ a: 1 });
+        ok(descriptors.a !== undefined, "getOwnPropertyDescriptors returns per-key descriptors");
+
+        const sealed = { a: 1 };
+        Object.seal(sealed);
+        eq(Object.isSealed(sealed), true, "isSealed is true after seal");
+
+        const nx = { a: 1 };
+        Object.preventExtensions(nx);
+        eq(Object.isExtensible(nx), false, "isExtensible is false after preventExtensions");
+
+        const dp = {};
+        Object.defineProperties(dp, { a: { value: 1 }, b: { value: 2 } });
+        eq(dp.a, 1, "defineProperties sets a");
+        eq(dp.b, 2, "defineProperties sets b");
+    })();
+
+    // =========================================================================
+    section("26. Array.at & String extras");
+    // =========================================================================
+    (function () {
+        eq([1, 2, 3].at(0), 1, "Array.at(0)");
+        eq([1, 2, 3].at(-1), 3, "Array.at(-1) counts from the end");
+        eq([1, 2, 3].at(5), undefined, "Array.at out of range is undefined");
+
+        eq("abc".at(0), "a", "String.at(0)");
+        eq("abc".at(-1), "c", "String.at(-1) counts from the end");
+        eq("abc".at(9), undefined, "String.at out of range is undefined");
+
+        eq("  x  ".trimStart(), "x  ", "trimStart strips leading whitespace");
+        eq("  x  ".trimEnd(), "  x", "trimEnd strips trailing whitespace");
+        eq("  x  ".trimLeft(), "x  ", "trimLeft is an alias of trimStart");
+        eq("  x  ".trimRight(), "  x", "trimRight is an alias of trimEnd");
+
+        eq("a-b-c".replaceAll("-", "+"), "a+b+c", "replaceAll replaces every occurrence");
+        eq("aaa".replaceAll("a", "bb"), "bbbbbb", "replaceAll handles a growing replacement");
+        eq("abc".replaceAll("q", "!"), "abc", "replaceAll with no match is a no-op");
+    })();
+
+    // =========================================================================
+    section("27. Promise.any (ES2021)");
+    // =========================================================================
+    (function () {
+        // Fulfills with the first fulfilled value, skipping rejections.
+        let v1 = null;
+        Promise.any([Promise.reject("e"), Promise.resolve(42)]).then(r => { v1 = r; });
+        eq(v1, 42, "Promise.any fulfills with the first fulfilled");
+
+        let v2 = null;
+        Promise.any([Promise.resolve(1), Promise.resolve(2)]).then(r => { v2 = r; });
+        eq(v2, 1, "Promise.any takes the first when all fulfill");
+
+        // A non-promise value counts as already fulfilled.
+        let v3 = null;
+        Promise.any([7, Promise.resolve(9)]).then(r => { v3 = r; });
+        eq(v3, 7, "Promise.any treats a plain value as fulfilled");
+
+        // When every input rejects it rejects with an AggregateError.
+        let agg = null;
+        Promise.any([Promise.reject(1), Promise.reject(2)]).catch(e => { agg = e; });
+        ok(agg instanceof AggregateError, "Promise.any rejects with an AggregateError");
+        ok(agg instanceof Error, "that AggregateError is an Error");
+        eq(agg.errors.length, 2, "the AggregateError collects every reason");
+        eq(agg.errors[0], 1, "first collected reason");
+        eq(agg.errors[1], 2, "second collected reason");
+
+        // An empty iterable rejects with an empty AggregateError.
+        let empty = null;
+        Promise.any([]).catch(e => { empty = e; });
+        ok(empty instanceof AggregateError, "Promise.any([]) rejects with an AggregateError");
+        eq(empty.errors.length, 0, "the empty AggregateError has no errors");
+    })();
+
+    // =========================================================================
+    section("28. JSON stringify / parse");
+    // =========================================================================
+    (function () {
+        // stringify emits no incidental whitespace (compact), per spec.
+        eq(JSON.stringify({ a: 1, b: 2 }), '{"a":1,"b":2}', "stringify an object compactly");
+        eq(JSON.stringify([1, 2, 3]), '[1,2,3]', "stringify an array compactly");
+        eq(JSON.stringify({ a: [1, { b: 2 }] }), '{"a":[1,{"b":2}]}', "stringify nested structures compactly");
+        eq(JSON.stringify(3.5), '3.5', "stringify a float without zero padding");
+        eq(JSON.stringify("s"), '"s"', "stringify a string");
+        eq(JSON.stringify(null), 'null', "stringify null");
+        eq(JSON.stringify(true), 'true', "stringify true");
+
+        // parse handles negatives and floats (a stray '-' used to hang the parser).
+        eq(JSON.parse('{"a":1}').a, 1, "parse an object member");
+        eq(JSON.parse('[1,2,3]').length, 3, "parse an array");
+        eq(JSON.parse('-3.5'), -3.5, "parse a negative float");
+        eq(JSON.parse('[-1,2,-3.5]')[2], -3.5, "parse negatives inside an array");
+        eq(JSON.parse('{"n":-7}').n, -7, "parse a negative integer member");
+
+        // roundtrip
+        const rt = JSON.parse(JSON.stringify({ a: 1, b: [2, 3], c: "x" }));
+        eq(rt.a, 1, "roundtrip preserves a number");
+        eq(rt.b[1], 3, "roundtrip preserves a nested array");
+        eq(rt.c, "x", "roundtrip preserves a string");
+    })();
+
+    // =========================================================================
+    section("29. Date & typeof of constructors");
+    // =========================================================================
+    (function () {
+        // Every constructor reports typeof "function" (native and script classes).
+        eq(typeof Date, "function", "typeof Date is 'function'");
+        eq(typeof Array, "function", "typeof Array is 'function'");
+        eq(typeof Object, "function", "typeof Object is 'function'");
+        eq(typeof Promise, "function", "typeof Promise is 'function'");
+        eq(typeof TypeError, "function", "typeof an error subtype is 'function'");
+        class Local {}
+        eq(typeof Local, "function", "typeof a script class is 'function'");
+
+        // Date.now(): a non-negative, monotonic epoch-ms number. The VM's 32-bit
+        // number model cannot hold ms exactly (a float32 quantises ~1.7e12 to
+        // 131072-ms steps), so only sign/magnitude/ordering are asserted here.
+        eq(typeof Date.now(), "number", "Date.now() is a number");
+        ok(Date.now() >= 0, "Date.now() is non-negative");
+        const n0 = Date.now(), n1 = Date.now();
+        ok(n1 >= n0, "Date.now() is monotonic");
+
+        // new Date() and its instance methods.
+        const d = new Date();
+        eq(typeof d, "object", "new Date() is an object");
+        ok(d instanceof Date, "new Date() instanceof Date");
+        eq(typeof d.getTime, "function", "getTime is an instance method");
+        eq(typeof d.getTime(), "number", "getTime() is a number");
+        ok(d.getTime() >= 0, "getTime() is non-negative");
+        eq(typeof d.valueOf(), "number", "valueOf() is a number");
+
+        // A Date built from an explicit time round-trips it (getTime() is a
+        // float, so compare with ===, which coerces, rather than Object.is).
+        ok(new Date(86400000).getTime() === 86400000, "new Date(t).getTime() round-trips");
+        ok(new Date(0).getTime() === 0, "new Date(0).getTime() is 0");
+    })();
+
+    // =========================================================================
+    section("30. undefined / null equality");
+    // =========================================================================
+    (function () {
+        // undefined === undefined was historically false in this VM.
+        eq(undefined === undefined, true, "undefined === undefined");
+        eq(null === null, true, "null === null");
+        eq(undefined === null, false, "undefined is not null under ===");
+        ok(undefined == null, "undefined == null under loose equality");
+        ok(null == undefined, "null == undefined under loose equality");
+        ok(undefined !== null, "undefined !== null");
+
+        let unassigned;
+        eq(unassigned, undefined, "an unassigned variable is undefined");
+        eq({}.missing, undefined, "a missing property reads as undefined");
+        ok([1, 2].at(9) === undefined, "Array.at out of range === undefined");
+        ok("ab".at(9) === undefined, "String.at out of range === undefined");
+        ok(NaN !== NaN, "NaN is not equal to itself");
+    })();
+
+    // =========================================================================
+    section("31. Added built-ins & logical-operator operand semantics");
+    // =========================================================================
+    (function () {
+        // --- Math additions (floor/ceil box integral results as ints) ---
+        eq(Math.floor(1.7), 1, "Math.floor(1.7) === 1");
+        eq(Math.floor(-1.2), -2, "Math.floor(-1.2) === -2");
+        eq(Math.ceil(1.2), 2, "Math.ceil(1.2) === 2");
+        eq(Math.ceil(-1.7), -1, "Math.ceil(-1.7) === -1");
+        // atan2 returns a float32; compare within a tolerance, not by ===.
+        ok(Math.abs(Math.atan2(1, 1) - 0.7853981634) < 1e-5, "Math.atan2(1,1) ~ pi/4");
+        ok(Math.abs(Math.atan2(0, -1) - 3.14159265) < 1e-5, "Math.atan2(0,-1) ~ pi");
+        ok(Math.fround(1.5) === 1.5, "Math.fround(1.5) === 1.5");
+        ok(Math.random() >= 0 && Math.random() < 1, "Math.random() is in [0,1)");
+    })();
+
+    (function () {
+        // --- Array.prototype.splice (partition + rebuild; hash-mapped arrays) ---
+        const a = [1, 2, 3, 4, 5];
+        const removed = a.splice(1, 2);
+        deepEq(removed, [2, 3], "splice returns the removed slice");
+        deepEq(a, [1, 4, 5], "splice mutates the original array");
+
+        const b = [1, 2, 3];
+        const none = b.splice(1, 0, "x", "y");
+        deepEq(none, [], "splice with deleteCount 0 removes nothing");
+        deepEq(b, [1, "x", "y", 2, 3], "splice inserts items at the index");
+
+        const c = [1, 2, 3, 4];
+        deepEq(c.splice(-1, 1), [4], "splice accepts a negative start");
+        deepEq(c, [1, 2, 3], "splice(-1,1) drops the last element");
+
+        const d = [1, 2, 3];
+        deepEq(d.splice(1), [2, 3], "splice with no deleteCount removes to the end");
+        deepEq(d, [1], "splice(1) leaves the head");
+
+        // --- Array.prototype.reduceRight ---
+        eq([1, 2, 3].reduceRight((acc, x) => acc + x, 0), 6, "reduceRight sums");
+        eq(["a", "b", "c"].reduceRight((acc, x) => acc + x, ""), "cba", "reduceRight walks right-to-left");
+        eq([1, 2, 3].reduceRight((acc, x, i) => acc + i, 0), 3, "reduceRight passes indices 2,1,0");
+    })();
+
+    (function () {
+        // --- String additions ---
+        eq("hello".charAt(1), "e", "charAt(1)");
+        eq("hello".charAt(9), "", "charAt out of range yields ''");
+        eq("abc".charCodeAt(0), 97, "charCodeAt(0) === 97");
+        ok(Number.isNaN("abc".charCodeAt(9)), "charCodeAt out of range is NaN");
+        eq("abcdef".substring(1, 3), "bc", "substring(1,3)");
+        eq("abcdef".substring(3, 1), "bc", "substring swaps when start > end");
+        eq("abcdef".substring(-1, 2), "ab", "substring clamps negatives to 0");
+        eq("ab".concat("cd", "ef"), "abcdef", "concat joins every argument");
+        eq("a".concat(1, true, "b"), "a1trueb", "concat stringifies non-strings");
+        eq(String.fromCharCode(72, 105), "Hi", "fromCharCode builds a string");
+        eq("aaa".lastIndexOf("a"), 2, "lastIndexOf finds the last match");
+        eq("abc".lastIndexOf("z"), -1, "lastIndexOf returns -1 when absent");
+        eq("abab".lastIndexOf("a", 2), 2, "lastIndexOf honours fromIndex");
+        eq("abc".localeCompare("abd"), -1, "localeCompare less-than");
+        eq("abc".localeCompare("abc"), 0, "localeCompare equal");
+        eq("abd".localeCompare("abc"), 1, "localeCompare greater-than");
+    })();
+
+    (function () {
+        // --- Number additions ---
+        eq((123.456).toFixed(2), "123.46", "toFixed(2) rounds");
+        eq((5).toFixed(2), "5.00", "toFixed pads with zeros");
+        eq((9.5).toFixed(0), "10", "toFixed(0) rounds to an integer string");
+        eq((123.456).toPrecision(3), "123", "toPrecision(3) significant digits");
+        eq((5).valueOf(), 5, "Number.prototype.valueOf returns the primitive");
+        ok(Number.MAX_VALUE > 1e30, "Number.MAX_VALUE is large");
+        ok(Number.MIN_VALUE > 0 && Number.MIN_VALUE < 1, "Number.MIN_VALUE is a small positive");
+    })();
+
+    (function () {
+        // --- Logical `&&` / `||` yield an OPERAND, not a boolean. These are the
+        // regression guards for the handle_logic NULL-deref crash (undefined/null
+        // operands used to segfault) and its wrong boolean result. ---
+        ok((undefined && 1) === undefined, "undefined && 1 yields undefined (no crash)");
+        ok((null && 1) === null, "null && 1 yields null (no crash)");
+        eq(null || 2, 2, "null || 2 yields 2");
+        eq("s" && 1, 1, "'s' && 1 yields 1, not true");
+        eq(0 || 7, 7, "0 || 7 yields 7, not true");
+        eq(1 && 2, 2, "1 && 2 yields 2");
+        eq("a" || "b", "a", "'a' || 'b' yields 'a'");
+        eq("" && "x", "", "'' && 'x' yields '' (empty string is falsy)");
+        eq(0 && "x", 0, "0 && 'x' yields 0");
+        eq(NaN || "fallback", "fallback", "NaN || 'fallback' yields 'fallback'");
+        const opts = {};
+        eq(opts.port || 8080, 8080, "the `a || default` idiom works");
+        const o = {};
+        eq(o && 5, 5, "an object is truthy in &&");
     })();
 
     // =========================================================================

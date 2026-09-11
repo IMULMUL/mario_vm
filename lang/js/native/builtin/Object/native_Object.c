@@ -438,6 +438,129 @@ var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) 
 	return d;
 }
 
+/* Object.hasOwn(obj, key): own-property check (no prototype chain), the modern
+ * replacement for obj.hasOwnProperty(key). */
+var_t* native_Object_hasOwn(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	const char* name = get_func_arg_str(env, 1);
+	node_t* n = (obj != NULL) ? var_find_own_member(obj, name) : NULL;
+	return var_new_bool(vm, n != NULL && n->be_inherited == 0 && n->invisable == 0);
+}
+
+/* Object.setPrototypeOf(obj, proto): re-point obj's [[Prototype]]; returns obj. */
+var_t* native_Object_setPrototypeOf(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	var_t* proto = get_func_arg(env, 1);
+	if(obj != NULL && proto != NULL)
+		var_set_prototype(obj, proto);
+	return obj != NULL ? obj : var_new(vm);
+}
+
+/* Object.getOwnPropertyDescriptors(obj): a plain object mapping every own key to
+ * its {value,writable,enumerable,configurable} descriptor. */
+var_t* native_Object_getOwnPropertyDescriptors(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	var_t* ret = new_plain_obj(vm);
+	if(obj == NULL)
+		return ret;
+	var_t* keys = var_new_array(vm);
+	var_own_keys(vm, obj, keys, false);
+	uint32_t sz = var_array_size(keys), j;
+	vm->gc.gc_defer++; /* ret/keys unrooted while we build them */
+	for(j = 0; j < sz; j++) {
+		const char* k = var_get_str(var_array_get_var(keys, (int32_t)j));
+		node_t* n = var_find_own_member(obj, k);
+		if(n == NULL || n->be_inherited)
+			continue;
+		var_t* d = new_plain_obj(vm);
+		var_add(d, "value", n->var != NULL ? n->var : var_new(vm));
+		var_add(d, "writable", var_new_bool(vm, !n->be_const));
+		var_add(d, "enumerable", var_new_bool(vm, !n->be_unenumerable));
+		var_add(d, "configurable", var_new_bool(vm, !n->be_const));
+		var_add(ret, k, d);
+	}
+	vm->gc.gc_defer--;
+	var_unref(keys);
+	return ret;
+}
+
+/* Object.seal(obj) / isSealed: mark the object sealed. mario does not model
+ * configurable-vs-writable separately, so seal is tracked with a hidden flag and
+ * reported back by isSealed; it deliberately does NOT freeze values. */
+var_t* native_Object_seal(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	if(obj != NULL) {
+		node_t* mark = var_add(obj, "@sealed", var_new_bool(vm, true));
+		if(mark != NULL)
+			mark->invisable = 1;
+	}
+	return obj != NULL ? obj : var_new(vm);
+}
+
+var_t* native_Object_isSealed(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	node_t* n = (obj != NULL) ? var_find_own_member(obj, "@sealed") : NULL;
+	return var_new_bool(vm, n != NULL);
+}
+
+/* Object.preventExtensions(obj) / isExtensible: hidden flag, mirrors seal. */
+var_t* native_Object_preventExtensions(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	if(obj != NULL) {
+		node_t* mark = var_add(obj, "@noext", var_new_bool(vm, true));
+		if(mark != NULL)
+			mark->invisable = 1;
+	}
+	return obj != NULL ? obj : var_new(vm);
+}
+
+var_t* native_Object_isExtensible(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	node_t* n = (obj != NULL) ? var_find_own_member(obj, "@noext") : NULL;
+	return var_new_bool(vm, n == NULL);
+}
+
+/* Object.defineProperties(obj, descriptors): apply each own key of `descriptors`
+ * through the same logic as defineProperty. */
+var_t* native_Object_defineProperties(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* obj = get_func_arg(env, 0);
+	var_t* descriptors = get_func_arg(env, 1);
+	if(obj == NULL)
+		return var_new(vm);
+	if(descriptors == NULL)
+		return obj;
+	var_t* keys = var_new_array(vm);
+	var_own_keys(vm, descriptors, keys, false);
+	uint32_t sz = var_array_size(keys), j;
+	for(j = 0; j < sz; j++) {
+		const char* k = var_get_str(var_array_get_var(keys, (int32_t)j));
+		var_t* desc = var_find_own_member_var(descriptors, k);
+		if(desc == NULL)
+			continue;
+		var_t* v = var_find_own_member_var(desc, "value");
+		node_t* node = var_add(obj, k, v != NULL ? v : var_new(vm));
+		v = var_find_own_member_var(desc, "writable");
+		if(v != NULL)
+			node->be_const = !var_get_bool(v);
+		v = var_find_own_member_var(desc, "enumerable");
+		if(v != NULL)
+			node->be_unenumerable = !var_get_bool(v);
+		v = var_find_own_member_var(desc, "configurable");
+		if(v != NULL)
+			node->be_const = !var_get_bool(v);
+	}
+	var_unref(keys);
+	return obj;
+}
+
 /* __obj_rest(src, excludedKeysArray): internal helper for object-rest
  * destructuring `const { a, ...rest } = src`. Returns a new object holding
  * src's own enumerable properties whose key is not in excludedKeysArray. */
@@ -492,9 +615,22 @@ void reg_native_Object(vm_t* vm) {
 	vm_reg_static(vm, cls, "getOwnPropertyNames(obj)", native_Object_getOwnPropertyNames, NULL);
 	vm_reg_static(vm, cls, "getOwnPropertySymbols(obj)", native_Object_getOwnPropertySymbols, NULL);
 	vm_reg_static(vm, cls, "getOwnPropertyDescriptor(obj, prop)", native_Object_getOwnPropertyDescriptor, NULL);
+	vm_reg_static(vm, cls, "getOwnPropertyDescriptors(obj)", native_Object_getOwnPropertyDescriptors, NULL);
+	vm_reg_static(vm, cls, "hasOwn(obj, key)", native_Object_hasOwn, NULL);
+	vm_reg_static(vm, cls, "setPrototypeOf(obj, proto)", native_Object_setPrototypeOf, NULL);
+	vm_reg_static(vm, cls, "defineProperties(obj, descriptors)", native_Object_defineProperties, NULL);
+	vm_reg_static(vm, cls, "seal(obj)", native_Object_seal, NULL);
+	vm_reg_static(vm, cls, "isSealed(obj)", native_Object_isSealed, NULL);
+	vm_reg_static(vm, cls, "preventExtensions(obj)", native_Object_preventExtensions, NULL);
+	vm_reg_static(vm, cls, "isExtensible(obj)", native_Object_isExtensible, NULL);
 	vm_reg_native(vm, NULL, "__obj_rest(src, excluded)", native_obj_rest, NULL);
 	/* for-in lowering (stmt_for_in) calls this by INSTR_CALL "__enum_keys$1". */
 	vm_reg_native(vm, NULL, "__enum_keys(o)", native_enum_keys, NULL);
+	/* globalThis: the global object itself. vm->root already holds every global
+	 * (Object, Array, isNaN, ...), so exposing it under the standard name makes
+	 * `globalThis.X` resolve. The self-member forms a cycle the gc mark phase
+	 * already guards against. */
+	vm_reg_var(vm, NULL, "globalThis", vm->root, true);
 }
 
 #ifdef __cplusplus

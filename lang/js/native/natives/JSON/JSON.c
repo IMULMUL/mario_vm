@@ -107,6 +107,27 @@ static bool lex_json_chkread(lex_t* lex, uint32_t expected_tk) {
 }
 
 static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
+	/* JSON numbers may carry a leading sign, but the lexer emits '-' / '+' as a
+	 * standalone char token rather than folding it into the numeric literal.
+	 * Without this branch the sign is never consumed: object parsing bails to
+	 * undefined and array parsing spins forever on the same token (the ']' loop
+	 * guard never advances, so var_array_add grows without bound -> OOM). Consume
+	 * the sign, then read the magnitude exactly like the unsigned branches. */
+	if (l->tk=='-' || l->tk=='+') {
+		bool neg = (l->tk=='-');
+		lex_json_get_next_token(l);
+		if (l->tk==LEX_INT) {
+			int i = atoi(l->tk_str->cstr);
+			lex_json_chkread(l, LEX_INT);
+			return var_new_int(vm, neg ? -i : i);
+		}
+		else if (l->tk==LEX_FLOAT) {
+			float f = (float)atof(l->tk_str->cstr);
+			lex_json_chkread(l, LEX_FLOAT);
+			return var_new_float(vm, neg ? -f : f);
+		}
+		return var_new(vm);
+	}
 	if (l->tk==LEX_R_TRUE) {
 		lex_json_chkread(l, LEX_R_TRUE);
 		return var_new_int(vm, 1);
@@ -129,7 +150,7 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 		return var_new_int(vm, i);
 	}
 	else if (l->tk==LEX_FLOAT) {
-		float f = 0.0;//atof(l->tk_str->cstr);
+		float f = (float)atof(l->tk_str->cstr);
 		lex_json_chkread(l, LEX_FLOAT);
 		return var_new_float(vm, f);
 	}
@@ -152,7 +173,11 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 		lex_json_chkread(l, '[');
 		while (l->tk != ']') {
 			var_t* v = json_parse_factor(vm, l);
-			var_add(arr, "", v);
+			/* Array elements must go through var_array_add so they land in the
+			 * hidden "_ARRAY_" member that var_array_size/stringify read. The old
+			 * var_add(arr, "", v) attached them to the object itself, so a parsed
+			 * array reported length 0 and JSON.stringify emitted []. */
+			var_array_add(arr, v);
 			if (l->tk != ']') 
 				lex_json_chkread(l, ',');
 		}

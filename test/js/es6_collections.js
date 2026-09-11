@@ -103,7 +103,7 @@ eq(sym === sym, true, "same symbol is identical to itself");
 var holder = {};
 holder[sym] = "secret";
 eq(holder[sym], "secret", "symbol usable as object key");
-eq(typeof Symbol(), "object", "Symbol() returns an object (simplified)");
+eq(typeof Symbol(), "symbol", "typeof Symbol() is 'symbol'");
 
 // ---------------------------------------------------------------------------
 console.log("");

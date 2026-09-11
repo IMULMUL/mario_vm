@@ -486,6 +486,80 @@ var_t* native_PromiseAllSettled(vm_t* vm, var_t* env, void* data) {
     return result;
 }
 
+/* Promise.any (ES2021): fulfills with the first fulfilled input; a non-promise
+ * input counts as already fulfilled. If every input rejects -- or the iterable
+ * is empty -- it rejects with an AggregateError holding all the rejection
+ * reasons. A pending input can never settle in this synchronous VM, so an
+ * all-or-partly-pending call with no fulfillment stays pending (mirroring
+ * native_PromiseRace's treatment of unsettled inputs). */
+var_t* native_PromiseAny(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* promises = get_obj(env, "promises");
+
+    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    pd->state = PROMISE_STATE_PENDING;
+    pd->value = NULL;
+    pd->fulfilled_callbacks = var_new_array(vm);
+    pd->rejected_callbacks = var_new_array(vm);
+
+    bool fulfilled = false;
+    bool sawPending = false;
+    var_t* errors = var_new_array(vm); /* rejection reasons; refs=0 until adopted */
+
+    if (promises != NULL && promises->is_array) {
+        uint32_t len = var_array_size(promises);
+        for (uint32_t i = 0; i < len; i++) {
+            var_t* item = var_array_get_var(promises, i);
+            if (item == NULL) {
+                continue;
+            }
+            if (is_promise(vm, item)) {
+                promise_data* ipd = (promise_data*)item->value;
+                if (ipd == NULL || ipd->state == PROMISE_STATE_PENDING) {
+                    sawPending = true;
+                    continue;
+                }
+                if (ipd->state == PROMISE_STATE_FULFILLED) {
+                    pd->state = PROMISE_STATE_FULFILLED;
+                    pd->value = ipd->value ? var_ref(ipd->value) : var_ref(var_new(vm));
+                    fulfilled = true;
+                    break;
+                }
+                /* rejected: record the reason and keep looking for a fulfillment */
+                var_array_add(errors, ipd->value ? ipd->value : var_new(vm));
+            } else {
+                /* a non-promise value is treated as already fulfilled */
+                pd->state = PROMISE_STATE_FULFILLED;
+                pd->value = var_ref(item);
+                fulfilled = true;
+                break;
+            }
+        }
+    }
+
+    if (!fulfilled) {
+        if (sawPending) {
+            /* some input may still settle (never, here) -> stay pending */
+            var_unref(errors);
+        } else {
+            /* every input rejected, or the iterable was empty -> AggregateError */
+            node_t* an = vm_load_node(vm, "AggregateError", false);
+            var_t* aggProto = (an != NULL && an->var != NULL) ? var_get_prototype(an->var) : NULL;
+            var_t* aggErr = var_new_obj(vm, aggProto, NULL, NULL);
+            var_add(aggErr, "name", var_new_str(vm, "AggregateError"));
+            var_add(aggErr, "message", var_new_str(vm, "All promises were rejected"));
+            var_add(aggErr, "errors", errors); /* refs errors (0->1); owned by aggErr */
+            pd->state = PROMISE_STATE_REJECTED;
+            pd->value = var_ref(aggErr); /* pd owns one ref, matching Promise.all reject */
+        }
+    }
+
+    var_t* proto = get_promise_proto(vm);
+    var_t* result = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, result, pd);
+    return result;
+}
+
 /* Synchronous VM without an event loop: setTimeout never fires its callback.
  * A delayed promise therefore simply stays pending, which is exactly what
  * Promise.race semantics need here. */
@@ -502,6 +576,7 @@ void reg_native_Promise(vm_t* vm) {
     vm_reg_static(vm, cls, "all(promises)", native_PromiseAll, NULL);
     vm_reg_static(vm, cls, "allSettled(promises)", native_PromiseAllSettled, NULL);
     vm_reg_static(vm, cls, "race(promises)", native_PromiseRace, NULL);
+    vm_reg_static(vm, cls, "any(promises)", native_PromiseAny, NULL);
     vm_reg_native(vm, cls, "then(onFulfilled, onRejected)", native_PromiseThen, NULL);
     vm_reg_native(vm, cls, "catch(onRejected)", native_PromiseCatch, NULL);
     vm_reg_native(vm, cls, "finally(onFinally)", native_PromiseFinally, NULL);

@@ -302,7 +302,7 @@ var fi = 1;
 fi += 0.5;
 eq(fi, 1.5, "int += float promotes to a float");
 // string + float used to read the string's byte buffer as a 4-byte int
-eq("v=" + 1.5, "v=1.500000", "string + float concatenates");
+eq("v=" + 1.5, "v=1.5", "string + float concatenates");
 eq(1.5 + 2.25, 3.75, "float + float adds");
 
 // ---------------------------------------------------------------------------

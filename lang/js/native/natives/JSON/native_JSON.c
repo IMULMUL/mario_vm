@@ -12,7 +12,7 @@ var_t* native_json_stringify(vm_t* vm, var_t* env, void* data) {
 	node_t* n = var_find_own_member(env, "var");
 	mstr_t* s = mstr_new("");
 	if(n != NULL)
-		var_to_json_str(n->var, s, 0);
+		var_to_json_str(n->var, s, 0, true);
 
 	var_t* var = var_new_str(vm, s->cstr);
 	mstr_free(s);
