@@ -60,6 +60,13 @@
 //   36. Proxy / Reflect (get/set/has/deleteProperty/ownKeys/apply/construct/
 //       prototype/extensibility/descriptor traps, revocable, invariants, and
 //       all 13 Reflect statics)
+//   37. WeakRef / FinalizationRegistry (deref & weak clearing after a forced
+//       gc(), cleanup callbacks with held values, register/unregister tokens,
+//       @@toStringTag, and the object-target / callable-callback TypeErrors)
+//   38. SharedArrayBuffer / Atomics (shared buffer byteLength/zero-init/slice/
+//       @@toStringTag/non-growable; atomic load/store/add/sub/and/or/xor/
+//       exchange/compareExchange over integer & BigInt64 views, wait throws,
+//       notify wakes 0, isLockFree)
 //
 // Deliberately EXCLUDED (each would need a subsystem this minimal engine lacks):
 //   - RegExp: no /pattern/ literals, no regex-based match/split/replace.
@@ -1959,6 +1966,228 @@ section("15. async / await");
         ok(Reflect.isExtensible(rnp), "Reflect.isExtensible true");
         eq(Reflect.preventExtensions(rnp), true, "Reflect.preventExtensions returns true");
         ok(!Reflect.isExtensible(rnp), "Reflect.isExtensible now false");
+    })();
+
+    // =========================================================================
+    section("37. WeakRef / FinalizationRegistry (weak references & cleanup)");
+    // =========================================================================
+    (function () {
+        // --- presence & shape ---
+        eq(typeof WeakRef, "function", "WeakRef is a constructor function");
+        eq(typeof WeakRef.prototype.deref, "function", "WeakRef.prototype.deref is a function");
+        eq(typeof gc, "function", "the hidden gc() helper is available");
+        eq(gc(), undefined, "gc() returns undefined");
+
+        // --- a live target is observable through deref() ---
+        const live = { n: 42 };
+        const wr = new WeakRef(live);
+        ok(wr.deref() === live, "deref() returns the very target object (identity)");
+        eq(wr.deref().n, 42, "the target reached through deref() keeps its fields");
+        eq(new WeakRef({})[Symbol.toStringTag], "WeakRef", "@@toStringTag is 'WeakRef'");
+
+        // --- a still-reachable target is NOT collected ---
+        gc();
+        ok(wr.deref() === live, "a target still held by an outer binding survives gc()");
+
+        // --- once the only strong reference dies, deref() clears to undefined ---
+        const wrDead = (() => { const tmp = { gone: true }; return new WeakRef(tmp); })();
+        gc();
+        eq(wrDead.deref(), undefined, "deref() is undefined after the target is collected");
+
+        // --- two WeakRefs to one target both clear together ---
+        let wrA, wrB;
+        (() => { const t = {}; wrA = new WeakRef(t); wrB = new WeakRef(t); })();
+        gc();
+        eq(wrA.deref(), undefined, "the first of two WeakRefs to a dead target cleared");
+        eq(wrB.deref(), undefined, "the second of two WeakRefs to a dead target cleared");
+
+        // --- deref() on a non-WeakRef receiver is a TypeError ---
+        throws(() => WeakRef.prototype.deref.call({}), "deref on a non-WeakRef throws TypeError");
+
+        // --- WeakRef only accepts an object target ---
+        throws(() => new WeakRef(42), "a number target throws TypeError");
+        throws(() => new WeakRef("str"), "a string target throws TypeError");
+        throws(() => new WeakRef(true), "a boolean target throws TypeError");
+        throws(() => new WeakRef(null), "a null target throws TypeError");
+        throws(() => new WeakRef(undefined), "an undefined target throws TypeError");
+        throws(() => new WeakRef(), "a missing target throws TypeError");
+    })();
+
+    (function () {
+        // --- FinalizationRegistry presence & shape ---
+        eq(typeof FinalizationRegistry, "function", "FinalizationRegistry is a constructor function");
+        eq(typeof FinalizationRegistry.prototype.register, "function", "register is a function");
+        eq(typeof FinalizationRegistry.prototype.unregister, "function", "unregister is a function");
+
+        // --- the cleanup callback runs with the held value once the target dies ---
+        const fired = [];
+        const fr = new FinalizationRegistry((held) => { fired.push(held); });
+        eq(fr[Symbol.toStringTag], "FinalizationRegistry", "@@toStringTag is 'FinalizationRegistry'");
+        (() => { const t = {}; fr.register(t, "cleanup-payload"); })();
+        gc();
+        eq(fired.length, 1, "the cleanup callback ran exactly once");
+        eq(fired[0], "cleanup-payload", "the callback received the held value");
+
+        // --- held-value identity is preserved (objects pass through by reference) ---
+        const heldObj = { id: 7 };
+        let gotHeld = null;
+        const fr2 = new FinalizationRegistry((h) => { gotHeld = h; });
+        (() => { const t = {}; fr2.register(t, heldObj); })();
+        gc();
+        ok(gotHeld === heldObj, "an object held value is delivered by identity");
+        eq(gotHeld.id, 7, "the delivered held object keeps its fields");
+
+        // --- registering without a held value delivers undefined ---
+        let noHeldCalled = false, noHeldArg = "sentinel";
+        const fr3 = new FinalizationRegistry((h) => { noHeldCalled = true; noHeldArg = h; });
+        (() => { const t = {}; fr3.register(t); })();
+        gc();
+        ok(noHeldCalled, "a registration without a held value still fires");
+        eq(noHeldArg, undefined, "the callback receives undefined when no held value was given");
+
+        // --- several registrations on one registry all fire ---
+        const many = [];
+        const fr4 = new FinalizationRegistry((h) => { many.push(h); });
+        (() => { for (let i = 0; i < 3; i++) { const t = { i }; fr4.register(t, i * 100); } })();
+        gc();
+        eq(many.length, 3, "all three registrations fired");
+        deepEq(many.sort((a, b) => a - b), [0, 100, 200], "each callback got its own held value");
+
+        // --- unregister() on a live registration returns true and suppresses it ---
+        const suppressed = [];
+        const fr5 = new FinalizationRegistry((h) => { suppressed.push(h); });
+        (() => {
+            const t = {};
+            const token = {};
+            fr5.register(t, "should-not-fire", token);
+            eq(fr5.unregister(token), true, "unregister returns true for a live registration");
+        })();
+        gc();
+        eq(suppressed.length, 0, "an unregistered target's callback never runs");
+
+        // --- unregister() with an unknown token returns false ---
+        eq(fr5.unregister({}), false, "unregister with an unknown token returns false");
+
+        // --- TypeErrors ---
+        throws(() => new FinalizationRegistry(42), "a non-callable callback throws TypeError");
+        throws(() => new FinalizationRegistry(), "a missing callback throws TypeError");
+        (() => {
+            const t = {};
+            throws(() => fr5.register(42, "x"), "register with a primitive target throws TypeError");
+            throws(() => fr5.register(t, "x", t), "register with token === target throws TypeError");
+        })();
+    })();
+
+    // =========================================================================
+    section("38. SharedArrayBuffer / Atomics (shared memory & atomic ops)");
+    // =========================================================================
+    (function () {
+        // --- SharedArrayBuffer construction & shape ---
+        eq(typeof SharedArrayBuffer, "function", "SharedArrayBuffer is a constructor function");
+        const sab = new SharedArrayBuffer(16);
+        eq(sab.byteLength, 16, "byteLength reflects the requested size");
+        eq(new SharedArrayBuffer(0).byteLength, 0, "a zero-length SharedArrayBuffer is legal");
+        eq(sab[Symbol.toStringTag], "SharedArrayBuffer", "@@toStringTag is 'SharedArrayBuffer'");
+
+        // --- a fresh buffer is zero-filled (observed through a Uint8Array view) ---
+        const z = new Uint8Array(new SharedArrayBuffer(4));
+        deepEq([z[0], z[1], z[2], z[3]], [0, 0, 0, 0], "a new SharedArrayBuffer is zero-initialised");
+
+        // --- slice() copies the byte range into a new SharedArrayBuffer ---
+        const src = new SharedArrayBuffer(8);
+        const sv = new Uint8Array(src);
+        sv[0] = 1; sv[1] = 2; sv[2] = 3; sv[3] = 4;
+        const copy = src.slice(0, 4);
+        eq(copy.byteLength, 4, "slice honours the [begin,end) length");
+        eq(copy[Symbol.toStringTag], "SharedArrayBuffer", "slice returns a SharedArrayBuffer");
+        const cv = new Uint8Array(copy);
+        deepEq([cv[0], cv[1], cv[2], cv[3]], [1, 2, 3, 4], "slice copies the bytes");
+        eq(src.slice(2).byteLength, 6, "slice with only a begin runs to the end");
+
+        // --- errors & the non-growable stub ---
+        throws(() => new SharedArrayBuffer(-1), "a negative length throws RangeError");
+        throws(() => SharedArrayBuffer.prototype.slice.call({}), "slice on a non-SharedArrayBuffer throws TypeError");
+        throws(() => new SharedArrayBuffer(8).grow(16), "grow() on a non-growable buffer throws TypeError");
+
+        // --- a TypedArray view over a SharedArrayBuffer behaves normally ---
+        const view = new Int32Array(new SharedArrayBuffer(16));
+        eq(view.length, 4, "an Int32Array over a 16-byte SAB has 4 elements");
+        eq(view.buffer.byteLength, 16, "the view's buffer is the SharedArrayBuffer");
+        eq(view.BYTES_PER_ELEMENT, 4, "Int32Array BYTES_PER_ELEMENT over a SAB");
+    })();
+
+    (function () {
+        // --- Atomics namespace ---
+        eq(typeof Atomics.load, "function", "Atomics.load is a function");
+        eq(typeof Atomics.compareExchange, "function", "Atomics.compareExchange is a function");
+
+        const i32 = new Int32Array(new SharedArrayBuffer(16)); // 4 slots
+
+        // --- load / store ---
+        eq(Atomics.store(i32, 0, 42), 42, "store returns the stored value");
+        eq(Atomics.load(i32, 0), 42, "load reads back the stored value");
+        eq(i32[0], 42, "a plain index read sees the atomic store");
+        i32[1] = 7;
+        eq(Atomics.load(i32, 1), 7, "Atomics.load sees a plain index write");
+
+        // --- add / sub return the OLD value and update in place ---
+        eq(Atomics.add(i32, 0, 8), 42, "add returns the previous value");
+        eq(Atomics.load(i32, 0), 50, "add updated the element");
+        eq(Atomics.sub(i32, 0, 20), 50, "sub returns the previous value");
+        eq(Atomics.load(i32, 0), 30, "sub updated the element");
+
+        // --- and / or / xor ---
+        Atomics.store(i32, 2, 12);
+        eq(Atomics.and(i32, 2, 10), 12, "and returns the previous value");
+        eq(Atomics.load(i32, 2), 8, "12 & 10 === 8");
+        Atomics.store(i32, 2, 12);
+        eq(Atomics.or(i32, 2, 3), 12, "or returns the previous value");
+        eq(Atomics.load(i32, 2), 15, "12 | 3 === 15");
+        Atomics.store(i32, 2, 12);
+        eq(Atomics.xor(i32, 2, 6), 12, "xor returns the previous value");
+        eq(Atomics.load(i32, 2), 10, "12 ^ 6 === 10");
+
+        // --- exchange ---
+        Atomics.store(i32, 3, 5);
+        eq(Atomics.exchange(i32, 3, 99), 5, "exchange returns the previous value");
+        eq(Atomics.load(i32, 3), 99, "exchange wrote the new value");
+
+        // --- compareExchange (match and mismatch) ---
+        Atomics.store(i32, 3, 5);
+        eq(Atomics.compareExchange(i32, 3, 5, 10), 5, "compareExchange returns the previous value on a match");
+        eq(Atomics.load(i32, 3), 10, "compareExchange wrote on a match");
+        eq(Atomics.compareExchange(i32, 3, 999, 20), 10, "compareExchange returns the current value on a mismatch");
+        eq(Atomics.load(i32, 3), 10, "compareExchange left the value unchanged on a mismatch");
+
+        // --- 32-bit signed wraparound ---
+        Atomics.store(i32, 0, 2147483647);
+        Atomics.add(i32, 0, 1);
+        eq(Atomics.load(i32, 0), -2147483648, "int32 add wraps from INT_MAX to INT_MIN");
+
+        // --- Atomics on a BigInt64Array (use === ; Object.is is numeric-tag sensitive) ---
+        const bi = new BigInt64Array(new SharedArrayBuffer(16)); // 2 slots
+        eq(typeof Atomics.load(bi, 0), "bigint", "a BigInt64Array element loads as a bigint");
+        Atomics.store(bi, 0, 100n);
+        ok(Atomics.load(bi, 0) === 100n, "BigInt64 store/load round-trips");
+        ok(Atomics.add(bi, 0, 50n) === 100n, "BigInt64 add returns the previous value");
+        ok(Atomics.load(bi, 0) === 150n, "BigInt64 add updated the element");
+        ok(Atomics.exchange(bi, 1, 7n) === 0n, "BigInt64 exchange returns the previous value");
+        ok(Atomics.load(bi, 1) === 7n, "BigInt64 exchange wrote the new value");
+
+        // --- wait / notify / isLockFree (single-threaded engine) ---
+        throws(() => Atomics.wait(i32, 0, 0), "Atomics.wait throws (a lone agent may not block)");
+        eq(Atomics.notify(i32, 0), 0, "Atomics.notify wakes zero waiters");
+        eq(Atomics.isLockFree(1), true, "isLockFree(1) is true");
+        eq(Atomics.isLockFree(2), true, "isLockFree(2) is true");
+        eq(Atomics.isLockFree(4), true, "isLockFree(4) is true");
+        eq(Atomics.isLockFree(8), true, "isLockFree(8) is true");
+        eq(Atomics.isLockFree(3), false, "isLockFree(3) is false");
+
+        // --- argument validation ---
+        throws(() => Atomics.load(new Float64Array(4), 0), "Atomics on a float TypedArray throws TypeError");
+        throws(() => Atomics.load(i32, 99), "an out-of-range index throws RangeError");
+        throws(() => Atomics.load(i32, -1), "a negative index throws RangeError");
+        throws(() => Atomics.load({}, 0), "a non-TypedArray first argument throws TypeError");
     })();
 
     // =========================================================================

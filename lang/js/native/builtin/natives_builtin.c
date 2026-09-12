@@ -15,6 +15,10 @@
 #include "Symbol/native_Symbol.h"
 #include "Proxy/native_Proxy.h"
 #include "Reflect/native_Reflect.h"
+#include "WeakRef/native_WeakRef.h"
+#include "FinalizationRegistry/native_FinalizationRegistry.h"
+#include "SharedArrayBuffer/native_SharedArrayBuffer.h"
+#include "Atomics/native_Atomics.h"
 
 #ifdef __cplusplus /* __cplusplus */
 extern "C" {
@@ -37,6 +41,10 @@ void reg_builtin_natives(vm_t* vm) {
 	reg_native_Symbol(vm);
 	reg_native_Proxy(vm);
 	reg_native_Reflect(vm);
+	reg_native_WeakRef(vm);
+	reg_native_FinalizationRegistry(vm);
+	reg_native_SharedArrayBuffer(vm);
+	reg_native_Atomics(vm);
 }
 
 #ifdef __cplusplus /* __cplusplus */

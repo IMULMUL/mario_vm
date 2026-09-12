@@ -1,6 +1,8 @@
 #include "mario.h"
 #include "natives_builtin.h"
 #include "natives.h"
+#include "WeakRef/native_WeakRef.h"
+#include "FinalizationRegistry/native_FinalizationRegistry.h"
 #include <math.h>
 
 static inline var_t* vm_load_var(vm_t* vm, const char* name, bool create) {

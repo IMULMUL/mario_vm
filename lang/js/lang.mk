@@ -25,6 +25,10 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH_BUILTIN)/Symbol/native_Symbol.o \
 	$(NATIVES_PATH_BUILTIN)/Proxy/native_Proxy.o \
 	$(NATIVES_PATH_BUILTIN)/Reflect/native_Reflect.o \
+	$(NATIVES_PATH_BUILTIN)/WeakRef/native_WeakRef.o \
+	$(NATIVES_PATH_BUILTIN)/FinalizationRegistry/native_FinalizationRegistry.o \
+	$(NATIVES_PATH_BUILTIN)/SharedArrayBuffer/native_SharedArrayBuffer.o \
+	$(NATIVES_PATH_BUILTIN)/Atomics/native_Atomics.o \
 	\
 	$(NATIVES_PATH)/natives.o  \
 	$(NATIVES_PATH)/JSON/JSON.o \
