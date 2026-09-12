@@ -24,6 +24,7 @@ typedef enum {
     LEX_GEQUAL,
     LEX_RSHIFT,
     LEX_RSHIFTUNSIGNED,
+    LEX_RSHIFTUNSIGNEQUAL,
     LEX_RSHIFTEQUAL,
     LEX_PLUSEQUAL,
     LEX_MINUSEQUAL,
@@ -67,6 +68,7 @@ typedef enum {
     LEX_R_UNDEFINED,
     LEX_R_NEW,
     LEX_R_TYPEOF,
+    LEX_R_VOID,
     LEX_R_INCLUDE,
     LEX_R_THROW,
     LEX_R_TRY,
@@ -76,6 +78,9 @@ typedef enum {
     LEX_R_AWAIT,
     LEX_R_DELETE,     // `delete` unary operator
     LEX_R_IN,         // `in` relational operator (and for-in separator)
+    LEX_R_SWITCH,     // `switch` statement
+    LEX_R_CASE,       // `case` clause
+    LEX_R_DEFAULT,    // `default` clause
     LEX_R_LIST_END /* always the last entry */
 } LEX_TYPES;
 
@@ -113,9 +118,13 @@ void lex_get_op_token(lex_t* lex) {
         if (lex->curr_ch == '=') { // >>=
             lex->tk = LEX_RSHIFTEQUAL;
             lex_get_nextch(lex);
-        } else if (lex->curr_ch == '>') { // >>>
+        } else if (lex->curr_ch == '>') { // >>> or >>>=
             lex->tk = LEX_RSHIFTUNSIGNED;
             lex_get_nextch(lex);
+            if (lex->curr_ch == '=') { // >>>=
+                lex->tk = LEX_RSHIFTUNSIGNEQUAL;
+                lex_get_nextch(lex);
+            }
         }
     } else if (lex->tk == '+' && lex->curr_ch == '=') {
         lex->tk = LEX_PLUSEQUAL;
@@ -293,6 +302,8 @@ void lex_get_reserved_word(lex_t* lex) {
         lex->tk = LEX_R_NEW;
     } else if (strcmp(lex->tk_str->cstr, "typeof") == 0) {
         lex->tk = LEX_R_TYPEOF;
+    } else if (strcmp(lex->tk_str->cstr, "void") == 0) {
+        lex->tk = LEX_R_VOID;
     } else if (strcmp(lex->tk_str->cstr, "throw") == 0) {
         lex->tk = LEX_R_THROW;
     } else if (strcmp(lex->tk_str->cstr, "try") == 0) {
@@ -309,6 +320,12 @@ void lex_get_reserved_word(lex_t* lex) {
         lex->tk = LEX_R_DELETE;
     } else if (strcmp(lex->tk_str->cstr, "in") == 0) {
         lex->tk = LEX_R_IN;
+    } else if (strcmp(lex->tk_str->cstr, "switch") == 0) {
+        lex->tk = LEX_R_SWITCH;
+    } else if (strcmp(lex->tk_str->cstr, "case") == 0) {
+        lex->tk = LEX_R_CASE;
+    } else if (strcmp(lex->tk_str->cstr, "default") == 0) {
+        lex->tk = LEX_R_DEFAULT;
     }
 }
 
@@ -454,8 +471,16 @@ const char* lex_get_token_str(int token, char* str) {
             return "include";
         case LEX_R_DELETE:
             return "delete";
+        case LEX_R_VOID:
+            return "void";
         case LEX_R_IN:
             return "in";
+        case LEX_R_SWITCH:
+            return "switch";
+        case LEX_R_CASE:
+            return "case";
+        case LEX_R_DEFAULT:
+            return "default";
     }
     return "?[UNKNOW]";
 }
@@ -646,7 +671,16 @@ bool stmt_loop_block(lex_t* l, bytecode_t* bc) {
     if (block) {
         lex_skip_empty(l);
         while (l->tk && l->tk != '}') {
+            int32_t prev_pos = l->data_pos;
+            uint32_t prev_tk = l->tk;
             if (!statement(l, bc)) {
+                return false;
+            }
+            /* Safety net: a statement that consumed nothing (unhandled
+             * token) would spin this loop forever - fail instead. */
+            if (l->data_pos == prev_pos && l->tk == prev_tk) {
+                mario_printf("compile error: unexpected token, made no progress! ");
+                compile_error_pos(l, -1);
                 return false;
             }
         }
@@ -672,7 +706,15 @@ bool stmt_block(lex_t* l, bytecode_t* bc, bool func) {
     }
 
     while (l->tk && l->tk != '}') {
+        int32_t prev_pos = l->data_pos;
+        uint32_t prev_tk = l->tk;
         if (!statement(l, bc)) {
+            return false;
+        }
+        /* Safety net: never loop forever on a token statement() ignores. */
+        if (l->data_pos == prev_pos && l->tk == prev_tk) {
+            mario_printf("compile error: unexpected token, made no progress! ");
+            compile_error_pos(l, -1);
             return false;
         }
     }
@@ -1120,6 +1162,10 @@ static bool lex_chkread_stmt_end(lex_t* l) {
         return lex_chkread(l, ';');
     } else if (l->tk == '\n') {
         return lex_chkread(l, '\n');
+    } else if (l->tk == '}') {
+        /* ASI: a statement is also terminated by the closing '}' of its
+         * enclosing block (`{break}`). Leave the '}' for the block parser. */
+        return true;
     }
     return false;
     //return lex_chkread(l, ';');
@@ -1273,13 +1319,29 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
             break;
         }
 
-        // ES2017 async method: {async name(params){body}}. `async` is a
-        // reserved word, so this token can only begin an async method here.
+        // ES2017 async method: {async name(params){body}}. `async` is only a
+        // method modifier when the *next* token can start a property name
+        // (ID / string / computed `[` / generator `*`). Otherwise it is an
+        // ordinary property key, e.g. {async: true} or shorthand {async}, and
+        // must fall through to the reserved-word-as-key branch below.
         bool is_async_method = false;
         if (l->tk == LEX_R_ASYNC) {
+            lex_t asv = *l;                 // shallow copy: keeps original tk_str ptr
+            mstr_t* asv_tk_str = l->tk_str; // peeking must not clobber caller token
+            l->tk_str = mstr_new("");
+            mstr_cpy(l->tk_str, asv_tk_str->cstr);
             lex_chkread(l, LEX_R_ASYNC);
             lex_skip_empty(l);
-            is_async_method = true;
+            bool looks_like_method =
+                (l->tk == LEX_ID || l->tk == LEX_STR ||
+                 l->tk == '[' || l->tk == '*');
+            mstr_free(l->tk_str);
+            *l = asv;                       // restore original position + tk_str
+            if (looks_like_method) {
+                lex_chkread(l, LEX_R_ASYNC);
+                lex_skip_empty(l);
+                is_async_method = true;
+            }
         }
 
         // ES6 generator method: {*name(params){body}} / {*[expr](params){body}}.
@@ -1366,6 +1428,15 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
             }
         } else if (l->tk == LEX_ID) {
             if (!lex_chkread(l, LEX_ID)) {
+                mstr_free(id);
+                return false;
+            }
+        } else if (l->tk == LEX_INT || l->tk == LEX_FLOAT) {
+            /* Numeric literal key: {0:"a"}, {1.5:"x"} (common in webpack module
+             * maps). JS uses the number's string form as the property name;
+             * `id` already captured the literal text from tk_str above. */
+            int tk = l->tk;
+            if (!lex_chkread(l, tk)) {
                 mstr_free(id);
                 return false;
             }
@@ -1503,6 +1574,12 @@ bool factor_array(lex_t* l, bytecode_t* bc) {
                 return false;
             }
             bc_gen(bc, INSTR_ARR_SPREAD);
+        } else if (l->tk == ',') {
+            // Array elision (hole): [,,3] / [1,,3]. A `,` at element position
+            // means an empty slot; push an undefined placeholder so indices and
+            // length stay correct. The trailing-comma step below consumes it.
+            bc_gen(bc, INSTR_UNDEF);
+            bc_gen(bc, INSTR_MEMBER);
         } else {
             if (!base(l, bc)) {
                 return false;
@@ -1815,6 +1892,93 @@ bool factor_tagged_template(lex_t* l, bytecode_t* bc) {
     return true;
 }
 
+/* Scan the tail of a regex literal. Entered right after factor() saw '/'
+ * (or '/=', when the pattern begins with '='): the lexer has consumed the
+ * opening token, so curr_ch is the first pattern character. '/' inside a
+ * [class] does not terminate, '\' escapes the next char, a newline or EOF
+ * is a syntax error. Trailing letters are the flags. */
+static bool lex_scan_regex(lex_t* l, mstr_t* pat, mstr_t* flags) {
+    bool in_class = false;
+    while (true) {
+        char c = l->curr_ch;
+        if (c == 0 || c == '\n') {
+            mario_printf("unterminated regex literal! ");
+            compile_error_pos(l, -1);
+            return false;
+        }
+        if (c == '\\') {
+            mstr_add(pat, c);
+            lex_get_nextch(l);
+            if (l->curr_ch == 0) {
+                mario_printf("unterminated regex literal! ");
+                compile_error_pos(l, -1);
+                return false;
+            }
+            mstr_add(pat, l->curr_ch);
+            lex_get_nextch(l);
+            continue;
+        }
+        if (c == '[')
+            in_class = true;
+        else if (c == ']')
+            in_class = false;
+        else if (c == '/' && !in_class) {
+            lex_get_nextch(l);
+            break;
+        }
+        mstr_add(pat, c);
+        lex_get_nextch(l);
+    }
+    while (is_alpha(l->curr_ch)) {
+        mstr_add(flags, l->curr_ch);
+        lex_get_nextch(l);
+    }
+    lex_get_next_token(l);
+    return true;
+}
+
+/* Lookahead: does the parenthesised group starting at the current '(' token
+ * form an arrow-function parameter list, i.e. is its matching ')' immediately
+ * followed by `=>`? The lexer state is fully restored, so the caller can then
+ * parse the group either as arrow parameters or as a comma expression. The two
+ * need different code: a comma expression must emit POP between operands to
+ * keep only the last value, but an arrow parameter list must NOT (func_def
+ * scans the operands' name strings until the body JMP, and a stray POP would
+ * truncate the parameter list). */
+static bool paren_group_is_arrow(lex_t* l) {
+    if (l->tk != '(') {
+        return false;
+    }
+    lex_t saved = *l;                 // shallow copy: keeps original tk_str ptr
+    mstr_t* saved_tk_str = l->tk_str; // do not let scanning clobber caller token
+    l->tk_str = mstr_new("");
+    mstr_cpy(l->tk_str, saved_tk_str->cstr);
+
+    bool is_arrow = false;
+    int depth = 0;
+    while (true) {
+        if (l->tk == LEX_EOF) {
+            break;
+        }
+        if (l->tk == '(') {
+            depth++;
+        } else if (l->tk == ')') {
+            depth--;
+            if (depth <= 0) {
+                lex_get_next_token(l); // token right after the matching ')'
+                lex_skip_empty(l);
+                is_arrow = (l->tk == LEX_R_AFUNCTION);
+                break;
+            }
+        }
+        lex_get_next_token(l);
+    }
+
+    mstr_free(l->tk_str);
+    *l = saved; // restore scalar state and original tk_str pointer
+    return is_arrow;
+}
+
 bool factor(lex_t* l, bytecode_t* bc, bool member) {
     if (member && l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END) {
         /* A reserved word used as a property name after '.', e.g. obj.return(),
@@ -1840,6 +2004,11 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         mstr_free(name);
     } else if (l->tk == '(') {
         PC pc = bc_reserve(bc);
+        /* Decide NOW whether this group is an arrow parameter list or a comma
+         * expression: only the latter may emit value-discarding POPs between
+         * operands (a POP inside an arrow parameter list would corrupt the
+         * parameter-name scan that func_def performs). */
+        bool is_arrow = paren_group_is_arrow(l);
         if (!lex_chkread(l, '(')) {
             return false;
         }
@@ -1854,6 +2023,11 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
 			while (l->tk == ',') {
 				if (!lex_chkread(l, ',')) {
 					return false;
+				}
+				/* Comma expression: drop the previous operand's value so only the
+				 * last one survives. Skipped for arrow parameter lists. */
+				if (!is_arrow) {
+					bc_gen(bc, INSTR_POP);
 				}
 				if (!base(l, bc)) {
 					return false;
@@ -1916,6 +2090,25 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         if (!lex_chkread(l, LEX_STR)) {
             return false;
         }
+    } else if (!member && (l->tk == '/' || l->tk == LEX_DIVEQUAL)) {
+        /* A '/' where an expression is expected can only start a regex
+         * literal (division needs a left operand, handled in term()). It is
+         * compiled as `new RegExp(pattern, flags)` so the whole engine lives
+         * in the RegExp native. A '/=' here is a pattern starting with '='. */
+        mstr_t* pat = mstr_new("");
+        mstr_t* flags = mstr_new("");
+        if (l->tk == LEX_DIVEQUAL)
+            mstr_add(pat, '=');
+        if (!lex_scan_regex(l, pat, flags)) {
+            mstr_free(pat);
+            mstr_free(flags);
+            return false;
+        }
+        bc_gen_str(bc, INSTR_STR, pat->cstr);
+        bc_gen_str(bc, INSTR_STR, flags->cstr);
+        bc_gen_str(bc, INSTR_NEW, "RegExp$2");
+        mstr_free(pat);
+        mstr_free(flags);
     } else if (l->tk == '`') { // ES6 template literal
         if (!factor_template(l, bc)) {
             return false;
@@ -2145,7 +2338,31 @@ bool unary(lex_t* l, bytecode_t* bc) {
         bc_gen(bc, INSTR_TRUE);
         return true;
     }
+    /* Prefix ++/-- reached as a nested unary operand (e.g. `!--x`, `-++i`).
+     * The additive-level expr() strips a leading ++/-- before term()->unary(),
+     * so unary() only ever sees them here. Parse the operand, retarget a
+     * member/subscript to its write variant (as expr() does), then pre-step. */
+    if (l->tk == LEX_PLUSPLUS || l->tk == LEX_MINUSMINUS) {
+        bool is_inc = (l->tk == LEX_PLUSPLUS);
+        if (!lex_chkread(l, l->tk)) {
+            return false;
+        }
+        if (!unary(l, bc)) {
+            return false;
+        }
+        if (bc->cindex > 0) {
+            PC last = bc->code_buf[bc->cindex - 1];
+            if (OP(last) == INSTR_ARRAY_AT)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+            else if (OP(last) == INSTR_GET)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
+        }
+        bc_gen(bc, is_inc ? INSTR_PPLUS_PRE : INSTR_MMINUS_PRE);
+        return true;
+    }
+
     opr_code_t instr = INSTR_END;
+    bool is_void = false;
     if (l->tk == '!') {
         if (!lex_chkread(l, '!')) {
             return false;
@@ -2156,6 +2373,12 @@ bool unary(lex_t* l, bytecode_t* bc) {
             return false;
         }
         instr = INSTR_TYPEOF;
+    } else if (l->tk == LEX_R_VOID) {
+        /* `void expr` evaluates the operand, discards it, yields undefined. */
+        if (!lex_chkread(l, LEX_R_VOID)) {
+            return false;
+        }
+        is_void = true;
     } else if (l->tk == '-') { // unary minus, incl. as a right operand (a * -b)
         if (!lex_chkread(l, '-')) {
             return false;
@@ -2166,13 +2389,27 @@ bool unary(lex_t* l, bytecode_t* bc) {
             return false;
         }
         instr = INSTR_POS;
+    } else if (l->tk == '~') { // unary bitwise NOT: ~x
+        if (!lex_chkread(l, '~')) {
+            return false;
+        }
+        instr = INSTR_BNOT;
     }
 
-    if (!factor(l, bc, false)) {
+    if (instr != INSTR_END || is_void) {
+        /* Prefix operators nest (`typeof void 0`, `!!x`): recurse at the
+         * unary level for the operand instead of dropping to factor. */
+        if (!unary(l, bc)) {
+            return false;
+        }
+    } else if (!factor(l, bc, false)) {
         return false;
     }
 
-    if (instr != INSTR_END) {
+    if (is_void) {
+        bc_gen(bc, INSTR_POP);
+        bc_gen(bc, INSTR_UNDEF);
+    } else if (instr != INSTR_END) {
         bc_gen(bc, instr);
     }
     return true;
@@ -2389,20 +2626,30 @@ bool logic(lex_t* l, bytecode_t* bc) {
         if (!lex_chkread(l, l->tk)) {
             return false;
         }
-        if (!condition(l, bc)) {
-            return false;
-        }
 
-        if (op == LEX_ANDAND) {
-            bc_gen(bc, INSTR_AAND);
-        } else if (op == LEX_OROR) {
-            bc_gen(bc, INSTR_OOR);
-        } else if (op == '|') {
-            bc_gen(bc, INSTR_OR);
-        } else if (op == '&') {
-            bc_gen(bc, INSTR_AND);
-        } else if (op == '^') {
-            bc_gen(bc, INSTR_XOR);
+        if (op == LEX_ANDAND || op == LEX_OROR) {
+            /* Short-circuit `&&`/`||`: reserve a jump slot, compile the RHS, then
+             * patch the slot to a conditional jump. At runtime the LHS is already
+             * on the stack; if it decides the result (`||` truthy / `&&` falsy) the
+             * jump skips the RHS keeping the LHS, otherwise the LHS is popped and
+             * execution falls through into the RHS. Chained ops patch each slot to
+             * the next op's slot (or the end), so `a||b||c` short-circuits fully. */
+            PC pc1 = bc_reserve(bc);
+            if (!condition(l, bc)) {
+                return false;
+            }
+            bc_set_instr(bc, pc1, (op == LEX_ANDAND) ? INSTR_SCAND : INSTR_SCOR, ILLEGAL_PC);
+        } else {
+            if (!condition(l, bc)) {
+                return false;
+            }
+            if (op == '|') {
+                bc_gen(bc, INSTR_OR);
+            } else if (op == '&') {
+                bc_gen(bc, INSTR_AND);
+            } else if (op == '^') {
+                bc_gen(bc, INSTR_XOR);
+            }
         }
     }
     return true;
@@ -2464,6 +2711,12 @@ bool base(lex_t* l, bytecode_t* bc) {
 			l->tk == LEX_OREQUALOR ||
 			l->tk == LEX_ANDEQUALAND ||
 			l->tk == LEX_NULLISHEQUAL ||
+			l->tk == LEX_ANDEQUAL ||
+			l->tk == LEX_OREQUAL ||
+			l->tk == LEX_XOREQUAL ||
+			l->tk == LEX_LSHIFTEQUAL ||
+			l->tk == LEX_RSHIFTEQUAL ||
+			l->tk == LEX_RSHIFTUNSIGNEQUAL ||
 	        l->tk == LEX_MINUSEQUAL) {
         LEX_TYPES op = (LEX_TYPES)l->tk;
         if (!lex_chkread(l, l->tk)) {
@@ -2486,7 +2739,10 @@ bool base(lex_t* l, bytecode_t* bc) {
          * while a TypedArray receiver yields a synthetic @@taslot write target. */
         bool arith_compound = (op == LEX_PLUSEQUAL || op == LEX_MINUSEQUAL ||
                                op == LEX_MULTIEQUAL || op == LEX_DIVEQUAL ||
-                               op == LEX_MODEQUAL || op == LEX_POWEREQUAL);
+                               op == LEX_MODEQUAL || op == LEX_POWEREQUAL ||
+                               op == LEX_ANDEQUAL || op == LEX_OREQUAL ||
+                               op == LEX_XOREQUAL || op == LEX_LSHIFTEQUAL ||
+                               op == LEX_RSHIFTEQUAL || op == LEX_RSHIFTUNSIGNEQUAL);
         if (bc->cindex > 0) {
             PC last = bc->code_buf[bc->cindex - 1];
             if ((op == '=' || arith_compound) && OP(last) == INSTR_GET) {
@@ -2519,6 +2775,18 @@ bool base(lex_t* l, bytecode_t* bc) {
             bc_gen(bc, INSTR_ANDEQ);
         } else if (op == LEX_NULLISHEQUAL) {
             bc_gen(bc, INSTR_NULLISHEQ);
+        } else if (op == LEX_ANDEQUAL) {
+            bc_gen(bc, INSTR_BITANDEQ);
+        } else if (op == LEX_OREQUAL) {
+            bc_gen(bc, INSTR_BITOREQ);
+        } else if (op == LEX_XOREQUAL) {
+            bc_gen(bc, INSTR_BITXOREQ);
+        } else if (op == LEX_LSHIFTEQUAL) {
+            bc_gen(bc, INSTR_LSHIFTEQ);
+        } else if (op == LEX_RSHIFTEQUAL) {
+            bc_gen(bc, INSTR_RSHIFTEQ);
+        } else if (op == LEX_RSHIFTUNSIGNEQUAL) {
+            bc_gen(bc, INSTR_URSHIFTEQ);
         }
 		else {
 			return false;
@@ -2528,8 +2796,69 @@ bool base(lex_t* l, bytecode_t* bc) {
 }
 
 static bool is_stmt_end(int tk) {
-    return (tk == ';' || tk == '\n' || tk == 0);
+    /* '}' terminates the statement by ASI but is never consumed here. */
+    return (tk == ';' || tk == '\n' || tk == '}' || tk == 0);
     //return (tk == ';');
+}
+
+/* The lexer treats '\n' as plain whitespace, so automatic semicolon
+ * insertion is recovered from source positions: true when a line break sits
+ * in the gap between the previous token and the current one. */
+static bool lex_had_newline(lex_t* l) {
+    int32_t from = l->tk_last_end;
+    int32_t to = l->tk_start;
+    if (to <= from) {
+        return false;
+    }
+    if (to > l->data_end) {
+        to = l->data_end;
+    }
+    for (int32_t i = from; i < to; i++) {
+        if (l->data[i] == '\n') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Tokens that may continue the current expression on the next line
+ * (`var a = 1\n+2` is one expression in JS): a line break before anything
+ * else ends the statement by ASI. */
+static bool tk_continues_expr(int tk) {
+    switch (tk) {
+        case '+': case '-': case '*': case '/': case '%':
+        case '(': case '[': case '.': case '?': case ':':
+        case LEX_PLUSPLUS: case LEX_MINUSMINUS:
+        case LEX_EQUAL: case LEX_NEQUAL: case LEX_TYPEEQUAL: case LEX_NTYPEQUAL:
+        case LEX_LEQUAL: case LEX_GEQUAL: case LEX_ANDAND: case LEX_OROR:
+        case '<': case '>': case '&': case '|': case '^':
+        case LEX_R_INSTANCEOF: case LEX_R_IN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/** Comma (sequence) operator: `a, b, c` evaluates left to right and yields
+ *  the last value. It lives ABOVE the assignment level, so it is only used
+ *  where the grammar allows a full Expression (expression statements and the
+ *  for-header clauses) - never for call arguments or literal elements, where
+ *  ',' is a separator. */
+static bool expr_seq(lex_t* l, bytecode_t* bc) {
+    if (!base(l, bc)) {
+        return false;
+    }
+    while (l->tk == ',') {
+        bc_gen(bc, INSTR_POP); // discard the previous value, keep the last
+        if (!lex_chkread(l, ',')) {
+            return false;
+        }
+        lex_skip_empty(l);
+        if (!base(l, bc)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /** ES6 destructuring in a declaration: `let [a, b] = expr` or
@@ -2870,8 +3199,18 @@ bool stmt_var(lex_t* l, bytecode_t* bc) {
             bc_gen(bc, INSTR_POP);
         }
         if (!is_stmt_end(l->tk)) {
-            if (!lex_chkread(l, ',')) {
-				mstr_free(vname);
+            if (l->tk == ',') {
+                if (!lex_chkread(l, ',')) {
+                    mstr_free(vname);
+                    return false;
+                }
+            } else if (lex_had_newline(l) && !tk_continues_expr(l->tk)) {
+                /* ASI: `var x = 1\nfunction f(){}` - the line break ends the
+                 * declaration list; leave the token to the next statement. */
+                mstr_free(vname);
+                return true;
+            } else if (!lex_chkread(l, ',')) {
+                mstr_free(vname);
                 return false;
             }
         }
@@ -2887,7 +3226,7 @@ bool stmt_if(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, '(')) {
         return false;
     }
-    if (!base(l, bc)) {
+    if (!expr_seq(l, bc)) {
         return false;
     } //condition
     if (!lex_chkread(l, ')')) {
@@ -2929,7 +3268,7 @@ bool stmt_while(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, '(')) {
         return false;
     }
-    if (!base(l, bc)) {
+    if (!expr_seq(l, bc)) {
         return false;
     } //condition
     if (!lex_chkread(l, ')')) {
@@ -2948,6 +3287,64 @@ bool stmt_while(lex_t* l, bytecode_t* bc) {
     return true;
 }
 
+/* do { BODY } while (COND);  -- runs BODY once before the first COND test.
+ * Mirrors stmt_while's scope anchors but puts the body ahead of the condition.
+ * handle_block sets sc->pc_start = P+2 (continue) and sc->pc = P+3 (break)
+ * when INSTR_LOOP sits at index P, so the layout is:
+ *   [P]   LOOP
+ *   [P+1] entry    JMP -> body_start  (fall-through executes BODY first)
+ *   [P+2] continue JMP -> cond_start  (sc->pc_start)
+ *   [P+3] break    JMP -> LOOP_END    (sc->pc; also NJMPB target when COND false)
+ *   body_start: BODY
+ *   cond_start: COND
+ *             NJMPB -> P+3   (COND false -> break anchor -> end)
+ *             JMPB  -> body_start (COND true -> loop back)
+ *   LOOP_END */
+bool stmt_do(lex_t* l, bytecode_t* bc) {
+    if (!lex_chkread(l, LEX_R_DO)) {
+        return false;
+    }
+    bc_gen(bc, INSTR_LOOP);
+    PC pc_entry = bc_reserve(bc);    // P+1: entry -> body
+    PC pc_continue = bc_reserve(bc); // P+2: continue anchor (sc->pc_start)
+    PC pc_break = bc_reserve(bc);    // P+3: break anchor (sc->pc)
+
+    lex_skip_empty(l);
+    PC body_start = bc->cindex;
+    if (!stmt_loop_block(l, bc)) {
+        return false;
+    }
+
+    lex_skip_empty(l);
+    if (!lex_chkread(l, LEX_R_WHILE)) {
+        return false;
+    }
+    lex_skip_empty(l);
+    if (!lex_chkread(l, '(')) {
+        return false;
+    }
+    PC cond_start = bc->cindex;
+    if (!expr_seq(l, bc)) {
+        return false;
+    }
+    if (!lex_chkread(l, ')')) {
+        return false;
+    }
+    lex_skip_empty(l);
+    if (l->tk == ';') { // do-while ends with ';' (tolerate ASI when absent)
+        lex_chkread(l, ';');
+    }
+
+    bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC);  // COND false -> break anchor
+    bc_add_instr(bc, body_start, INSTR_JMPB, ILLEGAL_PC); // COND true  -> body
+
+    PC end = bc_gen(bc, INSTR_LOOP_END);
+    bc_set_instr(bc, pc_entry, INSTR_JMP, body_start);
+    bc_set_instr(bc, pc_continue, INSTR_JMP, cond_start);
+    bc_set_instr(bc, pc_break, INSTR_JMP, end - 1);
+    return true;
+}
+
 bool stmt_for_in(lex_t* l, bytecode_t* bc,
         PC pc_condition,
         PC pc_break,
@@ -2959,8 +3356,9 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
     // Store the object in a temporary variable
     bc_gen_str(bc, INSTR_SAFE_VAR, "__for_in_obj");
     bc_gen_str(bc, INSTR_LOAD, "__for_in_obj");
-    // Load the object to iterate over
-    if (!base(l, bc)) {
+    // Load the object to iterate over. The for-in RHS is a full Expression, so
+    // `for (k in sideEffect(), obj)` is a comma expression yielding `obj`.
+    if (!expr_seq(l, bc)) {
         return false;
     }
     if (!lex_chkread(l, ')')) {
@@ -3057,7 +3455,8 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
     // __for_of_iter = GetIterator(<iterable>) via the iteration protocol
     bc_gen_str(bc, INSTR_SAFE_VAR, "__for_of_iter");
     bc_gen_str(bc, INSTR_LOAD, "__for_of_iter");
-    if (!base(l, bc)) {
+    // The for-of RHS is a full Expression: `for (x of a, b)` iterates b.
+    if (!expr_seq(l, bc)) {
         return false;
     }
     if (!lex_chkread(l, ')')) {
@@ -3242,6 +3641,34 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
                 bc_gen(bc, INSTR_ASIGN);
                 bc_gen(bc, INSTR_POP);
             }
+            /* Comma-separated declaration list: `for (var a = 1, b = 2, c; ...)`. */
+            while (l->tk == ',') {
+                if (!lex_chkread(l, ',')) {
+                    mstr_free(loop_var);
+                    return false;
+                }
+                lex_skip_empty(l);
+                if (l->tk != LEX_ID) {
+                    mstr_free(loop_var);
+                    return false;
+                }
+                mstr_t* extra = mstr_new(l->tk_str->cstr);
+                lex_chkread(l, LEX_ID);
+                bc_gen_str(bc, var_op, extra->cstr);
+                if (l->tk == '=') {
+                    lex_chkread(l, '=');
+                    bc_gen_str(bc, INSTR_LOAD, extra->cstr);
+                    if (!base(l, bc)) {
+                        mstr_free(extra);
+                        mstr_free(loop_var);
+                        return false;
+                    }
+                    bc_gen(bc, INSTR_ASIGN);
+                    bc_gen(bc, INSTR_POP);
+                }
+                mstr_free(extra);
+                lex_skip_empty(l);
+            }
             if (l->tk != ';') {
                 mstr_free(loop_var);
                 return false;
@@ -3249,13 +3676,57 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             lex_chkread(l, ';');
             lex_skip_empty(l);
         }
+    } else if (l->tk == ';') {
+        // Empty init clause: `for(; cond; iter)`
+        lex_chkread(l, ';');
+        lex_skip_empty(l);
     } else {
-        // Standard for loop init statement
+        /* Bare-identifier for-in / for-of: `for (t in obj)` / `for (x of arr)`
+         * where the loop variable is an existing binding (no var/let/const).
+         * Peek past the identifier; if it is not followed by `in`/`of`, restore
+         * the lexer fully and let the generic init path handle `for (i = 0; ...)`. */
+        if (l->tk == LEX_ID) {
+            lex_t saved = *l;                 // shallow copy: keeps original tk_str ptr
+            mstr_t* saved_tk_str = l->tk_str; // do not let scanning clobber caller token
+            l->tk_str = mstr_new("");
+            mstr_cpy(l->tk_str, saved_tk_str->cstr);
+            mstr_t* bare = mstr_new(saved_tk_str->cstr); // capture the loop-variable name
+            lex_get_next_token(l);            // move past the identifier
+            lex_skip_empty(l);
+            bool bare_in = (l->tk == LEX_R_IN);
+            bool bare_of = (!bare_in && l->tk == LEX_ID && strcmp(l->tk_str->cstr, "of") == 0);
+            if (bare_in || bare_of) {
+                if (bare_in) lex_chkread(l, LEX_R_IN);
+                else         lex_chkread(l, LEX_ID);
+                lex_skip_empty(l);
+                /* l->tk is now the first token of the iterable, held in the temp
+                 * buffer. Copy its text into the caller's buffer and keep the
+                 * advanced position, so base() parses the iterable (not the stale
+                 * loop-variable name). */
+                mstr_cpy(saved_tk_str, l->tk_str->cstr);
+                mstr_free(l->tk_str);       // drop the temp scan buffer
+                l->tk_str = saved_tk_str;   // caller buffer now holds the live token
+                /* The bare variable already exists (or is a global); declare it
+                 * SAFE_VAR so the per-iteration reassignment is allowed. */
+                if (bare_in) {
+                    return stmt_for_in(l, bc, pc_condition, pc_break, bare, INSTR_SAFE_VAR);
+                }
+                return stmt_for_of(l, bc, pc_condition, pc_break, bare, INSTR_SAFE_VAR,
+                        NULL, INSTR_SAFE_VAR, is_for_await);
+            }
+            mstr_free(bare);
+            mstr_free(l->tk_str);
+            *l = saved;                     // not for-in/of: full restore
+        }
+        // Standard for loop init statement (it consumes its own ';'
+        // terminator; tolerate one it may have left behind).
         if (!statement(l, bc)) {
             return false;
         }
         lex_skip_empty(l);
-        lex_chkread(l, ';');
+        if (l->tk == ';') {
+            lex_chkread(l, ';');
+        }
         lex_skip_empty(l);
     }
     
@@ -3277,7 +3748,10 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 
     // Standard for loop implementation
     PC cond_pc = bc->cindex; //condition-check anchor (init falls through here)
-    if (!base(l, bc)) { //condition
+    if (l->tk == ';') {
+        // Empty condition (`for(;;)`) is always true.
+        bc_gen(bc, INSTR_TRUE);
+    } else if (!expr_seq(l, bc)) { //condition
         if (loop_var) {
             mstr_free(loop_var);
         }
@@ -3298,11 +3772,14 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
      * at the iterator so a continue advances the loop variable before re-testing
      * the condition; otherwise `for(..;..;..) { continue; }` never terminates. */
     bc_set_instr(bc, pc_condition, INSTR_JMP, pci);
-    if (!base(l, bc)) { //iterator statement
-        if (loop_var) {
-            mstr_free(loop_var);
+    bool has_iter = (l->tk != ')'); // empty iterator clause: `for(a; b;)`
+    if (has_iter) {
+        if (!expr_seq(l, bc)) { //iterator statement
+            if (loop_var) {
+                mstr_free(loop_var);
+            }
+            return false;
         }
-        return false;
     }
     if (!lex_chkread(l, ')')) {
         if (loop_var) {
@@ -3310,7 +3787,9 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
         }
         return false;
     }
-    bc_gen(bc, INSTR_POP); //pop the stack.
+    if (has_iter) {
+        bc_gen(bc, INSTR_POP); //pop the stack.
+    }
 
     bc_add_instr(bc, cond_pc, INSTR_JMPB, ILLEGAL_PC); //after iterator -> condition check
 
@@ -3423,7 +3902,9 @@ bool stmt_return(lex_t* l, bytecode_t* bc) {
         return false;
     }
     if (!is_stmt_end(l->tk)) {
-        if (!base(l, bc)) {
+        /* `return a, b` is a comma expression: evaluate a, discard, return b.
+         * base() alone would stop at the ',' and strand the statement. */
+        if (!expr_seq(l, bc)) {
             return false;
         }
         if (g_async_depth > 0) {
@@ -3473,29 +3954,254 @@ bool stmt_try(lex_t* l, bytecode_t* bc) {
     lex_skip_empty(l);
     PC pce = bc_reserve(bc); //jmp to finalize.
 
-    bc_set_instr(bc, pc_cache, INSTR_JMP, ILLEGAL_PC);
-    if (!lex_chkread(l, LEX_R_CATCH)) {
-        return false;
-    }
+    if (l->tk == LEX_R_CATCH) {
+        /* pc_cache is the throw anchor (sc->pc): on a throw the VM lands here
+         * and jumps to the real catch handler emitted below. */
+        bc_set_instr(bc, pc_cache, INSTR_JMP, ILLEGAL_PC);
+        if (!lex_chkread(l, LEX_R_CATCH)) {
+            return false;
+        }
 
-    lex_skip_empty(l);
-    if (!lex_chkread(l, '(')) {
-        return false;
-    }
-    bc_gen_str(bc, INSTR_CATCH, l->tk_str->cstr);
-    if (!lex_chkread(l, LEX_ID)) {
-        return false;
-    }
-    if (!lex_chkread(l, ')')) {
-        return false;
-    }
-    lex_skip_empty(l);
-    if (!statement(l, bc)) {
-        return false;
+        lex_skip_empty(l);
+        if (!lex_chkread(l, '(')) {
+            return false;
+        }
+        bc_gen_str(bc, INSTR_CATCH, l->tk_str->cstr);
+        if (!lex_chkread(l, LEX_ID)) {
+            return false;
+        }
+        if (!lex_chkread(l, ')')) {
+            return false;
+        }
+        lex_skip_empty(l);
+        if (!statement(l, bc)) {
+            return false;
+        }
+    } else {
+        /* try-finally with no catch: the try provides no exception handling, so
+         * demote INSTR_TRY to a plain BLOCK. The body runs normally and a throw
+         * propagates straight to an enclosing handler (exactly like code with no
+         * try at all) instead of routing through a synthetic rethrow — this
+         * preserves the thrown value and never crashes when the try sits inside
+         * a function that is called from another try. pc_cache stays a dead NIL
+         * slot (the JMP right after the BLOCK skips it and no throw targets it).
+         * The finally block below still runs on the normal (non-throwing) path. */
+        bc->code_buf[pc - 1] = INS(INSTR_BLOCK, OFF(bc->code_buf[pc - 1]));
     }
 
     pc = bc_gen(bc, INSTR_TRY_END) - 1;
     bc_set_instr(bc, pce, INSTR_JMP, pc); // end anchor;
+
+    /* Optional `finally { ... }`. `finally` is not a reserved word in this
+     * lexer (it arrives as LEX_ID), so detect it by name and emit the block
+     * sequentially after TRY_END. It runs on the normal path and on the
+     * catch-completes-normally path, matching JS for the common cases. */
+    lex_skip_empty(l);
+    if (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "finally") == 0) {
+        if (!lex_chkread(l, LEX_ID)) {
+            return false;
+        }
+        lex_skip_empty(l);
+        if (!statement(l, bc)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Skip a switch clause body at the token level: advance until the next
+ * `case`/`default` (at brace depth 0) or the switch's closing `}`. The boundary
+ * token is NOT consumed. Used by the dispatch pass, which must step over bodies
+ * without compiling them (they are compiled in the second pass). */
+static bool skip_switch_body(lex_t* l) {
+    int depth = 0;
+    while (l->tk != LEX_EOF) {
+        if (l->tk == '{') {
+            depth++;
+        } else if (l->tk == '}') {
+            if (depth == 0) return true; // the switch's own closing brace
+            depth--;
+        } else if (depth == 0 && (l->tk == LEX_R_CASE || l->tk == LEX_R_DEFAULT)) {
+            return true;
+        }
+        lex_get_next_token(l);
+    }
+    return false;
+}
+
+/* Consume a `case <expr>:` or `default:` label at the token level (no code is
+ * emitted). The case expression is skipped by scanning to the ':' that sits at
+ * paren/bracket/brace depth 0 and ternary depth 0. */
+static bool skip_case_label(lex_t* l) {
+    if (l->tk == LEX_R_DEFAULT) {
+        if (!lex_chkread(l, LEX_R_DEFAULT)) return false;
+        lex_skip_empty(l);
+        return lex_chkread(l, ':');
+    }
+    if (l->tk != LEX_R_CASE) return false;
+    if (!lex_chkread(l, LEX_R_CASE)) return false;
+    lex_skip_empty(l);
+    int depth = 0, ternary = 0;
+    while (l->tk != LEX_EOF) {
+        if (l->tk == '(' || l->tk == '[' || l->tk == '{') depth++;
+        else if (l->tk == ')' || l->tk == ']' || l->tk == '}') depth--;
+        else if (l->tk == '?') ternary++;
+        else if (l->tk == ':' && depth == 0) {
+            if (ternary > 0) ternary--;
+            else { lex_chkread(l, ':'); return true; }
+        }
+        lex_get_next_token(l);
+    }
+    return false;
+}
+
+/* Compile the statements of one switch clause body, stopping at the next
+ * `case`/`default`/`}`. Fall-through to the following clause is implicit (the
+ * bodies are emitted back-to-back). */
+static bool compile_switch_body(lex_t* l, bytecode_t* bc) {
+    while (l->tk != LEX_R_CASE && l->tk != LEX_R_DEFAULT &&
+           l->tk != '}' && l->tk != LEX_EOF) {
+        int32_t prev_pos = l->data_pos;
+        uint32_t prev_tk = l->tk;
+        if (!statement(l, bc)) return false;
+        lex_skip_empty(l);
+        if (l->data_pos == prev_pos && l->tk == prev_tk) return false; // no progress
+    }
+    return l->tk != LEX_EOF;
+}
+
+#define SWITCH_MAX_CASES 128
+
+/* `switch (expr) { case E: ... default: ... }`.
+ *
+ * Emitted layout (two passes over the source, one shared bytecode buffer):
+ *   <eval expr> -> __sw_val
+ *   SWITCH                 ; push switch scope, sc->pc = break anchor (SWITCH+2)
+ *   JMP  dispatch          ; normal flow skips the break anchor
+ *   break_anchor: JMP end  ; `break` lands here (sc->pc), jumps to SWITCH_END
+ * dispatch:
+ *   for each case i:  LOAD __sw_val; <E_i>; TEQ; NJMP next_test_i; JMP body_i
+ *   [JMP default_body]     ; only when a default clause exists
+ * body_0: <stmts>          ; bodies in source order -> fall-through is implicit
+ * body_1: <stmts>
+ * ...
+ * end: SWITCH_END          ; pop switch scope
+ *
+ * Pass 1 compiles the case expressions into the dispatch region and skips the
+ * bodies (recording nothing but reserving jump anchors). Pass 2 restores the
+ * lexer to the body-region start and compiles each body in source order, then
+ * every reserved anchor is patched. Case expressions are compiled exactly once
+ * (in pass 1), so their side effects run once, per spec. */
+bool stmt_switch(lex_t* l, bytecode_t* bc) {
+    if (!lex_chkread(l, LEX_R_SWITCH)) return false;
+    if (!lex_chkread(l, '(')) return false;
+
+    bc_gen_str(bc, INSTR_SAFE_VAR, "__sw_val");
+    bc_gen_str(bc, INSTR_LOAD, "__sw_val");
+    if (!expr_seq(l, bc)) return false;   // discriminant
+    if (!lex_chkread(l, ')')) return false;
+    bc_gen(bc, INSTR_ASIGN);
+    bc_gen(bc, INSTR_POP);
+    lex_skip_empty(l);
+    if (!lex_chkread(l, '{')) return false;
+    lex_skip_empty(l);
+
+    // Snapshot the body-region start; scan pass 1 with a private tk_str buffer so
+    // the original token text survives for the pass-2 restore (see the shared
+    // save/restore idiom in call_args_have_spread).
+    lex_t saved = *l;
+    mstr_t* saved_tk_str = l->tk_str;
+    l->tk_str = mstr_new("");
+    mstr_cpy(l->tk_str, saved_tk_str->cstr);
+
+    PC pc_switch = bc_gen(bc, INSTR_SWITCH);
+    bc_add_instr(bc, pc_switch, INSTR_JMP, pc_switch + 2); // normal flow -> dispatch
+    PC pc_break = bc_reserve(bc);                          // == pc_switch+2 == sc->pc
+
+    PC njmp_anchor[SWITCH_MAX_CASES];
+    PC body_anchor[SWITCH_MAX_CASES];
+    PC test_start[SWITCH_MAX_CASES];
+    int n_cases = 0;
+    bool has_default = false;
+    bool ok = true;
+
+    // ---- Pass 1: dispatch tests (bodies skipped) ----
+    while (l->tk != '}') {
+        if (l->tk == LEX_EOF) { ok = false; break; }
+        if (l->tk == LEX_R_CASE) {
+            if (n_cases >= SWITCH_MAX_CASES) { ok = false; break; }
+            if (!lex_chkread(l, LEX_R_CASE)) { ok = false; break; }
+            lex_skip_empty(l);
+            test_start[n_cases] = bc->cindex;
+            bc_gen_str(bc, INSTR_LOAD, "__sw_val");
+            if (!base(l, bc)) { ok = false; break; }      // case expr, stops at ':'
+            bc_gen(bc, INSTR_TEQ);
+            njmp_anchor[n_cases] = bc_reserve(bc);        // NJMP -> next test
+            body_anchor[n_cases] = bc_reserve(bc);        // JMP  -> body
+            n_cases++;
+            if (!lex_chkread(l, ':')) { ok = false; break; }
+            lex_skip_empty(l);
+            if (!skip_switch_body(l)) { ok = false; break; }
+        } else if (l->tk == LEX_R_DEFAULT) {
+            if (!lex_chkread(l, LEX_R_DEFAULT)) { ok = false; break; }
+            lex_skip_empty(l);
+            if (!lex_chkread(l, ':')) { ok = false; break; }
+            lex_skip_empty(l);
+            has_default = true;
+            if (!skip_switch_body(l)) { ok = false; break; }
+        } else {
+            // Statements before the first label are dead code in JS; skip them.
+            if (!skip_switch_body(l)) { ok = false; break; }
+        }
+    }
+    if (ok && l->tk == '}') lex_chkread(l, '}');
+
+    PC dispatch_end = bc->cindex;
+    PC default_anchor = ILLEGAL_PC;
+    if (ok && has_default) default_anchor = bc_reserve(bc); // JMP -> default body
+    for (int i = 0; ok && i < n_cases; i++) {
+        PC tgt = (i + 1 < n_cases) ? test_start[i + 1] : dispatch_end;
+        bc_set_instr(bc, njmp_anchor[i], INSTR_NJMP, tgt);
+    }
+
+    // ---- Restore to the body-region start for pass 2 ----
+    mstr_free(l->tk_str);
+    *l = saved;
+    if (!ok) return false;
+
+    // ---- Pass 2: bodies in source order ----
+    PC body_pos[SWITCH_MAX_CASES];
+    int body_idx = 0;
+    PC default_body_pos = ILLEGAL_PC;
+    while (l->tk != '}') {
+        if (l->tk == LEX_EOF) { ok = false; break; }
+        if (l->tk == LEX_R_CASE) {
+            if (!skip_case_label(l)) { ok = false; break; }
+            lex_skip_empty(l);
+            if (body_idx < SWITCH_MAX_CASES) body_pos[body_idx++] = bc->cindex;
+            if (!compile_switch_body(l, bc)) { ok = false; break; }
+        } else if (l->tk == LEX_R_DEFAULT) {
+            if (!skip_case_label(l)) { ok = false; break; }
+            lex_skip_empty(l);
+            default_body_pos = bc->cindex;
+            if (!compile_switch_body(l, bc)) { ok = false; break; }
+        } else {
+            if (!skip_switch_body(l)) { ok = false; break; }
+        }
+    }
+    if (ok && l->tk == '}') lex_chkread(l, '}');
+    if (!ok) return false;
+
+    PC pc_end = bc_gen(bc, INSTR_SWITCH_END);
+    bc_set_instr(bc, pc_break, INSTR_JMP, pc_end);        // break -> SWITCH_END
+    for (int i = 0; i < n_cases; i++) {
+        if (i < body_idx) bc_set_instr(bc, body_anchor[i], INSTR_JMP, body_pos[i]);
+        else              bc_set_instr(bc, body_anchor[i], INSTR_JMP, pc_end);
+    }
+    if (has_default && default_anchor != ILLEGAL_PC) {
+        PC dtgt = (default_body_pos != ILLEGAL_PC) ? default_body_pos : pc_end;
+        bc_set_instr(bc, default_anchor, INSTR_JMP, dtgt);
+    }
     return true;
 }
 
@@ -3524,6 +4230,10 @@ bool statement(lex_t* l, bytecode_t* bc) {
 
     if (l->tk == '\n') {
         lex_skip_empty(l);
+    } else if (l->tk == ';') { /* Empty statement */
+        if (!lex_chkread(l, ';')) {
+            return false;
+        }
     } else if (l->tk == '{') { /* A block of code */
         if (!stmt_block(l, bc, false)) {
             return false;
@@ -3558,7 +4268,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                 }
             }
         } else if (!stmt_strict(l, bc)) {
-            if (!base(l, bc)) {
+            if (!expr_seq(l, bc)) {
                 return false;
             }
             if (is_stmt_end(l->tk)) {
@@ -3577,10 +4287,15 @@ bool statement(lex_t* l, bytecode_t* bc) {
                l->tk == LEX_MINUSMINUS ||
                l->tk == '(' || l->tk == '!' || l->tk == LEX_R_NEW ||
                l->tk == LEX_R_AWAIT || l->tk == LEX_R_DELETE ||
-               l->tk == '-') {
+               l->tk == LEX_R_NULL || l->tk == LEX_R_UNDEFINED ||
+               l->tk == LEX_R_TRUE || l->tk == LEX_R_FALSE ||
+               l->tk == LEX_R_TYPEOF || l->tk == LEX_R_VOID ||
+               l->tk == '+' ||
+               l->tk == '-' ||
+               l->tk == '~') {
         if (!stmt_strict(l, bc)) {
             /* Execute a simple statement that only contains basic arithmetic... */
-            if (!base(l, bc)) {
+            if (!expr_seq(l, bc)) {
                 return false;
             }
             if (is_stmt_end(l->tk)) {
@@ -3644,6 +4359,10 @@ bool statement(lex_t* l, bytecode_t* bc) {
         if (!stmt_while(l, bc)) {
             return false;
         }
+    } else if (l->tk == LEX_R_DO) {
+        if (!stmt_do(l, bc)) {
+            return false;
+        }
     } else if (l->tk == LEX_R_FOR) {
         if (!stmt_for(l, bc)) {
             return false;
@@ -3662,6 +4381,10 @@ bool statement(lex_t* l, bytecode_t* bc) {
         }
     } else if (l->tk == LEX_R_TRY) {
         if (!stmt_try(l, bc)) {
+            return false;
+        }
+    } else if (l->tk == LEX_R_SWITCH) {
+        if (!stmt_switch(l, bc)) {
             return false;
         }
     }

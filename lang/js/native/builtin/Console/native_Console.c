@@ -49,6 +49,15 @@ void reg_native_Console(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_CONSOLE);
 	vm_reg_static(vm, cls, "write(v)", native_print, NULL); 
 	vm_reg_static(vm, cls, "log(v)", native_println, NULL); 
+	/* Real-world scripts (jQuery, framework bundles) call these constantly; mario
+	 * has a single output sink, so route them all through println. Without them a
+	 * console.error(...) raises "can not find function 'error'" and, if it happens
+	 * inside a catch body, used to spin forever. */
+	vm_reg_static(vm, cls, "info(v)", native_println, NULL);
+	vm_reg_static(vm, cls, "warn(v)", native_println, NULL);
+	vm_reg_static(vm, cls, "error(v)", native_println, NULL);
+	vm_reg_static(vm, cls, "debug(v)", native_println, NULL);
+	vm_reg_static(vm, cls, "trace(v)", native_println, NULL);
 }
 
 #ifdef __cplusplus

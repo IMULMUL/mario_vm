@@ -19,6 +19,7 @@
 #include "FinalizationRegistry/native_FinalizationRegistry.h"
 #include "SharedArrayBuffer/native_SharedArrayBuffer.h"
 #include "Atomics/native_Atomics.h"
+#include "RegExp/native_RegExp.h"
 
 #ifdef __cplusplus /* __cplusplus */
 extern "C" {
@@ -45,6 +46,7 @@ void reg_builtin_natives(vm_t* vm) {
 	reg_native_FinalizationRegistry(vm);
 	reg_native_SharedArrayBuffer(vm);
 	reg_native_Atomics(vm);
+	reg_native_RegExp(vm);
 }
 
 #ifdef __cplusplus /* __cplusplus */

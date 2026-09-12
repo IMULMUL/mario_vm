@@ -3,7 +3,12 @@ extern "C" {
 #endif
 
 #include "native_String.h"
+#include "../RegExp/native_RegExp.h"
 #include <math.h>   /* NAN for charCodeAt's out-of-range result */
+
+/* regexp split path (defined with the other regex-aware helpers below);
+ * native_StringSplit() sits earlier in the file. */
+static var_t* str_re_split(vm_t* vm, var_t* env, var_t* re, int limit);
 
 /**======utf8 functions======*/
 
@@ -321,6 +326,20 @@ var_t* native_StringIndexOf(vm_t* vm, var_t* env, void* data) {
 var_t* native_StringSplit(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 
+	{
+		var_t* sepv = get_obj(env, "separator");
+		if(js_regexp_is(sepv)) {
+			int limit = -1;
+			var_t* lv = get_obj(env, "limit");
+			if(lv != NULL && lv->type == V_INT) {
+				limit = var_get_int(lv);
+				if(limit <= 0)
+					limit = -1;
+			}
+			return str_re_split(vm, env, sepv, limit);
+		}
+	}
+
 	const char* s = get_str(env, THIS);
 	const char* separator = get_str(env, "separator");
 	int len = (int)strlen(s);
@@ -435,8 +454,233 @@ var_t* native_StringToUpperCase(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/**====== regex-aware paths for replace/match/search/split ======*/
+
+static void str_re_append_n(mstr_t* out, const char* s, int n) {
+	int i;
+	for(i = 0; i < n; i++)
+		mstr_add(out, s[i]);
+}
+
+/* Expand a replacement template: $$ $& $` $' $1..$99. An out-of-range or
+ * unset group expands to "" (JS leaves the literal text only for $0/$-less
+ * digits; keeping it simple and predictable here). */
+static void str_re_expand(mstr_t* out, const char* repl, const char* s, int slen, int* caps, int ng) {
+	const char* p = repl;
+	while(*p != 0) {
+		if(*p == '$' && p[1] != 0) {
+			char c = p[1];
+			if(c == '$') { mstr_add(out, '$'); p += 2; continue; }
+			if(c == '&') { str_re_append_n(out, s + caps[0], caps[1] - caps[0]); p += 2; continue; }
+			if(c == '`') { str_re_append_n(out, s, caps[0]); p += 2; continue; }
+			if(c == '\'') { str_re_append_n(out, s + caps[1], slen - caps[1]); p += 2; continue; }
+			if(c >= '1' && c <= '9') {
+				int g = c - '0';
+				int adv = 2;
+				if(p[2] >= '0' && p[2] <= '9' && g * 10 + (p[2] - '0') <= ng) {
+					g = g * 10 + (p[2] - '0');
+					adv = 3;
+				}
+				if(g <= ng) {
+					if(caps[g * 2] >= 0)
+						str_re_append_n(out, s + caps[g * 2], caps[g * 2 + 1] - caps[g * 2]);
+					p += adv;
+					continue;
+				}
+			}
+		}
+		mstr_add(out, *p);
+		p++;
+	}
+}
+
+/* Call a function replacement f(match, p1..pn, offset, string) and append its
+ * string value. Runs inside a gc_defer window (transient args are unrooted,
+ * same contract as the Array callback natives). */
+static void str_re_call_repl(vm_t* vm, var_t* env, var_t* f, mstr_t* out,
+		const char* s, int* caps, int ng) {
+	vm->gc.gc_defer++;
+	var_t* args = var_new_array(vm);
+	int g;
+	for(g = 0; g <= ng; g++) {
+		if(caps[g * 2] >= 0)
+			var_array_add(args, var_new_str2(vm, s + caps[g * 2], (uint32_t)(caps[g * 2 + 1] - caps[g * 2])));
+		else
+			var_array_add(args, var_new(vm));
+	}
+	var_array_add(args, var_new_int(vm, caps[0]));
+	var_array_add(args, var_new_str(vm, s));
+	var_array_reverse(args);
+	var_t* res = call_m_func(vm, env, f, args);
+	var_unref(args);
+	if(res != NULL) {
+		mstr_t* rs = mstr_new("");
+		var_to_str(res, rs);
+		mstr_append(out, rs->cstr);
+		mstr_free(rs);
+		var_unref(res);
+	}
+	vm->gc.gc_defer--;
+}
+
+/* Shared regexp replace: one match, or all of them when the regexp carries
+ * /g (String.replace) or unconditionally (String.replaceAll). */
+static var_t* str_re_replace(vm_t* vm, var_t* env, var_t* re, bool force_all) {
+	const char* s = get_str(env, THIS);
+	int slen = (int)strlen(s);
+	char err[64];
+	re_prog_t* p = re_compile(get_str(re, "source"), get_str(re, "flags"), err, sizeof(err));
+	if(p == NULL)
+		return var_new_str(vm, s);
+	bool all = force_all || re_flag_global(p);
+	var_t* replv = get_obj(env, "replacement");
+	bool is_fn = replv != NULL && replv->is_func != 0;
+	const char* repl = is_fn ? "" : get_str(env, "replacement");
+	int ng = re_ngroups(p);
+	int caps[RE_CAPS_MAX];
+	mstr_t* out = mstr_new("");
+	int pos = 0;
+	while(pos <= slen) {
+		if(!re_match(p, s, slen, pos, caps))
+			break;
+		str_re_append_n(out, s + pos, caps[0] - pos);
+		if(is_fn)
+			str_re_call_repl(vm, env, replv, out, s, caps, ng);
+		else
+			str_re_expand(out, repl, s, slen, caps, ng);
+		if(caps[1] > caps[0])
+			pos = caps[1];
+		else {
+			/* empty match: copy one char through to guarantee progress */
+			if(caps[1] < slen)
+				mstr_add(out, s[caps[1]]);
+			pos = caps[1] + 1;
+		}
+		if(!all)
+			break;
+	}
+	if(pos < slen)
+		str_re_append_n(out, s + pos, slen - pos);
+	re_free(p);
+	var_t* ret = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	var_instance_from(ret, get_obj(env, THIS));
+	return ret;
+}
+
+/* String.prototype.match(regexp): non-global -> exec()-shaped array or null;
+ * global -> array of every full match (or null when there is none). A plain
+ * string argument is compiled as a pattern, per spec. */
+var_t* native_StringMatch(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int slen = (int)strlen(s);
+	var_t* rv = get_obj(env, "regexp");
+	const char* src;
+	const char* flg;
+	if(js_regexp_is(rv)) {
+		src = get_str(rv, "source");
+		flg = get_str(rv, "flags");
+	}
+	else {
+		src = get_str(env, "regexp");
+		flg = "";
+	}
+	char err[64];
+	re_prog_t* p = re_compile(src, flg, err, sizeof(err));
+	if(p == NULL)
+		return var_new_null(vm);
+	int caps[RE_CAPS_MAX];
+	if(!re_flag_global(p)) {
+		if(!re_match(p, s, slen, 0, caps)) {
+			re_free(p);
+			return var_new_null(vm);
+		}
+		var_t* arr = js_regexp_result_array(vm, s, caps, re_ngroups(p));
+		re_free(p);
+		return arr;
+	}
+	var_t* arr = var_new_array(vm);
+	int pos = 0, hits = 0;
+	while(pos <= slen && re_match(p, s, slen, pos, caps)) {
+		var_array_add(arr, var_new_str2(vm, s + caps[0], (uint32_t)(caps[1] - caps[0])));
+		hits++;
+		pos = caps[1] > caps[0] ? caps[1] : caps[1] + 1;
+	}
+	re_free(p);
+	if(hits == 0)
+		return var_new_null(vm);   /* arr is unrooted; the next gc sweeps it */
+	return arr;
+}
+
+/* String.prototype.search(regexp): byte index of the first match or -1. */
+var_t* native_StringSearch(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	var_t* rv = get_obj(env, "regexp");
+	const char* src;
+	const char* flg;
+	if(js_regexp_is(rv)) {
+		src = get_str(rv, "source");
+		flg = get_str(rv, "flags");
+	}
+	else {
+		src = get_str(env, "regexp");
+		flg = "";
+	}
+	char err[64];
+	re_prog_t* p = re_compile(src, flg, err, sizeof(err));
+	if(p == NULL)
+		return var_new_int(vm, -1);
+	int caps[RE_CAPS_MAX];
+	bool hit = re_match(p, s, (int)strlen(s), 0, caps);
+	re_free(p);
+	return var_new_int(vm, hit ? caps[0] : -1);
+}
+
+/* Regexp split path used by native_StringSplit(). Capture groups are not
+ * spliced into the result (rarely relied on). */
+static var_t* str_re_split(vm_t* vm, var_t* env, var_t* re, int limit) {
+	const char* s = get_str(env, THIS);
+	int slen = (int)strlen(s);
+	var_t* result = var_new_array(vm);
+	char err[64];
+	re_prog_t* p = re_compile(get_str(re, "source"), get_str(re, "flags"), err, sizeof(err));
+	if(p == NULL) {
+		var_array_add(result, var_new_str(vm, s));
+		return result;
+	}
+	int caps[RE_CAPS_MAX];
+	int pos = 0, start = 0, count = 0;
+	while(pos <= slen && (limit < 0 || count < limit)) {
+		if(!re_match(p, s, slen, pos, caps))
+			break;
+		if(caps[1] == caps[0] && caps[0] >= slen)
+			break;
+		if(caps[1] == caps[0] && caps[0] == start) {
+			/* empty match at the piece start: step over one char */
+			pos = caps[0] + 1;
+			continue;
+		}
+		var_array_add(result, var_new_str2(vm, s + start, (uint32_t)(caps[0] - start)));
+		count++;
+		start = caps[1];
+		pos = caps[1] > caps[0] ? caps[1] : caps[1] + 1;
+	}
+	if(limit < 0 || count < limit)
+		var_array_add(result, var_new_str2(vm, s + start, (uint32_t)(slen - start)));
+	re_free(p);
+	return result;
+}
+
 var_t* native_StringReplace(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
+
+	{
+		var_t* sv = get_obj(env, "searchValue");
+		if(js_regexp_is(sv))
+			return str_re_replace(vm, env, sv, false);
+	}
 
 	const char* s = get_str(env, THIS);
 	const char* searchValue = get_str(env, "searchValue");
@@ -993,6 +1237,12 @@ var_t* native_StringAt(vm_t* vm, var_t* env, void* data) {
  * code point and at both ends, matching the spec ("-a-b-" for "ab"). */
 var_t* native_StringReplaceAll(vm_t* vm, var_t* env, void* data) {
 	(void)data;
+
+	{
+		var_t* sv = get_obj(env, "searchValue");
+		if(js_regexp_is(sv))
+			return str_re_replace(vm, env, sv, true);
+	}
 	const char* s = get_str(env, THIS);
 	const char* searchValue = get_str(env, "searchValue");
 	const char* replacement = get_str(env, "replacement");
@@ -1163,6 +1413,8 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "toLowerCase()", native_StringToLowerCase, NULL); 
 	vm_reg_native(vm, cls, "toUpperCase()", native_StringToUpperCase, NULL); 
 	vm_reg_native(vm, cls, "replace(searchValue, replacement)", native_StringReplace, NULL); 
+	vm_reg_native(vm, cls, "match(regexp)", native_StringMatch, NULL); 
+	vm_reg_native(vm, cls, "search(regexp)", native_StringSearch, NULL); 
 	vm_reg_native(vm, cls, "startsWith(searchString, position)", native_StringStartsWith, NULL); 
 	vm_reg_native(vm, cls, "endsWith(searchString, endPosition)", native_StringEndsWith, NULL); 
 	vm_reg_native(vm, cls, "includes(searchString, position)", native_StringIncludes, NULL); 

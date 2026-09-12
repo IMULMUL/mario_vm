@@ -182,80 +182,82 @@ var_t* native_math_toRadians(vm_t* vm, var_t* env, void *data) {
 	return var_new_float64(vm, (K_PI/180.0)*(get_float64(env, "a")));
 }
 
-/* The trig / log / exp functions below carry a pre-existing non-standard
- * (180/PI) degree-scaling quirk that is intentionally left untouched; only the
- * numeric width is widened to canonical doubles (V_FLOAT64). */
+/* The trig / log / exp functions below use standard JS (radian) semantics: the
+ * result is the raw libm value with no scaling. An earlier build carried a
+ * non-standard (180/PI) degree factor here, which broke Math.cos(0)==1,
+ * Math.log(Math.E)==1 and every canvas/animation trig call, so it is removed.
+ * (toDegrees/toRadians keep their conversion: that is their whole purpose.) */
 
 //Math.sin(a) - returns trig. sine of given angle in radians
 var_t* native_math_sin(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(sin(get_float64(env, "a"))));
+	return var_new_float64(vm, sin(get_float64(env, "a")));
 }
 
 //Math.asin(a) - returns trig. arcsine of given angle in radians
 var_t* native_math_asin(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(asin(get_float64(env, "a"))));
+	return var_new_float64(vm, asin(get_float64(env, "a")));
 }
 
 //Math.cos(a) - returns trig. cosine of given angle in radians
 var_t* native_math_cos(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(cos(get_float64(env, "a"))));
+	return var_new_float64(vm, cos(get_float64(env, "a")));
 }
 
 //Math.acos(a) - returns trig. arccosine of given angle in radians
 var_t* native_math_acos(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(acos(get_float64(env, "a"))));
+	return var_new_float64(vm, acos(get_float64(env, "a")));
 }
 
 //Math.tan(a) - returns trig. tangent of given angle in radians
 var_t* native_math_tan(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(tan(get_float64(env, "a"))));
+	return var_new_float64(vm, tan(get_float64(env, "a")));
 }
 
 //Math.atan(a) - returns trig. arctangent of given angle in radians
 var_t* native_math_atan(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(atan(get_float64(env, "a"))));
+	return var_new_float64(vm, atan(get_float64(env, "a")));
 }
 
 //Math.sinh(a) - returns trig. hyperbolic sine of given angle in radians
 var_t* native_math_sinh(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(sinh(get_float64(env, "a"))));
+	return var_new_float64(vm, sinh(get_float64(env, "a")));
 }
 
 //Math.asinh(a) - returns trig. hyperbolic arcsine of given angle in radians
 var_t* native_math_asinh(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(asinh(get_float64(env, "a"))));
+	return var_new_float64(vm, asinh(get_float64(env, "a")));
 }
 
 //Math.cosh(a) - returns trig. hyperbolic cosine of given angle in radians
 var_t* native_math_cosh(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(cosh(get_float64(env, "a"))));
+	return var_new_float64(vm, cosh(get_float64(env, "a")));
 }
 
 //Math.acosh(a) - returns trig. hyperbolic arccosine of given angle in radians
 var_t* native_math_acosh(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(acosh(get_float64(env, "a"))));
+	return var_new_float64(vm, acosh(get_float64(env, "a")));
 }
 
 //Math.tanh(a) - returns trig. hyperbolic tangent of given angle in radians
 var_t* native_math_tanh(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(tanh(get_float64(env, "a"))));
+	return var_new_float64(vm, tanh(get_float64(env, "a")));
 }
 
 //Math.atanh(a) - returns trig. hyperbolic arctangent of given angle in radians
 var_t* native_math_atanh(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(atanh(get_float64(env, "a"))));
+	return var_new_float64(vm, atanh(get_float64(env, "a")));
 }
 
 //Math.E() - returns E Neplero value
@@ -267,7 +269,7 @@ var_t* native_math_E(vm_t* vm, var_t* env, void *data) {
 //Math.log(a) - returns natural logaritm (base E) of given value
 var_t* native_math_log(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(log(get_float64(env, "a"))));
+	return var_new_float64(vm, log(get_float64(env, "a")));
 }
 
 //Math.log10(a) - returns logaritm(base 10) of given value
@@ -334,7 +336,7 @@ var_t* native_math_clz32(vm_t* vm, var_t* env, void *data) {
 //Math.exp(a) - returns e raised to the power of a given number
 var_t* native_math_exp(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	return var_new_float64(vm, (180.0/K_PI)*(exp(get_float64(env, "a"))));
+	return var_new_float64(vm, exp(get_float64(env, "a")));
 }
 
 //Math.pow(a,b) - returns the result of a number raised to a power (a)^(b)
@@ -384,9 +386,7 @@ var_t* native_math_ceil(vm_t* vm, var_t* env, void *data) {
 	return math_num(vm, ceil(get_float64(env, "a")));
 }
 
-//Math.atan2(y,x) - arctangent of y/x in RADIANS. Standard JS result; note the
-//degree-scaling in atan()/sin() above is a pre-existing non-standard quirk that
-//is intentionally left untouched here.
+//Math.atan2(y,x) - arctangent of y/x in RADIANS (standard JS result).
 var_t* native_math_atan2(vm_t* vm, var_t* env, void *data) {
 	(void)data;
 	return var_new_float64(vm, atan2(get_float64(env, "y"), get_float64(env, "x")));
@@ -412,7 +412,17 @@ void reg_native_Math(vm_t* vm) {
 	vm_reg_static(vm, cls, "range(x,a,b)", native_math_range, NULL);
 	vm_reg_static(vm, cls, "sign(a)", native_math_sign, NULL);
 
-	vm_reg_static(vm, cls, "PI()", native_math_PI, NULL);
+	/* Math.PI / Math.E and the rest are numeric PROPERTIES in standard JS (not
+	 * callable methods): `Math.PI` must yield 3.14159..., not a function object.
+	 * Registered via vm_reg_var as read-only static data, like Number.MAX_VALUE. */
+	vm_reg_var(vm, cls, "PI", var_new_float64(vm, K_PI), true);
+	vm_reg_var(vm, cls, "E", var_new_float64(vm, K_E), true);
+	vm_reg_var(vm, cls, "LN2", var_new_float64(vm, 0.6931471805599453), true);
+	vm_reg_var(vm, cls, "LN10", var_new_float64(vm, 2.302585092994046), true);
+	vm_reg_var(vm, cls, "LOG2E", var_new_float64(vm, 1.4426950408889634), true);
+	vm_reg_var(vm, cls, "LOG10E", var_new_float64(vm, 0.4342944819032518), true);
+	vm_reg_var(vm, cls, "SQRT1_2", var_new_float64(vm, 0.7071067811865476), true);
+	vm_reg_var(vm, cls, "SQRT2", var_new_float64(vm, 1.4142135623730951), true);
 	vm_reg_static(vm, cls, "toDegrees(a)", native_math_toDegrees, NULL);
 	vm_reg_static(vm, cls, "toRadians(a)", native_math_toRadians, NULL);
 	vm_reg_static(vm, cls, "sin(a)", native_math_sin, NULL);
@@ -428,7 +438,6 @@ void reg_native_Math(vm_t* vm) {
 	vm_reg_static(vm, cls, "tanh(a)", native_math_tanh, NULL);
 	vm_reg_static(vm, cls, "atanh(a)", native_math_atanh, NULL);
 
-	vm_reg_static(vm, cls, "E()", native_math_E, NULL);
 	vm_reg_static(vm, cls, "log(a)", native_math_log, NULL);
 	vm_reg_static(vm, cls, "log10(a)", native_math_log10, NULL);
 	vm_reg_static(vm, cls, "log2(a)", native_math_log2, NULL);

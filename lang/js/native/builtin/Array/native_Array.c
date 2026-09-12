@@ -319,14 +319,33 @@ var_t* native_Array_push(vm_t* vm, var_t* env, void* data) {
 }
 
 var_t* native_Array_unshift(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
+	(void)data;
 	var_t* arr = get_obj(env, THIS);
 	uint32_t args_num = get_func_args_num(env);
+	uint32_t sz = var_array_size(arr);
 	uint32_t i;
-	for(i=args_num; i>0; --i) {
-		var_t* arg = get_func_arg(env, i-1);
-		var_array_add_head(arr, arg);
+	/* Mario arrays are index-keyed maps with no re-indexing on head insert
+	 * (see the splice comment below), so unshift must rebuild: stash the
+	 * current elements, empty the array, append the new items, re-append. */
+	vm->gc.gc_defer++;
+	var_t* rest = var_new_array(vm);
+	for(i=0; i<sz; ++i) {
+		var_t* v = var_array_get_var(arr, (int32_t)i);
+		if(v != NULL) var_array_add(rest, v);
 	}
+	for(i=0; i<sz; ++i)
+		var_array_del(arr, (int32_t)i);
+	for(i=0; i<args_num; ++i) {
+		var_t* arg = get_func_arg(env, i);
+		if(arg != NULL) var_array_add(arr, arg);
+	}
+	uint32_t rs = var_array_size(rest);
+	for(i=0; i<rs; ++i) {
+		var_t* v = var_array_get_var(rest, (int32_t)i);
+		if(v != NULL) var_array_add(arr, v);
+	}
+	var_unref(rest);
+	vm->gc.gc_defer--;
 	return arr;
 }
 
@@ -346,17 +365,35 @@ var_t* native_Array_pop(vm_t* vm, var_t* env, void* data) {
 }
 
 var_t* native_Array_shift(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
+	(void)data;
 	var_t* arr = get_obj(env, THIS);
-	var_t* ret = NULL;
 	uint32_t sz = var_array_size(arr);
 	if(sz == 0)
 		return NULL;
-	
-	node_t* n = var_array_remove(arr, 0);
-	ret = var_ref(n->var);
-	node_free(n);
-	var_unref(ret);
+
+	/* Removal never re-indexes the remaining keys (see the splice comment
+	 * below), so shift rebuilds: keep elements 1..sz-1 in a temp, empty the
+	 * array, then re-append them at 0..sz-2. */
+	vm->gc.gc_defer++;
+	var_t* first = var_array_get_var(arr, 0);
+	var_t* ret = (first != NULL) ? var_ref(first) : NULL;
+	var_t* rest = var_new_array(vm);
+	uint32_t i;
+	for(i=1; i<sz; ++i) {
+		var_t* v = var_array_get_var(arr, (int32_t)i);
+		if(v != NULL) var_array_add(rest, v);
+	}
+	for(i=0; i<sz; ++i)
+		var_array_del(arr, (int32_t)i);
+	uint32_t rs = var_array_size(rest);
+	for(i=0; i<rs; ++i) {
+		var_t* v = var_array_get_var(rest, (int32_t)i);
+		if(v != NULL) var_array_add(arr, v);
+	}
+	var_unref(rest);
+	vm->gc.gc_defer--;
+	if(ret != NULL && ret->refs > 0)
+		ret->refs--; /* drop our guard ref; caller roots the return value */
 	return ret;
 }
 
