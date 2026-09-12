@@ -22,6 +22,7 @@ Mario 是一个**极小的、单文件的字节码虚拟机引擎**，不依赖�
 | 第 8 章 | [内存管理与垃圾回收](08-gc.md) | 引用计数 + 标记清除的混合 GC、变量缓冲池 |
 | 第 9 章 | [Native 扩展与内建类](09-natives.md) | 如何用 C 注册原生函数/类，参数如何传递 |
 | 第 10 章 | [字节码文件与工具链](10-mbc-and-tools.md) | `.mbc` 预编译文件格式、dump/asm 工具、嵌入到你自己的程序 |
+| 第 11 章 | [ES6+ 语言特性支持](11-es6-support.md) | 完整 ES6 及后续增补：语法特性、内建对象、支持矩阵与已知限制 |
 
 ---
 
@@ -55,7 +56,7 @@ JavaScript 源码 (文本)
 | `mario/lex/mario_lex.*` | 基础词法分析器（与语言无关） |
 | `mario/bcdump/bcdump.*` | 把字节码反汇编成可读文本 |
 | `lang/js/compiler.c` | JavaScript 编译器（递归下降解析器） |
-| `lang/js/native/...` | 内建类：Console / String / Number / Array / Object / JSON / Math / Date / Error / Promise 等 |
+| `lang/js/native/...` | 内建类：Object / Array / String / Number / Symbol / Error / Map / Set / Promise / Proxy / Reflect / BigInt / ArrayBuffer / DataView / TypedArray / WeakRef / RegExp / JSON / Math / Date 等（完整清单见第 9、11 章） |
 | `bin/mario/mario.c` | 命令行运行器 `main()` |
 | `bin/lib/mbc.c` | `.mbc` 字节码文件的读写 |
 | `test/js/*.js` | 示例脚本 |

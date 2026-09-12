@@ -205,8 +205,10 @@ int main(void) {
 
 进一步学习建议：
 
-1. **动手改**：给编译器加一个新语法（如 `do...while`），给内建类加一个新方法（如 `Math.max`）。
+1. **动手改**：给编译器加一个新语法（如正则字面量 `/.../`），给内建类加一个新方法（如 `String.prototype.reverse`）。
 2. **单步看**：用 `MARIO_DEBUG=yes` 编译，配合 `mario_debug` 观察执行流。
-3. **读测试**：`test/js/*.js` 是最好的行为规约，读它们并预测字节码，再用 `-a` 验证。
+3. **读测试**：`test/js/*.js` 是最好的行为规约，读它们并预测字节码，再用 `-a` 验证。尤其是 [`test/js/es6_full.js`](../../test/js/es6_full.js)，它是完整的 ES6+ 行为规约。
+
+作为一门 JavaScript，Mario 到底支持哪些 ES6+ 语法与内建对象？完整的特性矩阵、代码示例与已知限制见 [第 11 章 · ES6+ 语言特性支持](11-es6-support.md)。
 
 回到 [Wiki 首页](README.md)。

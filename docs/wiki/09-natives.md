@@ -4,22 +4,24 @@
 
 ## 9.1 内建类总览
 
-Mario 的 JS 前端自带一批内建类，分布在 [`lang/js/native/`](../../lang/js/native/)：
+Mario 的 JS 前端自带一大批内建类，分布在 [`lang/js/native/`](../../lang/js/native/)，覆盖从基础类型到 ES6+ 的元编程、二进制、弱引用等（完整的 ES6+ 内建对象清单与用法见 [第 11 章](11-es6-support.md)）：
 
 ```
 native/
-├── builtin/            # 语言级基础类
-│   ├── Object/         # Object
-│   ├── Error/          # Error
-│   ├── Array/          # Array：push/pop/length/...
-│   ├── String/         # String：substring/indexOf/...
-│   ├── Number/         # Number：toString(radix)
-│   ├── Console/        # console.log / console.write
-│   └── Promise/        # Promise
-└── natives/            # 扩展类
+├── builtin/            # 语言级基础类（reg_builtin_natives）
+│   ├── Object/  Error/  Array/  String/  Number/  Symbol/  Console/
+│   ├── Map/  Set/                     # 内含 WeakMap / WeakSet
+│   ├── Promise/                       # + async/await 运行时
+│   ├── Proxy/  Reflect/               # 元编程
+│   ├── BigInt/                        # 任意精度整数
+│   ├── ArrayBuffer/  DataView/  TypedArray/
+│   ├── SharedArrayBuffer/  Atomics/
+│   ├── WeakRef/  FinalizationRegistry/
+│   └── RegExp/
+└── natives/            # 扩展类（reg_natives）
     ├── JSON/           # JSON.stringify / JSON.parse
     ├── Date/           # Date
-    └── Math/           # Math（默认未编入，见 lang.mk 注释）
+    └── Math/           # Math
 ```
 
 注册入口分两级：
@@ -27,15 +29,18 @@ native/
 ```c
 // natives_all.c
 void reg_all_natives(vm_t* vm) {
-    reg_builtin_natives(vm);   // Object/Error/Array/String/Console/Number/Promise
-    load_basic_classes(vm);    // 把内建类指针缓存进 vm->builtin_vars，并创建 console 对象
-    reg_natives(vm);           // Date/JSON
+    reg_builtin_natives(vm);   // Object/Error/Array/String/Console/Number/BigInt/
+                               // ArrayBuffer/DataView/TypedArray/Promise/Map/Set/
+                               // Symbol/Proxy/Reflect/WeakRef/FinalizationRegistry/
+                               // SharedArrayBuffer/Atomics/RegExp
+    load_basic_classes(vm);    // 缓存常用类指针进 vm->builtin_vars，创建 console，注册 Infinity/NaN
+    reg_natives(vm);           // Math/Date/JSON
 }
 ```
 
 `reg_all_natives` 就是第 2 章里传给 `vm_init` 的 `on_init` 回调——VM 初始化时自动把所有内建类注册好。
 
-`load_basic_classes` 会把常用类的 `var_t*` 缓存进 `vm->builtin_vars`（`var_Object`/`var_String`/`var_Number`/`var_Array`/`var_Error`），并创建全局 `console` 对象：
+`load_basic_classes` 会把常用类的 `var_t*` 缓存进 `vm->builtin_vars`（`var_Object`/`var_String`/`var_Number`/`var_BigInt`/`var_Error`/`var_Array`），创建全局 `console` 对象，并注册全局常量 `Infinity` / `NaN`：
 
 ```c
 static inline void load_basic_classes(vm_t* vm) {
@@ -44,6 +49,8 @@ static inline void load_basic_classes(vm_t* vm) {
     ...
     var_t* console = new_obj(vm, "Console", 0);
     var_add(vm->root, "console", console);   // 全局 console
+    vm_reg_var(vm, NULL, "Infinity", var_new_float(vm, INFINITY), true);
+    vm_reg_var(vm, NULL, "NaN",      var_new_float(vm, NAN),      true);
 }
 ```
 
@@ -208,7 +215,7 @@ void reg_native_MyMath(vm_t* vm) {
 
 接入步骤：
 
-1. 在 [`lang/js/lang.mk`](../../lang/js/lang.mk) 的 `NATIVE_OBJS` 里加上你的 `.o`（Math 目录已有示例，默认被注释掉了）。
+1. 在 [`lang/js/lang.mk`](../../lang/js/lang.mk) 的 `NATIVE_OBJS` 里加上你的 `.o`（里面已列出全部内建类的 `.o`，照样子加一行即可）。
 2. 在 `reg_natives()`（`natives.c`）或 `reg_builtin_natives()` 里调用 `reg_native_MyMath(vm)`。
 3. `make` 重新编译。
 
@@ -240,4 +247,4 @@ vm_reg_var(vm, NULL, "VERSION", var_new_int(vm, 3), true);  // const
 - 内建类通过 `reg_all_natives` 在 VM 初始化时自动装载。
 - 扩展只需：写原生函数 → 注册 → 加进 `lang.mk` → 重新 `make`。
 
-最后一章 [第 10 章 · 字节码文件与工具链](10-mbc-and-tools.md)，讲预编译文件与如何把 Mario 嵌入你自己的程序。
+下一章 [第 10 章 · 字节码文件与工具链](10-mbc-and-tools.md)，讲预编译文件与如何把 Mario 嵌入你自己的程序；内建类的完整 ES6+ 清单与用法见 [第 11 章](11-es6-support.md)。
