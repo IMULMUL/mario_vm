@@ -649,6 +649,11 @@ int call_func(lex_t* l, bytecode_t* bc, bool* has_spread) {
             if (!lex_chkread(l, ',')) {
                 return -1;
             }
+            /* ES2017 trailing comma in call arguments: `f(a, b,)`. */
+            lex_skip_empty(l);
+            if (l->tk == ')') {
+                break;
+            }
         } else {
             break;
         }
@@ -3963,15 +3968,22 @@ bool stmt_try(lex_t* l, bytecode_t* bc) {
         }
 
         lex_skip_empty(l);
-        if (!lex_chkread(l, '(')) {
-            return false;
-        }
-        bc_gen_str(bc, INSTR_CATCH, l->tk_str->cstr);
-        if (!lex_chkread(l, LEX_ID)) {
-            return false;
-        }
-        if (!lex_chkread(l, ')')) {
-            return false;
+        if (l->tk == '(') {
+            if (!lex_chkread(l, '(')) {
+                return false;
+            }
+            bc_gen_str(bc, INSTR_CATCH, l->tk_str->cstr);
+            if (!lex_chkread(l, LEX_ID)) {
+                return false;
+            }
+            if (!lex_chkread(l, ')')) {
+                return false;
+            }
+        } else {
+            /* ES2019 optional catch binding: `catch { ... }`. The thrown
+             * value still has to be popped off the stack, so bind it to a
+             * name no JS identifier can ever match. */
+            bc_gen_str(bc, INSTR_CATCH, "");
         }
         lex_skip_empty(l);
         if (!statement(l, bc)) {
