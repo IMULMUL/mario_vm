@@ -4087,6 +4087,10 @@ void vm_throw(vm_t* vm, const char *format, ...) {
 
 	scope_t* try_sc = vm_get_try_catch_scope(vm);
 	if(try_sc == NULL) {
+		/* Nobody handles this throw: report it like a browser console
+		 * would, then drop it - silently swallowing leaves the page
+		 * misbehaving with no diagnostic at all. */
+		mario_printf("Uncaught Error: %s\n", message);
 		vm_pop(vm);
 		return;
 	}
@@ -4189,6 +4193,8 @@ void vm_throw_type(vm_t* vm, const char* type_name, const char* format, ...) {
 
 	scope_t* try_sc = vm_get_try_catch_scope(vm);
 	if(try_sc == NULL) {
+		/* Unhandled: surface it like a console would (see vm_throw). */
+		mario_printf("Uncaught %s: %s\n", type_name, message);
 		vm_pop(vm);
 		return;
 	}
@@ -8575,7 +8581,14 @@ static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	while(true) {
 		scope_t* sc = vm_get_scope(vm);
 		if(sc == NULL) {
-			mario_printf("Error: 'throw' not in any try...catch!\n");
+			/* Unhandled user throw: report the value like a console would,
+			 * then abort this script run only (vm_terminate resets on the
+			 * next vm_run). */
+			var_t* tv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
+			mstr_t* es = mstr_new("");
+			var_to_str(tv, es);
+			mario_printf("Uncaught %s\n", es->cstr);
+			mstr_free(es);
 			vm_terminate(vm);
 			break;
 		}
