@@ -3994,6 +3994,21 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 	node_t* ret = NULL;
 	scope_t* sc = vm_get_scope(vm);
 	if(sc != NULL && sc->is_func) {
+		/* The function's own call env (params, locals, `this`, `arguments`)
+		 * outranks every captured lexical env. With definition-time capture
+		 * (handle_func) a function whose DEFINING scope carries a `this`
+		 * member (any env captured while a bare call inherited a non-NULL
+		 * this) otherwise resolves `this`/param names from the captured env
+		 * instead of the call-time binding: Reflect.apply's thisArg and a
+		 * constructor's fresh instance were both shadowed by the defining
+		 * IIFE's `this` (es6_full.js Proxy/Reflect failures). ES scope-chain
+		 * order is own scope first, then outward; the closure walk below and
+		 * the deferred walk in the scope-stack loop still find free vars. */
+		if(!var_empty(sc->var)) {
+			ret = var_find_own_member(sc->var, name);
+			if(ret != NULL)
+				return ret;
+		}
 		var_t* closure = sc->func->closure.var;
 		func_t* closure_func = sc->func->closure.func;
 		int chain_guard = 0;
@@ -6913,6 +6928,22 @@ static inline void handle_func(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 				func_bind_closure_func(f, (s != NULL && s->is_func) ? s->func : NULL);
 			}
 		}
+		/* Definition-time capture for every function defined directly in a
+		 * function scope. Without it, a function that escapes by member store
+		 * (window.Foo = D; D.prototype.load = function(){...} - the universal
+		 * library/UMD pattern) instead of by `return` never captures its
+		 * lexical env: handle_return's func_set_closure() only fires for the
+		 * returned value, so once the defining IIFE scope pops, the stored
+		 * function's closure.var stays NULL and its free-variable lookups fall
+		 * through to the caller's scope chain - "can not find function 'M'/'u'"
+		 * on fontfaceobserver.js (w3.org). The GC hazards that originally
+		 * disabled this (live-subtree sweeps through closure links, cyclic
+		 * closure.func chains) are fixed: gc_mark() walks closure.var and the
+		 * whole closure.func chain with its visited guard, and
+		 * func_bind_closure_func() pins the outer func_t's owner var and
+		 * rejects cycles. Runs after the block-scope branch above and is a
+		 * no-op when that branch already captured (closure.var != NULL). */
+		vm_capture_closure(vm, v);
 		vm_push(vm, v);
 	}
 }
