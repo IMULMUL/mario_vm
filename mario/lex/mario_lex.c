@@ -76,15 +76,69 @@ void lex_get_nextch(lex_t* lex) {
 	lex->data_pos++;
 }
 
-void lex_skip_whitespace(lex_t* lex) {
-	while (lex->curr_ch && is_whitespace(lex->curr_ch)){
+/* Peek the byte right after next_ch (the third byte of lookahead; the read
+ * head invariant is curr_ch == data[data_pos-2], next_ch == data[data_pos-1]).
+ * data is NUL-terminated, so one byte past data_end is still a safe read. */
+static unsigned char lex_peek3(lex_t* lex) {
+	if (lex->data_pos < lex->data_end)
+		return (unsigned char)lex->data[lex->data_pos];
+	return 0;
+}
+
+/* Consume one UTF-8 encoded Unicode whitespace code point at the read head.
+ * Web pages routinely carry these inside inline scripts and minified bundles:
+ * U+00A0 NBSP, U+FEFF (BOM / zero-width nbsp), U+1680, U+2000..U+200A,
+ * U+2028/U+2029, U+202F, U+205F, U+3000. Without this the lexer dies with
+ * "?[UNKNOW]" on the first byte of the sequence. */
+static bool lex_skip_unicode_space(lex_t* lex) {
+	unsigned char c0 = (unsigned char)lex->curr_ch;
+	unsigned char c1 = (unsigned char)lex->next_ch;
+	unsigned char c2;
+	int n = 0;
+
+	if (c0 == 0xC2 && c1 == 0xA0)                    /* U+00A0 NO-BREAK SPACE */
+		n = 2;
+	else {
+		c2 = lex_peek3(lex);
+		if (c0 == 0xE1 && c1 == 0x9A && c2 == 0x80)               /* U+1680 */
+			n = 3;
+		else if (c0 == 0xE2 && c1 == 0x80 &&
+				((c2 >= 0x80 && c2 <= 0x8A) || c2 == 0xA8 || c2 == 0xA9 || c2 == 0xAF))
+			n = 3;                                  /* U+2000-200A, U+2028, U+2029, U+202F */
+		else if (c0 == 0xE2 && c1 == 0x81 && c2 == 0x9F)          /* U+205F */
+			n = 3;
+		else if (c0 == 0xE3 && c1 == 0x80 && c2 == 0x80)          /* U+3000 */
+			n = 3;
+		else if (c0 == 0xEF && c1 == 0xBB && c2 == 0xBF)          /* U+FEFF */
+			n = 3;
+	}
+
+	if (n == 0)
+		return false;
+	while (n-- > 0)
 		lex_get_nextch(lex);
+	return true;
+}
+
+void lex_skip_whitespace(lex_t* lex) {
+	while (lex->curr_ch){
+		if (is_whitespace(lex->curr_ch)) {
+			lex_get_nextch(lex);
+			continue;
+		}
+		if (!lex_skip_unicode_space(lex))
+			break;
 	}
 }
 
 void lex_skip_space(lex_t* lex) {
-	while (lex->curr_ch && is_space(lex->curr_ch)){
-		lex_get_nextch(lex);
+	while (lex->curr_ch){
+		if (is_space(lex->curr_ch)) {
+			lex_get_nextch(lex);
+			continue;
+		}
+		if (!lex_skip_unicode_space(lex))
+			break;
 	}
 }
 

@@ -322,6 +322,8 @@ typedef struct st_bytecode {
 #define INSTR_URSHIFTEQ    0x085 // URSHIFTEQ : `>>>=` unsigned-right-shift assignment
 #define INSTR_SCOR         0x086 // SCOR  : short-circuit `||` (LHS truthy -> keep LHS, jump past RHS; else pop LHS, eval RHS)
 #define INSTR_SCAND        0x087 // SCAND : short-circuit `&&` (LHS falsy  -> keep LHS, jump past RHS; else pop LHS, eval RHS)
+#define INSTR_NEWX         0x088 // NEWX $n: construct with the constructor VALUE on the stack below its n args (`new (expr)(args)`)
+#define INSTR_NEWX_SPREAD  0x089 // NEWX_SPREAD : pop args array, construct with the constructor value beneath it (runtime arity)
 
 #define INSTR_MAX          0x090 // Maximum instruction opcode value
 
@@ -639,6 +641,7 @@ typedef struct st_vm {
 	uint32_t            gen_depth;
 	var_t*              root;
 	var_t*              new_target; // ES6 `new.target`: the constructor of the in-progress `new`; consumed (bound into env, then cleared) by func_call
+	const char*         dbg_tag;    // optional embedder tag (e.g. current script id) printed with uncaught errors
 	int32_t             to_str_depth; // guards var_to_str's object->toString() call against unbounded re-entrancy
 	int32_t             call_depth;   // live script func_call frames; func_call raises RangeError at MARIO_MAX_CALL_DEPTH so runaway recursion can't overflow the native thread stack
 

@@ -22,6 +22,26 @@ var_t* native_Number_constructor(vm_t* vm, var_t* env, void* data) {
 			case V_FLOAT:   this_v = var_new_float(vm, var_get_float(v)); break;
 			case V_FLOAT64: this_v = var_new_float64(vm, var_get_float64(v)); break;
 			case V_BIGINT:  this_v = var_new_float64(vm, var_get_float64(v)); break; // Number(bigint) -> nearest double
+			case V_STRING: {
+			        /* Number(str): strtod covers leading whitespace, decimal,
+			         * hex ("0x10") and Infinity; empty/unparseable -> 0/NaN per C. */
+			        const char* sv = var_get_str(v);
+			        char* end = NULL;
+			        double d = strtod(sv, &end);
+			        if(end == sv) {
+			                /* No conversion: empty/whitespace-only -> +0, junk -> NaN. */
+			                const char* p = sv;
+			                while(*p==' '||*p=='\t'||*p=='\n'||*p=='\r'||*p=='\f'||*p=='\v') p++;
+			                if(*p == '\0')
+			                        this_v = var_new_int(vm, 0);
+			                else
+			                        this_v = var_new_float64(vm, 0.0/0.0);
+			        }
+			        else
+			                this_v = var_new_float64(vm, d);
+			        break;
+			}
+			case V_BOOL:    this_v = var_new_int(vm, var_get_int(v)); break;
 			default: break;
 		}
 	}

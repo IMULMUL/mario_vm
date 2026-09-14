@@ -485,7 +485,35 @@ const char* lex_get_token_str(int token, char* str) {
     return "?[UNKNOW]";
 }
 
+/** Function-declaration hoisting (ES5 semantics): a `function f(){}`
+ * declaration binds its name at the top of the enclosing statement sequence
+ * (script body, function body or plain block), so calls textually before the
+ * declaration resolve. Minified bundles rely on this everywhere.
+ *
+ * Strategy: before a statement sequence is compiled, hoist_begin() runs a
+ * quiet scan pass over it: function declarations are redirected into the REAL
+ * bytecode (via g_funcdecl_bc) while everything else is parsed into a scratch
+ * buffer and discarded. The real pass then compiles normally with declarations
+ * redirected to the scratch buffer, so each is emitted exactly once at the top.
+ * The scan pass is best effort: a parse error only truncates hoisting - the
+ * real pass reports the error. */
+static bytecode_t* g_funcdecl_bc = NULL; /* redirect target for declarations */
+static bytecode_t* g_vardecl_bc = NULL;  /* var-declaration hoist target */
+static bool g_hoist_quiet = false;       /* true while the scan pass parses */
+
+/* Embedder hook: silence all compile diagnostics (used by eval's speculative
+ * expression-form attempt, where a statement-shaped body is EXPECTED to fail
+ * and be retried as statements). hoist_begin saves/restores this flag around
+ * its scan pass, so the setting survives a full js_compile unchanged. */
+void js_compile_set_quiet(bool quiet) { g_hoist_quiet = quiet; }
+static void hoist_begin(lex_t* l, bytecode_t* bc, bytecode_t* scratch, bool block, bool func,
+                        bytecode_t** saved_redirect, bytecode_t** saved_vardecl);
+static void hoist_end(bytecode_t* scratch, bytecode_t* saved_redirect, bytecode_t* saved_vardecl);
+
 void compile_error_pos(lex_t* l, int pos) {
+    if (g_hoist_quiet) {
+        return;
+    }
     int line = 1;
     int col;
 
@@ -512,8 +540,10 @@ bool lex_chkread(lex_t* lex, uint32_t expected_tk) { //check read with empty lin
         const char* stk = lex_get_token_str(lex->tk, s_tk);
         const char* sexp = lex_get_token_str(expected_tk, s_expect);
 
-        mario_printf("lex got '%s' expected '%s'! ", stk, sexp);
-        compile_error_pos(lex, -1);
+        if (!g_hoist_quiet) {
+            mario_printf("lex got '%s' expected '%s'! ", stk, sexp);
+            compile_error_pos(lex, -1);
+        }
         return false;
     }
     lex_get_next_token(lex);
@@ -684,8 +714,10 @@ bool stmt_loop_block(lex_t* l, bytecode_t* bc) {
             /* Safety net: a statement that consumed nothing (unhandled
              * token) would spin this loop forever - fail instead. */
             if (l->data_pos == prev_pos && l->tk == prev_tk) {
-                mario_printf("compile error: unexpected token, made no progress! ");
-                compile_error_pos(l, -1);
+                if (!g_hoist_quiet) {
+                    mario_printf("compile error: unexpected token, made no progress! ");
+                    compile_error_pos(l, -1);
+                }
                 return false;
             }
         }
@@ -710,18 +742,31 @@ bool stmt_block(lex_t* l, bytecode_t* bc, bool func) {
         bc_gen(bc, INSTR_BLOCK);
     }
 
+    /* Hoist function declarations to the top of the block (ES5 semantics). */
+    bytecode_t scratch;
+    bytecode_t* saved_redirect;
+    bytecode_t* saved_vardecl;
+    hoist_begin(l, bc, &scratch, true, func, &saved_redirect, &saved_vardecl);
+
+    bool ok = true;
     while (l->tk && l->tk != '}') {
         int32_t prev_pos = l->data_pos;
         uint32_t prev_tk = l->tk;
         if (!statement(l, bc)) {
-            return false;
+            ok = false;
+            break;
         }
         /* Safety net: never loop forever on a token statement() ignores. */
         if (l->data_pos == prev_pos && l->tk == prev_tk) {
             mario_printf("compile error: unexpected token, made no progress! ");
             compile_error_pos(l, -1);
-            return false;
+            ok = false;
+            break;
         }
+    }
+    hoist_end(&scratch, saved_redirect, saved_vardecl);
+    if (!ok) {
+        return false;
     }
     if (!lex_chkread(l, '}')) {
         return false;
@@ -853,6 +898,66 @@ static int g_async_pending = 0;
  * to emit INSTR_CALLXO (bind that receiver as `this`) instead of INSTR_CALLX. */
 static int g_arrat_recv = 0;
 
+/** Scan pass for function-declaration hoisting: parses the statement sequence
+ * ahead (a block body up to its `}`, or the rest of the script) into `scratch`,
+ * with function declarations redirected into the real `bc` so they are emitted
+ * once at the sequence top. The lexer is restored to the sequence start and
+ * declarations are redirected to `scratch` for the real pass that follows, so
+ * they are parsed but not re-emitted. Returns the previous redirect target for
+ * hoist_end(). Global codegen state touched by a (possibly failed) scan is
+ * restored so the real pass starts clean. */
+static void hoist_begin(lex_t* l, bytecode_t* bc, bytecode_t* scratch, bool block, bool func,
+                        bytecode_t** out_redirect, bytecode_t** out_vardecl) {
+    bc_init(scratch);
+    *out_redirect = g_funcdecl_bc;
+    *out_vardecl = g_vardecl_bc;
+    bool saved_quiet = g_hoist_quiet;
+    int saved_async_pend = g_async_pending;
+    int saved_async_depth = g_async_depth;
+    int saved_arrat = g_arrat_recv;
+
+    lex_t saved = *l;
+    mstr_t* saved_str = mstr_new(l->tk_str->cstr);
+    g_funcdecl_bc = bc;
+    /* ES5 `var` declarations hoist to the enclosing function/script top. A
+     * function body or the script top level becomes the hoist target; plain
+     * nested blocks inherit the enclosing target so `if(x){var o=1}` still
+     * binds o at the function level (matching handle_var's runtime scope). */
+    if (func || !block) {
+        g_vardecl_bc = bc;
+    }
+    g_hoist_quiet = true;
+    while (l->tk != LEX_EOF && (!block || l->tk != '}')) {
+        int32_t prev_pos = l->data_pos;
+        uint32_t prev_tk = l->tk;
+        if (!statement(l, scratch)) {
+            break;
+        }
+        /* Same no-progress safety net as the real loops. */
+        if (l->tk != LEX_EOF && l->data_pos == prev_pos && l->tk == prev_tk) {
+            break;
+        }
+    }
+    g_async_pending = saved_async_pend;
+    g_async_depth = saved_async_depth;
+    g_arrat_recv = saved_arrat;
+    g_hoist_quiet = saved_quiet;
+    *l = saved;
+    mstr_cpy(l->tk_str, saved_str->cstr);
+    mstr_free(saved_str);
+
+    /* The real pass emits declarations into the scratch buffer instead, and
+     * declares vars in place (the hoisted declaration already bound them). */
+    g_funcdecl_bc = scratch;
+    g_vardecl_bc = NULL;
+}
+
+static void hoist_end(bytecode_t* scratch, bytecode_t* saved_redirect, bytecode_t* saved_vardecl) {
+    g_funcdecl_bc = saved_redirect;
+    g_vardecl_bc = saved_vardecl;
+    bc_release(scratch);
+}
+
 /** Parse a function's parameter list (starting at '(') and body, emitting the
  *  argument-name instructions expected by func_def plus the body bytecode.
  *  Supports ES6 default parameters and a trailing rest parameter. The caller
@@ -923,13 +1028,18 @@ bool func_params_and_body(lex_t* l, bytecode_t* bc) {
             continue;
         }
 
-        if (l->tk != LEX_ID) {
+        if (l->tk != LEX_ID && l->tk != LEX_R_UNDEFINED) {
+            /* `undefined` is not a reserved word in ES5 - it is an ordinary
+             * identifier, so `function(exports, undefined){}` is legal (a
+             * classic pattern to secure a local undefined). Accept it as a
+             * parameter name; value uses still compile to INSTR_UNDEF, which
+             * matches the runtime value of an unpassed parameter. */
             break;
         }
         mstr_t* pname = mstr_new(l->tk_str->cstr);
         bc_gen_str(bc, INSTR_LOAD, pname->cstr); // argument name for func_def
         positional++;
-        if (!lex_chkread(l, LEX_ID)) {
+        if (!lex_chkread(l, l->tk)) {
             mstr_free(pname);
             break;
         }
@@ -1284,6 +1394,72 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
             return true;
         }
         return false;
+    }
+    /* `new (expr)(args)`: the constructor is a computed expression rather than
+     * a named binding (`new (cond ? A : B)(x)`, `new (function(){...})()`).
+     * Compile the expression, then the argument list; NEWX picks the
+     * constructor value off the stack (the CALLX equivalent for [[Construct]]). */
+    if (l->tk == '(') {
+        if (!lex_chkread(l, '(')) {
+            return false;
+        }
+        lex_skip_empty(l);
+        if (!base(l, bc)) {
+            return false;
+        }
+        lex_skip_empty(l);
+        if (!lex_chkread(l, ')')) {
+            return false;
+        }
+        int arg_num = 0;
+        bool has_spread = false;
+        if (l->tk == '(') {
+            arg_num = call_func(l, bc, &has_spread);
+            if (arg_num < 0) {
+                return false;
+            }
+        }
+        if (has_spread) {
+            bc_gen_str(bc, INSTR_NEWX_SPREAD, "");
+        } else {
+            mstr_t* s = mstr_new("");
+            gen_func_name("", arg_num, s);
+            bc_gen_str(bc, INSTR_NEWX, s->cstr);
+            mstr_free(s);
+        }
+        return true;
+    }
+    /* `new function(args){...}` / `new function name(args){...}`: an anonymous
+     * (or named) function expression as the constructor - ES5 allows any
+     * MemberExpression after `new`. Compile the function value, then the
+     * optional argument list; NEWX constructs from the value on the stack. */
+    if (l->tk == LEX_R_FUNCTION) {
+        if (!lex_chkread(l, LEX_R_FUNCTION)) {
+            return false;
+        }
+        mstr_t* fname = mstr_new("");
+        if (!factor_def_func(l, bc, fname)) {
+            mstr_free(fname);
+            return false;
+        }
+        mstr_free(fname);
+        int arg_num = 0;
+        bool has_spread = false;
+        if (l->tk == '(') {
+            arg_num = call_func(l, bc, &has_spread);
+            if (arg_num < 0) {
+                return false;
+            }
+        }
+        if (has_spread) {
+            bc_gen_str(bc, INSTR_NEWX_SPREAD, "");
+        } else {
+            mstr_t* s = mstr_new("");
+            gen_func_name("", arg_num, s);
+            bc_gen_str(bc, INSTR_NEWX, s->cstr);
+            mstr_free(s);
+        }
+        return true;
     }
     mstr_t* class_name = mstr_new("");
     mstr_cpy(class_name, l->tk_str->cstr);
@@ -1921,16 +2097,20 @@ static bool lex_scan_regex(lex_t* l, mstr_t* pat, mstr_t* flags) {
     while (true) {
         char c = l->curr_ch;
         if (c == 0 || c == '\n') {
-            mario_printf("unterminated regex literal! ");
-            compile_error_pos(l, -1);
+            if (!g_hoist_quiet) {
+                mario_printf("unterminated regex literal! ");
+                compile_error_pos(l, -1);
+            }
             return false;
         }
         if (c == '\\') {
             mstr_add(pat, c);
             lex_get_nextch(l);
             if (l->curr_ch == 0) {
-                mario_printf("unterminated regex literal! ");
-                compile_error_pos(l, -1);
+                if (!g_hoist_quiet) {
+                    mario_printf("unterminated regex literal! ");
+                    compile_error_pos(l, -1);
+                }
                 return false;
             }
             mstr_add(pat, l->curr_ch);
@@ -2164,7 +2344,9 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
     } else if (l->tk == LEX_R_CLASS) { //define class
         factor_def_class(l, bc);
     } else if (l->tk == LEX_R_NEW) { //new object
-        factor_new(l, bc);
+        if (!factor_new(l, bc)) {
+            return false;
+        }
     } else if (l->tk == '{') { // JSON-style object definition
         factor_json(l, bc);
     } else if (l->tk == '[') { // JSON-style array 
@@ -2421,8 +2603,28 @@ bool unary(lex_t* l, bytecode_t* bc) {
         if (!unary(l, bc)) {
             return false;
         }
-    } else if (!factor(l, bc, false)) {
-        return false;
+    } else {
+        if (!factor(l, bc, false)) {
+            return false;
+        }
+        /* Postfix `x++` / `x--`: binds tighter than the multiplicative level
+         * (so `x++ % 3` parses as `(x++) % 3`) and looser than the member/call
+         * chain inside factor. Same subscript/member write-retargeting as the
+         * prefix form, so a proxy member yields its @@proxyslot sentinel. */
+        if (l->tk == LEX_PLUSPLUS || l->tk == LEX_MINUSMINUS) {
+            bool is_inc = (l->tk == LEX_PLUSPLUS);
+            if (!lex_chkread(l, l->tk)) {
+                return false;
+            }
+            if (bc->cindex > 0) {
+                PC last = bc->code_buf[bc->cindex - 1];
+                if (OP(last) == INSTR_ARRAY_AT)
+                    bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+                else if (OP(last) == INSTR_GET)
+                    bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
+            }
+            bc_gen(bc, is_inc ? INSTR_PPLUS : INSTR_MMINUS);
+        }
     }
 
     if (is_void) {
@@ -2525,41 +2727,20 @@ bool expr(lex_t* l, bytecode_t* bc) {
         bc_gen(bc, INSTR_MMINUS_PRE);
     }
 
-    while (l->tk == '+' || l->tk == '-' ||
-           l->tk == LEX_PLUSPLUS || l->tk == LEX_MINUSMINUS) {
+    while (l->tk == '+' || l->tk == '-') {
+        /* Postfix ++/-- is handled at the unary level (right after factor),
+         * so it binds tighter than the multiplicative operators. */
         int op = l->tk;
         if (!lex_chkread(l, l->tk)) {
             return false;
         }
-        if (op == LEX_PLUSPLUS) {
-            /* Postfix `a[i]++` / `a.x++`: same subscript/member retarget as the
-             * prefix form, so a proxy member yields its @@proxyslot sentinel. */
-            if (bc->cindex > 0) {
-                PC last = bc->code_buf[bc->cindex - 1];
-                if (OP(last) == INSTR_ARRAY_AT)
-                    bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
-                else if (OP(last) == INSTR_GET)
-                    bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
-            }
-            bc_gen(bc, INSTR_PPLUS);
-        } else if (op == LEX_MINUSMINUS) {
-            if (bc->cindex > 0) {
-                PC last = bc->code_buf[bc->cindex - 1];
-                if (OP(last) == INSTR_ARRAY_AT)
-                    bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
-                else if (OP(last) == INSTR_GET)
-                    bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
-            }
-            bc_gen(bc, INSTR_MMINUS);
+        if (!term(l, bc)) {
+            return false;
+        }
+        if (op == '+') {
+            bc_gen(bc, INSTR_PLUS);
         } else {
-            if (!term(l, bc)) {
-                return false;
-            }
-            if (op == '+') {
-                bc_gen(bc, INSTR_PLUS);
-            } else if (op == '-') {
-                bc_gen(bc, INSTR_MINUS);
-            }
+            bc_gen(bc, INSTR_MINUS);
         }
     }
 
@@ -2953,6 +3134,9 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
             }
             if (decl_op) {
                 bc_gen_str(bc, decl_op, target);
+                if (g_vardecl_bc != NULL && decl_op == INSTR_VAR) {
+                    bc_gen_str(g_vardecl_bc, INSTR_VAR, target); // ES5 var hoisting
+                }
             }
             bc_gen_str(bc, INSTR_LOAD, target);
             bc_gen_str(bc, INSTR_LOAD, src);
@@ -3072,6 +3256,9 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
         } else {
             if (decl_op) {
                 bc_gen_str(bc, decl_op, target);
+                if (g_vardecl_bc != NULL && decl_op == INSTR_VAR) {
+                    bc_gen_str(g_vardecl_bc, INSTR_VAR, target); // ES5 var hoisting
+                }
             }
             bc_gen_str(bc, INSTR_LOAD, target);
             bc_gen_str(bc, INSTR_LOAD, src);
@@ -3203,6 +3390,11 @@ bool stmt_var(lex_t* l, bytecode_t* bc) {
             return false;
         }
         bc_gen_str(bc, op, vname->cstr);
+        if (g_vardecl_bc != NULL && op == INSTR_VAR) {
+            /* ES5 var hoisting: the scan pass also declares the name at the
+             * enclosing function/script top; the initializer stays in place. */
+            bc_gen_str(g_vardecl_bc, INSTR_VAR, vname->cstr);
+        }
         // sort out initialiser
         if (l->tk == '=') {
             if (!lex_chkread(l, '=')) {
@@ -3406,6 +3598,9 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
     // Generate variable declaration bytecode for loop variable
     if (loop_var) {
         bc_gen_str(bc, var_op, loop_var->cstr);
+        if (g_vardecl_bc != NULL && var_op == INSTR_VAR) {
+            bc_gen_str(g_vardecl_bc, INSTR_VAR, loop_var->cstr); // ES5 var hoisting
+        }
     }
     
     // Initialize index to 0
@@ -3491,6 +3686,9 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
     // declare the loop variable
     if (loop_var) {
         bc_gen_str(bc, var_op, loop_var->cstr);
+        if (g_vardecl_bc != NULL && var_op == INSTR_VAR) {
+            bc_gen_str(g_vardecl_bc, INSTR_VAR, loop_var->cstr); // ES5 var hoisting
+        }
     }
 
     /* Destructuring loop variable (`for (const [k,v] of ..)`): declare the
@@ -3644,6 +3842,11 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             // Generate variable declaration bytecode
             if (loop_var) {
                 bc_gen_str(bc, var_op, loop_var->cstr);
+                if (g_vardecl_bc != NULL && var_op == INSTR_VAR) {
+                    /* ES5 var hoisting: `for(var i=...)` declares i at the
+                     * enclosing function/script top too. */
+                    bc_gen_str(g_vardecl_bc, INSTR_VAR, loop_var->cstr);
+                }
                 /* ES6 for-let/const: declare the loop-scope temp that shuttles
                  * the loop variable in/out of the per-iteration block below. */
                 if (var_op != INSTR_VAR) {
@@ -3674,6 +3877,9 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
                 mstr_t* extra = mstr_new(l->tk_str->cstr);
                 lex_chkread(l, LEX_ID);
                 bc_gen_str(bc, var_op, extra->cstr);
+                if (g_vardecl_bc != NULL && var_op == INSTR_VAR) {
+                    bc_gen_str(g_vardecl_bc, INSTR_VAR, extra->cstr); // ES5 var hoisting
+                }
                 if (l->tk == '=') {
                     lex_chkread(l, '=');
                     bc_gen_str(bc, INSTR_LOAD, extra->cstr);
@@ -3737,14 +3943,12 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             mstr_free(l->tk_str);
             *l = saved;                     // not for-in/of: full restore
         }
-        // Standard for loop init statement (it consumes its own ';'
-        // terminator; tolerate one it may have left behind).
+        // Standard for loop init statement. statement() consumes the init's
+        // own ';' terminator, so the token that follows belongs to the
+        // CONDITION clause; eating another ';' here would swallow the
+        // condition separator of `for (i = 1;;)` and strand the parse.
         if (!statement(l, bc)) {
             return false;
-        }
-        lex_skip_empty(l);
-        if (l->tk == ';') {
-            lex_chkread(l, ';');
         }
         lex_skip_empty(l);
     }
@@ -3948,7 +4152,10 @@ bool stmt_throw(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, LEX_R_THROW)) {
         return false;
     }
-    if (!base(l, bc)) {
+    /* `throw a, b` is a comma expression like `return a, b`: base() alone
+     * would stop at the ',' and strand the statement (regenerator-transpiled
+     * generators emit `throw y = !0, n;`). */
+    if (!expr_seq(l, bc)) {
         return false;
     }
     if (!lex_chkread_stmt_end(l)) {
@@ -4312,6 +4519,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                l->tk == LEX_PLUSPLUS ||
                l->tk == LEX_MINUSMINUS ||
                l->tk == '(' || l->tk == '!' || l->tk == LEX_R_NEW ||
+               l->tk == '/' || l->tk == LEX_DIVEQUAL ||
                l->tk == LEX_R_AWAIT || l->tk == LEX_R_DELETE ||
                l->tk == LEX_R_NULL || l->tk == LEX_R_UNDEFINED ||
                l->tk == LEX_R_TRUE || l->tk == LEX_R_FALSE ||
@@ -4339,7 +4547,10 @@ bool statement(lex_t* l, bytecode_t* bc) {
         factor_def_class(l, bc);
        	pop = true;
     } else if (l->tk == LEX_R_FUNCTION) {
-        if (!stmt_function(l, bc)) {
+        /* A declaration, never an expression (a statement cannot start with a
+         * function expression). During hoisting this may be redirected into the
+         * real bytecode (scan pass) or the scratch buffer (main pass). */
+        if (!stmt_function(l, g_funcdecl_bc != NULL ? g_funcdecl_bc : bc)) {
             return false;
         }
     } else if (l->tk == LEX_R_ASYNC) {
@@ -4355,8 +4566,9 @@ bool statement(lex_t* l, bytecode_t* bc) {
             }
             mstr_t* fname = mstr_new("");
             g_async_pending = 1;
-            factor_def_func(l, bc, fname);
-            bc_gen_str(bc, INSTR_MEMBERN, fname->cstr);
+            bytecode_t* dbc = (g_funcdecl_bc != NULL) ? g_funcdecl_bc : bc;
+            factor_def_func(l, dbc, fname);
+            bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);
             mstr_free(fname);
         } else {
             g_async_pending = 1;
@@ -4426,7 +4638,13 @@ bool js_compile(bytecode_t *bc, const char* input) {
     lex_t lex;
     lex_init(&lex, input);
     lex_get_next_token(&lex);
-    
+
+    /* Hoist top-level function declarations (ES5 semantics). */
+    bytecode_t scratch;
+    bytecode_t* saved_redirect;
+    bytecode_t* saved_vardecl;
+    hoist_begin(&lex, bc, &scratch, false, false, &saved_redirect, &saved_vardecl);
+
     bool ret = true;
     while (lex.tk != LEX_EOF && ret) {
         int32_t prev_pos = lex.data_pos;
@@ -4438,10 +4656,12 @@ bool js_compile(bytecode_t *bc, const char* input) {
          * forever in this loop. */
         if (ret && lex.tk != LEX_EOF &&
             lex.data_pos == prev_pos && lex.tk == prev_tk) {
-            mario_printf("compile error: unexpected token, made no progress! ");
+            if (!g_hoist_quiet)
+                mario_printf("compile error: unexpected token, made no progress! ");
             ret = false;
         }
     }
+    hoist_end(&scratch, saved_redirect, saved_vardecl);
     
     if (ret) {
         bc_gen(bc, INSTR_END);

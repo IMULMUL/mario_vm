@@ -4161,7 +4161,9 @@ void vm_throw(vm_t* vm, const char *format, ...) {
 		/* Nobody handles this throw: report it like a browser console
 		 * would, then drop it - silently swallowing leaves the page
 		 * misbehaving with no diagnostic at all. */
-		mario_printf("Uncaught Error: %s\n", message);
+		char tagsfx[160] = {0};
+		if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
+		mario_printf("Uncaught Error: %s%s\n", message, tagsfx);
 		vm_pop(vm);
 		return;
 	}
@@ -4265,7 +4267,9 @@ void vm_throw_type(vm_t* vm, const char* type_name, const char* format, ...) {
 	scope_t* try_sc = vm_get_try_catch_scope(vm);
 	if(try_sc == NULL) {
 		/* Unhandled: surface it like a console would (see vm_throw). */
-		mario_printf("Uncaught %s: %s\n", type_name, message);
+		char tagsfx[160] = {0};
+		if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
+		mario_printf("Uncaught %s: %s%s\n", type_name, message, tagsfx);
 		vm_pop(vm);
 		return;
 	}
@@ -4589,7 +4593,9 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		 * (redirecting vm->pc to an ancestor catch across live C frames) desyncs
 		 * the value stack. A runaway recursion is a broken script, so killing the
 		 * run is the correct, stable outcome. */
-		mario_printf("Uncaught RangeError: Maximum call stack size exceeded\n");
+		char tagsfx[160] = {0};
+		if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
+		mario_printf("Uncaught RangeError: Maximum call stack size exceeded%s\n", tagsfx);
 		vm_terminate(vm);
 		ret = NULL;
 	}
@@ -5406,11 +5412,14 @@ static void do_extends(vm_t* vm, var_t* cls_var, const char* super_name) {
 }
 
 /** create object by classname or function */
-var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
+/* Construct an instance from a constructor VALUE (class var or constructor
+ * function). Shared by new_obj() (constructor named by a scope binding) and
+ * handle_newx()/handle_newx_spread() (`new (expr)(args)`, where the
+ * constructor is a computed value on the stack). */
+var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_num, bool plain_call) {
 	var_t* obj = NULL;
-	node_t* n = vm_load_node(vm, name, false); //load class;
 
-	if(n == NULL || n->var->type != V_OBJECT) {
+	if(ctor_var == NULL || ctor_var->type != V_OBJECT) {
 		mario_debug("Error: There is no class: '%s'!\n", name);
 		vm_throw(vm, "there is no class: '%s'!", name);
 		return NULL;
@@ -5421,7 +5430,7 @@ var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
 	 * compiler already pushed arg_num args (natural order, argN on top); collect
 	 * them into an array and hand off to proxy_construct, which returns at baseline
 	 * refs just like the ordinary path. */
-	if(var_is_proxy(n->var)) {
+	if(var_is_proxy(ctor_var)) {
 		vm->gc.gc_defer++;
 		var_t* pargs = var_new_array(vm);
 		for(int i = 0; i < arg_num; i++) {
@@ -5430,18 +5439,18 @@ var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
 			if(a != NULL) var_unref(a);
 		}
 		var_array_reverse(pargs);
-		obj = proxy_construct(vm, n->var, pargs, n->var);
+		obj = proxy_construct(vm, ctor_var, pargs, ctor_var);
 		var_unref(pargs);
 		vm->gc.gc_defer--;
 		return obj;
 	}
 
-	var_t* protoV = var_get_prototype(n->var);
+	var_t* protoV = var_get_prototype(ctor_var);
 	obj = var_new_obj(vm, protoV, NULL, NULL);
 	var_t* constructor = NULL;
 
-	if(n->var->is_func) { // new object built by function call
-		constructor = n->var;
+	if(ctor_var->is_func) { // new object built by function call
+		constructor = ctor_var;
 	}
 	else {
 		constructor = var_find_member_var(protoV, CONSTRUCTOR);
@@ -5456,11 +5465,18 @@ var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
 		 * func_call consumes it (binds into env, clears the field); restore the
 		 * previous value afterwards so nested/outer constructions stay correct. */
 		var_t* old_nt = vm->new_target;
-		vm->new_target = n->var;
+		vm->new_target = ctor_var;
 		func_call(vm, obj, constructor, arg_num);
 		vm->new_target = old_nt;
 		var_t* ret = vm_pop2(vm); // no unref: ret carries func_call's push ref
-		if(ret != NULL && ret != obj && ret->type == V_OBJECT) {
+		bool ret_wins = (ret != NULL && ret != obj && ret->type == V_OBJECT);
+		/* Plain call of a class value (`String(x)`, `BigInt(5)`): spec-wise this is a
+		 * plain function call, so ANY defined return value is the result - the builtin
+		 * converters return primitives. Only an undefined return keeps the fresh object
+		 * (`Array(3)` populates `this` and returns nothing). */
+		if(plain_call && ret != NULL && ret != obj && ret->type != V_UNDEF)
+			ret_wins = true;
+		if(ret_wins) {
 			// JS semantics: an explicit object returned from a constructor wins.
 			obj->refs--; // release protection ref (obj discarded)
 			obj = ret;
@@ -5473,7 +5489,26 @@ var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
 			obj->refs--;     // release protection ref
 		}
 	}
+	else {
+		/* No constructor to run (e.g. plain `new Object()`): the args the
+		 * compiler pushed have no consumer - drop them or they leak into the
+		 * caller's expression stack. */
+		int k = arg_num;
+		while(k-- > 0)
+			vm_pop(vm);
+	}
 	return obj;
+}
+
+var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
+	node_t* n = vm_load_node(vm, name, false); //load class;
+
+	if(n == NULL) {
+		mario_debug("Error: There is no class: '%s'!\n", name);
+		vm_throw(vm, "there is no class: '%s'!", name);
+		return NULL;
+	}
+	return new_obj_with_ctor(vm, n->var, name, arg_num, false);
 }
 
 static int parse_func_name(const char* full, mstr_t* name) {
@@ -6667,6 +6702,115 @@ static inline void handle_new(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 		vm_terminate(vm);
 }
 
+/* `new (expr)(args)`: the constructor is a computed VALUE on the stack (below
+ * its args), where INSTR_CALLX keeps its callable. The operand encodes only
+ * the arity as "$n" (empty name), same as CALLX. Pick the value off, then
+ * construct through the shared new_obj_with_ctor() path. */
+static inline void handle_newx(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	const char* s = bc_getstr(&vm->bc, offset);
+	mstr_t* name = mstr_new("");
+	int arg_num = parse_func_name(s, name);
+	mstr_free(name);
+
+	var_t* ctor = vm_stack_pick(vm, arg_num + 1); /* removes the ctor slot */
+
+	/* Mirror do_new(): an arrow function has no [[Construct]]; `new arrow()` is
+	 * a catchable TypeError, not a VM abort. Args are still on the stack. */
+	if(ctor != NULL && ctor->is_func) {
+		func_t* cf = var_get_func(ctor);
+		if(cf != NULL && cf->is_arrow) {
+			int k = arg_num;
+			while(k-- > 0)
+				vm_pop(vm);
+			vm_push(vm, var_new(vm));
+			vm_throw(vm, "arrow function is not a constructor!");
+			var_unref(ctor); /* release the ref the value-stack slot held */
+			return;
+		}
+	}
+
+	if(ctor == NULL || ctor->type != V_OBJECT) {
+		/* Not constructible: args were never consumed; drop them, push
+		 * undefined, and throw catchably (a bad script must not kill the VM). */
+		int k = arg_num;
+		while(k-- > 0)
+			vm_pop(vm);
+		vm_push(vm, var_new(vm));
+		vm_throw(vm, "value is not a constructor!");
+		if(ctor != NULL)
+			var_unref(ctor);
+		return;
+	}
+
+	var_t* obj = new_obj_with_ctor(vm, ctor, "(expression)", arg_num, false);
+	if(obj == NULL) {
+		/* new_obj_with_ctor threw (proxy path consumed the args already). */
+		vm_push(vm, var_new(vm));
+	}
+	else {
+		vm_push(vm, obj);
+	}
+	var_unref(ctor); /* release the ref the value-stack slot held */
+}
+
+/* `new (expr)(...spread)`: stack holds (top-down) argsArray, ctor. Mirror of
+ * handle_new_spread() with the constructor taken from the stack. */
+static inline void handle_newx_spread(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* args = vm_pop2(vm);
+	var_t* ctor = vm_stack_pick(vm, 1); /* ctor value sits beneath the args array */
+
+	int arg_num = 0;
+	if(args != NULL && args->is_array) {
+		vm_push(vm, args); //anchor: keep args gc-reachable while the ctor runs (see call_m_func)
+		arg_num = var_array_size(args);
+		int i;
+		for(i = 0; i < arg_num; i++) {
+			node_t* node = var_array_get(args, i);
+			if(node == NULL || node->var == NULL)
+				vm_push(vm, var_new(vm));
+			else
+				vm_push(vm, node->var);
+		}
+	}
+
+	var_t* obj = NULL;
+	bool constructible = (ctor != NULL && ctor->type == V_OBJECT);
+	if(constructible && ctor->is_func) {
+		func_t* cf = var_get_func(ctor);
+		if(cf != NULL && cf->is_arrow)
+			constructible = false;
+	}
+	if(constructible) {
+		obj = new_obj_with_ctor(vm, ctor, "(expression)", arg_num, false);
+	}
+
+	vm->gc.gc_defer++; //obj/args/ctor are bare C pointers until pushed/released
+	if(!constructible) {
+		/* The ctor never ran: drop the un-consumed arg elements first, then
+		 * the args anchor beneath them, and throw catchably. */
+		int k = arg_num;
+		while(k-- > 0)
+			vm_pop(vm);
+		if(args != NULL && args->is_array)
+			vm_pop(vm); //drop the args anchor
+		vm_push(vm, var_new(vm));
+		vm_throw(vm, "value is not a constructor!");
+	}
+	else {
+		if(args != NULL && args->is_array)
+			vm_pop(vm); //drop the args anchor (elements were consumed by the ctor)
+		if(obj == NULL)
+			vm_push(vm, var_new(vm));
+		else
+			vm_push(vm, obj);
+	}
+	if(args != NULL)
+		var_unref(args);
+	if(ctor != NULL)
+		var_unref(ctor); /* release the ref the value-stack slot held */
+	vm->gc.gc_defer--;
+}
+
 static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	var_t* func = NULL;
 	var_t* obj = NULL;
@@ -6704,17 +6848,38 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		func = find_func(vm, obj, name->cstr);
 
 	if(func != NULL && !func->is_func && !var_is_proxy(func)) {
+		/* A class value invoked as a plain call: `Array(3)`, `Object(x)`,
+		 * `RegExp("a+")`. These builtins construct even without `new`, and
+		 * plain-calling the constructor with the ambient `this` let native
+		 * ctors write into the root scope (a NULL this segfaulted), so route
+		 * through the shared construction path which gives the constructor a
+		 * fresh object. The compiler already pushed arg_num args; construction
+		 * consumes them like a normal call. */
 		var_t* constr = var_find_own_member_var(func, CONSTRUCTOR);
 		if(constr == NULL) {
 			var_t* protoV = var_get_prototype(func);
 			if(protoV != NULL)
-				func = var_find_own_member_var(protoV, CONSTRUCTOR);
-			else
-				func = NULL;
+				constr = var_find_own_member_var(protoV, CONSTRUCTOR);
 		}
-		else {
+		if(strcmp(name->cstr, SUPER) == 0) {
+			/* `super(...)` inside a derived constructor: the parent constructor must
+			 * run on the CURRENT instance (the ambient `this`), not on a fresh object -
+			 * otherwise inherited fields land on a discarded copy. Fall through to the
+			 * ordinary call path with the constructor as the callee. */
 			func = constr;
 		}
+		else if(constr != NULL || func->is_class) {
+			var_t* nobj = new_obj_with_ctor(vm, func, name->cstr, arg_num, true);
+			if(nobj == NULL)
+				nobj = var_new(vm); /* construction threw; keep the stack balanced */
+			vm_push(vm, nobj);
+			mstr_free(name);
+			if(unrefObj && obj != NULL)
+				var_unref(obj);
+			return;
+		}
+		else
+			func = NULL;
 	}
 
 	if(func != NULL) {
@@ -6727,7 +6892,10 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 			arg_num--;
 		}
 		vm_push(vm, var_new(vm));
-		mario_debug("Error: can not find function '%s'!\n", name->cstr);
+		if(vm->dbg_tag != NULL)
+		        mario_debug("Error: can not find function '%s'!  [%s]\n", name->cstr, vm->dbg_tag);
+		else
+		        mario_debug("Error: can not find function '%s'!\n", name->cstr);
 		vm_throw(vm, "can not find function '%s'!", name->cstr);
 		vm->gc.gc_defer--;
 	}
@@ -7603,17 +7771,58 @@ static inline void handle_call_spread(vm_t* vm, PC ins, opr_code_t instr, uint32
 	}
 
 	if(func != NULL && !func->is_func && !var_is_proxy(func)) {
+		/* Class value invoked with a spread call: `Array(...a)`. Same rule as
+		 * handle_call: construct a fresh object instead of plain-calling the
+		 * constructor with the ambient `this`. The args array is re-pushed so
+		 * new_obj_with_ctor consumes it like a compiled argument list (mirror
+		 * handle_new_spread). */
 		var_t* constr = var_find_own_member_var(func, CONSTRUCTOR);
 		if(constr == NULL) {
 			var_t* protoV = var_get_prototype(func);
 			if(protoV != NULL)
-				func = var_find_own_member_var(protoV, CONSTRUCTOR);
-			else
-				func = NULL;
+				constr = var_find_own_member_var(protoV, CONSTRUCTOR);
 		}
-		else {
+		if(strcmp(name->cstr, SUPER) == 0) {
+			/* `super(...args)`: run the parent constructor on the ambient
+			 * `this` via the ordinary spread-call path (see handle_call). */
 			func = constr;
 		}
+		else if(constr != NULL || func->is_class) {
+			var_t* clsvar = func;
+			int an = 0;
+			if(args != NULL && args->is_array) {
+				vm_push(vm, args); //anchor: keep args gc-reachable while the ctor runs
+				an = var_array_size(args);
+				for(int i = 0; i < an; i++) {
+					node_t* node = var_array_get(args, i);
+					if(node == NULL || node->var == NULL)
+						vm_push(vm, var_new(vm));
+					else
+						vm_push(vm, node->var);
+				}
+			}
+			var_t* nobj = new_obj_with_ctor(vm, clsvar, name->cstr, an, true);
+			vm->gc.gc_defer++; //args/obj/func are bare C pointers until released
+			if(args != NULL && args->is_array)
+				vm_pop(vm); //drop the args anchor
+			if(nobj == NULL)
+				nobj = var_new(vm); /* construction threw; keep the stack balanced */
+			vm_push(vm, nobj);
+			mstr_free(name);
+			var_unref(args);
+			if(instr == INSTR_CALLO_SPREAD && obj != NULL)
+				var_unref(obj);
+			if(instr == INSTR_CALLX_SPREAD && func != NULL)
+				var_unref(func); // release the ref the value-stack slot held
+			if(instr == INSTR_CALLXO_SPREAD) {
+				if(func != NULL) var_unref(func);
+				if(obj != NULL) var_unref(obj);
+			}
+			vm->gc.gc_defer--;
+			return;
+		}
+		else
+			func = NULL;
 	}
 
 	if(func != NULL) {
@@ -8724,7 +8933,9 @@ static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 			var_t* tv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
 			mstr_t* es = mstr_new("");
 			var_to_str(tv, es);
-			mario_printf("Uncaught %s\n", es->cstr);
+			char tagsfx[160] = {0};
+			if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
+			mario_printf("Uncaught %s%s\n", es->cstr, tagsfx);
 			mstr_free(es);
 			vm_terminate(vm);
 			break;
@@ -8867,7 +9078,8 @@ static void init_instr_table(void) {
 	instr_table[INSTR_UNDEF] = handle_undef;
 
 	instr_table[INSTR_NEW] = handle_new;
-
+	instr_table[INSTR_NEWX] = handle_newx;
+	instr_table[INSTR_NEWX_SPREAD] = handle_newx_spread;
 	instr_table[INSTR_CACHE] = handle_cache;
 	instr_table[INSTR_NCACHE] = handle_ncache;
 
