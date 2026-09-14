@@ -1,6 +1,6 @@
 # 第 5 章 · 编译器（递归下降解析）
 
-编译器的任务：读 token 流，按语法规则组织，输出字节码。全部实现在 [`lang/js/compiler.c`](../../lang/js/compiler.c)，入口是：
+编译器的任务：读 token 流，按语法规则组织，输出字节码。全部实现在 [`lang/js/compiler.c`](../../../lang/js/compiler.c)，入口是：
 
 ```c
 bool js_compile(bytecode_t *bc, const char* input);
@@ -108,17 +108,21 @@ else if (l->tk == '[') factor_array_access(...);// foo[i]   → LOAD/GET + ARRAY
 | token | 语句 | 处理函数 |
 | --- | --- | --- |
 | `{` | 代码块 | `stmt_block` |
-| `var`/`let`/`const` | 变量声明 | `stmt_var` |
+| `var`/`let`/`const` | 变量声明（含解构） | `stmt_var` / `stmt_var_destructure` |
 | `class` | 类定义 | `factor_def_class` |
 | `function` | 函数声明 | `stmt_function` |
+| `async` | 异步函数声明 / 异步箭头表达式 | `factor_def_func` / `base` |
 | `if` | 条件 | `stmt_if` |
 | `while` | 循环 | `stmt_while` |
-| `for` | 循环（含 for-in） | `stmt_for` |
+| `do` | do-while 循环 | `stmt_do` |
+| `for` | 循环（含 for-in / for-of） | `stmt_for` / `stmt_for_in` / `stmt_for_of` |
+| `switch` | 分支选择 | `stmt_switch` |
 | `break`/`continue` | 循环控制 | `stmt_break`/`stmt_continue` |
 | `return` | 返回 | `stmt_return` |
 | `throw`/`try` | 异常 | `stmt_throw`/`stmt_try` |
 | `include` | 引入模块 | `stmt_include` |
-| 其它（ID/数字/字符串/`[`/`-`/`++`…） | 普通表达式语句 | `base` |
+| `[a,b] = ...` | 数组解构赋值 | `stmt_var_destructure` |
+| 其它（ID/数字/字符串/`` ` ``/`[`/`(`/`-`/`~`/`++`/`await`/`delete`…） | 普通表达式语句 | `base` / `expr_seq` |
 
 普通表达式语句执行后会 `bc_gen(bc, INSTR_POP)`，因为表达式会在栈上留下一个结果，而语句不需要它，必须弹出以保持栈平衡。
 
@@ -201,7 +205,7 @@ bc_set_instr(bc, pc_break, INSTR_JMP, pc-1);     // 回填 break 锚点 → 指�
 
 ### for（`stmt_for`）
 
-标准 `for(init; cond; iter)` 的字节码布局更复杂，它把「条件」和「迭代器」的位置重排，使得循环体内只需一次向后跳转。编译器还特判了 `for (var k in obj)` 形式（`stmt_for_in`），它会生成一段代码：把对象的 `keys()` 存进隐藏变量 `__for_in_keys`，用下标 `__for_in_idx` 遍历。
+标准 `for(init; cond; iter)` 的字节码布局更复杂，它把「条件」和「迭代器」的位置重排，使得循环体内只需一次向后跳转。编译器还特判了 `for (var k in obj)` 形式（`stmt_for_in`），它会生成一段代码：把对象的 `keys()` 存进隐藏变量 `__for_in_keys`，用下标 `__for_in_idx` 遍历；以及 ES6 的 `for (x of iterable)` 形式（`stmt_for_of`），它基于迭代协议（`GET_ITER` / `ITER_STEP`，见第 3 章）逐个取值。
 
 ### try / catch（`stmt_try`）
 
@@ -260,8 +264,17 @@ bool js_compile(bytecode_t *bc, const char* input) {
 
     bool ret = true;
     while (lex.tk != LEX_EOF && ret) {
+        int32_t prev_pos = lex.data_pos;
+        uint32_t prev_tk = lex.tk;
         ret = statement(&lex, bc);  // 一条条编译语句
         lex_skip_empty(&lex);
+        /* 安全网：若一条语句没消耗任何输入（未处理的前导 token），
+         * 直接报编译错误，而不是在循环里无限打转。 */
+        if (ret && lex.tk != LEX_EOF &&
+            lex.data_pos == prev_pos && lex.tk == prev_tk) {
+            mario_printf("compile error: unexpected token, made no progress! ");
+            ret = false;
+        }
     }
     if (ret) bc_gen(bc, INSTR_END); // 收尾：END
     else compile_error_pos(&lex, -1);
@@ -271,6 +284,6 @@ bool js_compile(bytecode_t *bc, const char* input) {
 }
 ```
 
-整个编译器不到 1800 行，却覆盖了 ES5 的主要语法。它的清晰之处在于：**每个语法结构 = 一个函数**，函数之间的调用关系 = 语法的嵌套关系 = 运算符的优先级关系。
+整个编译器约 4400 行（[`lang/js/compiler.c`](../../../lang/js/compiler.c)），覆盖了从 ES5 到大量 ES6+ 的语法。它的清晰之处在于：**每个语法结构 = 一个函数**，函数之间的调用关系 = 语法的嵌套关系 = 运算符的优先级关系。
 
 下一章 [第 6 章 · 虚拟机执行引擎](06-vm.md)，看这些字节码如何被真正执行。

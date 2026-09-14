@@ -12,7 +12,7 @@ make
 
 成功后会在 `build/` 目录生成可执行文件 `build/mario`，并输出 `done`。
 
-构建过程由根目录的 [`Makefile`](../../Makefile) 与 [`lang/js/lang.mk`](../../lang/js/lang.mk) 共同驱动：
+构建过程由根目录的 [`Makefile`](../../../Makefile) 与 [`lang/js/lang.mk`](../../../lang/js/lang.mk) 共同驱动：
 
 - `Makefile` 负责编译内核（`mario/mario.o`、`mario/lex/mario_lex.o`、`mario/bcdump/bcdump.o`）与命令行程序（`bin/mario/*`）。
 - `lang.mk` 负责列出 JS 语言层与所有内建 native 类的目标文件。
@@ -52,11 +52,13 @@ make MARIO_DEBUG=yes
 
 ## 2.3 命令行参数
 
-参数解析在 [`bin/mario/mario.c`](../../bin/mario/mario.c) 的 `doargs()` 里，通过 `getopt` 处理：
+参数解析在 [`bin/mario/mario.c`](../../../bin/mario/mario.c) 的 `doargs()` 里，通过 `getopt` 处理选项串 `"cda"`。程序实际打印的用法提示是：
 
 ```
-Usage: mario (-c/d/a) <filename> [output]
+Usage: mario (-c/d/a) <filename>
 ```
+
+`<filename>` 之后还可以再跟一个可选的 `[output]` 参数（仅在 `-c` 编译模式下用作输出文件名）：
 
 | 参数 | 含义 |
 | --- | --- |
@@ -64,7 +66,9 @@ Usage: mario (-c/d/a) <filename> [output]
 | `-a` | **dump 模式**：只编译，把字节码反汇编成可读文本打印出来，不执行 |
 | `-c` | **编译模式**：只编译，把字节码写入 `.mbc` 文件（预编译） |
 
-> 说明：源码里还定义了 `-d`，但当前 `doargs()` 只对 `c`/`a` 做了处理。
+> 说明：源码里 `getopt` 的选项串是 `"cda"`，但当前 `doargs()` 只对 `c`/`a` 做了实际处理，`-d` 尚未接线。
+>
+> 另外，`main()` 一开始会调用 `setvbuf(stdout, NULL, _IOLBF, 0)` 把标准输出设为**行缓冲**，这样即使把输出重定向到文件或管道，`console.log` 的内容也能及时出现，而不必等 4 KiB 缓冲填满或进程退出。
 
 ## 2.4 查看字节码：`-a`
 
@@ -130,14 +134,19 @@ pc_index | opr_code   ; instruction
 把脚本编译成 `.mbc` 二进制字节码文件，之后可以直接加载运行，省去重复编译：
 
 ```bash
-# 生成 /tmp/t.mbc
+# 不指定输出名：自动把输入的 .js 换成 .mbc，生成 /tmp/t.mbc
 ./build/mario -c /tmp/t.js
+
+# 也可以显式指定输出文件名
+./build/mario -c /tmp/t.js /tmp/out.mbc
 
 # 直接运行预编译字节码
 ./build/mario /tmp/t.mbc
 ```
 
-`.mbc` 文件的读写实现在 [`bin/lib/mbc.c`](../../bin/lib/mbc.c)，格式细节见第 10 章。
+> 当 `-c` 未跟随输出文件名时，`main()` 会取输入文件名、把其中的 `.js` 替换为 `.mbc` 作为默认输出名。
+
+`.mbc` 文件的读写实现在 [`bin/lib/mbc.c`](../../../bin/lib/mbc.c)，格式细节见第 10 章。
 
 ## 2.6 常见运行问题
 

@@ -30,7 +30,7 @@ Mario 是一个用纯 C 编写的**字节码虚拟机（bytecode VM）**。它�
 └─────────────────────────────────────────────┘
 ```
 
-**平台层**是移植的关键。看 [`bin/mario/mario.c`](../../bin/mario/mario.c) 里的 `platform_init()`：
+**平台层**是移植的关键。看 [`bin/mario/mario.c`](../../../bin/mario/mario.c) 里的 `platform_init()`：
 
 ```c
 void platform_init(void) {
@@ -64,7 +64,7 @@ void platform_init(void) {
 
 ## 1.4 核心数据结构一览
 
-这些结构体都定义在 [`mario/mario.h`](../../mario/mario.h)，后续章节会详细展开，这里先建立整体印象：
+这些结构体都定义在 [`mario/mario.h`](../../../mario/mario.h)，后续章节会详细展开，这里先建立整体印象：
 
 | 结构 | 一句话说明 | 详见 |
 | --- | --- | --- |

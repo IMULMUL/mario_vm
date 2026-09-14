@@ -13,7 +13,7 @@
 ./build/mario app.mbc          # 直接加载运行，不需要编译器
 ```
 
-实现在 [`bin/lib/mbc.c`](../../bin/lib/mbc.c)。
+实现在 [`bin/lib/mbc.c`](../../../bin/lib/mbc.c)。
 
 ## 10.2 .mbc 文件格式
 
@@ -79,13 +79,16 @@ static bool load_mbc(int fd, vm_t* vm) {
 
 ## 10.3 模块引入：include
 
-脚本里可以用 `include "xxx.js"` 引入其它脚本（对应 `INSTR_INCLUDE`）。加载逻辑在 [`bin/lib/js.c`](../../bin/lib/js.c)：
+脚本里可以用 `include "xxx.js"` 引入其它脚本（对应 `INSTR_INCLUDE`）。加载逻辑在 [`bin/lib/js.c`](../../../bin/lib/js.c)：
 
 ```c
+#define DEF_LIBS "/usr/local/mario"
+
 static mstr_t* include_script(vm_t* vm, const char* name) {
     const char* path = getenv("MARIO_PATH");   // 环境变量指定库目录
-    if(path == NULL) path = "/usr/local/mario";
-    // 先按当前路径找，再到 $MARIO_PATH/libs/js/ 下找
+    if(path == NULL) path = DEF_LIBS;          // 默认 /usr/local/mario
+    // 先按当前路径 load_script_content(name)
+    // 找不到再拼 $MARIO_PATH/libs/<lang>/name（<lang> 取自 _mario_lang，如 "js"）
 }
 ```
 
@@ -99,7 +102,7 @@ VM 通过全局函数指针 `_load_m_func` 回调到 `include_script`。运行�
 
 ## 10.4 把 Mario 嵌入你的 C 程序
 
-这是 Mario 最重要的用法——作为脚本引擎嵌入到应用里。最小骨架（参考 [`mario/demos/js_call/demo.c`](../../mario/demos/js_call/demo.c)）：
+这是 Mario 最重要的用法——作为脚本引擎嵌入到应用里。最小骨架（参考 [`mario/demos/js_call/demo.c`](../../../mario/demos/js_call/demo.c)）：
 
 ```c
 #include "mario.h"
@@ -161,10 +164,11 @@ int main(void) {
 - **JS 调 C**：注册原生函数（第 9 章），JS 侧像调普通函数一样调用。
 - **读写对象成员**：`get_obj_member(obj, name)` / `set_obj_member(obj, name, var)`；便捷取值 `get_int/get_str/get_float/get_bool`。
 
-## 10.5 反汇编与汇编工具
+## 10.5 反汇编工具
 
-- **bcdump**（[`mario/bcdump/bcdump.c`](../../mario/bcdump/bcdump.c)）：把 `bytecode_t` 反汇编成可读文本，即命令行 `-a` 的输出（详见第 3 章）。核心是 `bc_dump(bc)`，返回一个 `mstr_t*`。
-- **bcasm**（`bin/bcasm/`）：字节码汇编相关的目标文件（`main.o`、`dump.o`），用于更底层的字节码处理实验。
+- **bcdump**（[`mario/bcdump/bcdump.c`](../../../mario/bcdump/bcdump.c)）：把 `bytecode_t` 反汇编成可读文本，即命令行 `-a` 的输出（详见第 3 章）。核心是 `bc_dump(bc)`，返回一个 `mstr_t*`。demo 程序通过 `#include "bcdump/bcdump.h"` 使用它。
+
+> 说明：仓库当前只提供反汇编（dump）工具，尚未包含字节码汇编器（assembler）。若需从文本指令重建 `.mbc`，可参考 `bc_dump` 的格式自行实现。
 
 调试建议：写一段脚本 → `mario -a` 看它编译成什么指令 → 对照第 3、5 章理解 → 再用 `-c`/`.mbc` 验证加载路径。这是排查编译/执行问题最有效的工作流。
 
@@ -207,7 +211,7 @@ int main(void) {
 
 1. **动手改**：给编译器加一个新语法（如正则字面量 `/.../`），给内建类加一个新方法（如 `String.prototype.reverse`）。
 2. **单步看**：用 `MARIO_DEBUG=yes` 编译，配合 `mario_debug` 观察执行流。
-3. **读测试**：`test/js/*.js` 是最好的行为规约，读它们并预测字节码，再用 `-a` 验证。尤其是 [`test/js/es6_full.js`](../../test/js/es6_full.js)，它是完整的 ES6+ 行为规约。
+3. **读测试**：`test/js/*.js` 是最好的行为规约，读它们并预测字节码，再用 `-a` 验证。尤其是 [`test/js/es6_full.js`](../../../test/js/es6_full.js)，它是完整的 ES6+ 行为规约。
 
 作为一门 JavaScript，Mario 到底支持哪些 ES6+ 语法与内建对象？完整的特性矩阵、代码示例与已知限制见 [第 11 章 · ES6+ 语言特性支持](11-es6-support.md)。
 

@@ -4,7 +4,7 @@
 
 结论先行：**Mario 已经实现了完整的 ES6 特性集**，并额外覆盖了 ES2016～ES2022 里最常一起被提起的增补（`async/await`、对象 rest/spread、指数运算符、`BigInt`、类型化数组、`Proxy/Reflect`、`WeakRef`、`SharedArrayBuffer/Atomics` 等）。
 
-> 权威依据：仓库里的 [`test/js/es6_full.js`](../../test/js/es6_full.js) 是一份**按 ECMA-262 标准编写**的测试套件，共 **854 条断言，全部通过**（`=== es6_full.js: 854 passed, 0 failed ===`）。本章的每一处「支持」都能在里面对应到具体断言。
+> 权威依据：仓库里的 [`test/js/es6_full.js`](../../../test/js/es6_full.js) 是一份**按 ECMA-262 标准编写**的测试套件，共 **854 条断言，全部通过**（`=== es6_full.js: 854 passed, 0 failed ===`）。本章的每一处「支持」都能在里面对应到具体断言。
 
 ---
 
@@ -95,7 +95,7 @@ ES6 源码
 
 ## 11.2 语法层特性（编译器）
 
-本节的所有语法都在 [`lang/js/compiler.c`](../../lang/js/compiler.c) 中实现，编译产物是第 3 章的字节码。
+本节的所有语法都在 [`lang/js/compiler.c`](../../../lang/js/compiler.c) 中实现，编译产物是第 3 章的字节码。
 
 ### 11.2.1 `let` / `const` 与块级作用域
 
@@ -274,7 +274,7 @@ load().then(r => console.log(r));   // 84
 
 ## 11.3 内建对象层（native 类）
 
-内建类分布在 [`lang/js/native/`](../../lang/js/native/)，注册入口见第 9 章。当前的完整清单如下（远比早期版本丰富）：
+内建类分布在 [`lang/js/native/`](../../../lang/js/native/)，注册入口见第 9 章。当前的完整清单如下（远比早期版本丰富）：
 
 ```
 native/
@@ -292,11 +292,11 @@ native/
     ├── Math/  Date/  JSON/
 ```
 
-> 注册顺序（[`natives_builtin.c`](../../lang/js/native/builtin/natives_builtin.c)）：Object → Error → Array → String → Console → Number → BigInt → ArrayBuffer → DataView → TypedArray → Promise → Map → Set → Symbol → Proxy → Reflect → WeakRef → FinalizationRegistry → SharedArrayBuffer → Atomics → RegExp；随后 `load_basic_classes` 缓存常用类指针、创建全局 `console`、注册全局 `Infinity` / `NaN`；最后 `reg_natives` 注册 Math / Date / JSON。
+> 注册顺序（[`natives_builtin.c`](../../../lang/js/native/builtin/natives_builtin.c)）：Object → Error → Array → String → Console → Number → BigInt → ArrayBuffer → DataView → TypedArray → Promise → Map → Set → Symbol → Proxy → Reflect → WeakRef → FinalizationRegistry → SharedArrayBuffer → Atomics → RegExp；随后 `load_basic_classes` 缓存常用类指针、创建全局 `console`、注册全局 `Infinity` / `NaN`；最后 `reg_natives` 注册 Math / Date / JSON。
 
 ### 11.3.1 集合：Map / Set / WeakMap / WeakSet
 
-`Map`/`Set` 支持完整的增删查遍历与迭代协议；`WeakMap`（在 [`native_Map.c`](../../lang/js/native/builtin/Map/native_Map.c) 中注册）与 `WeakSet`（在 [`native_Set.c`](../../lang/js/native/builtin/Set/native_Set.c) 中注册）以对象为键、持弱引用。
+`Map`/`Set` 支持完整的增删查遍历与迭代协议；`WeakMap`（在 [`native_Map.c`](../../../lang/js/native/builtin/Map/native_Map.c) 中注册）与 `WeakSet`（在 [`native_Set.c`](../../../lang/js/native/builtin/Set/native_Set.c) 中注册）以对象为键、持弱引用。
 
 ```javascript
 const m = new Map([["a", 1]]);
@@ -368,7 +368,7 @@ reg.register(target, "token");
 
 ### 11.3.6 正则：RegExp
 
-`RegExp` 由一个自带的回溯正则引擎实现（[`native_RegExp.c`](../../lang/js/native/builtin/RegExp/native_RegExp.c)）。支持通过 `new RegExp(pattern, flags)` 构造，提供 `test`/`exec`/`toString` 与 `source`/`flags`/`global`/`ignoreCase`/`multiline`/`sticky`/`lastIndex` 属性。
+`RegExp` 由一个自带的回溯正则引擎实现（[`native_RegExp.c`](../../../lang/js/native/builtin/RegExp/native_RegExp.c)）。支持通过 `new RegExp(pattern, flags)` 构造，提供 `test`/`exec`/`toString` 与 `source`/`flags`/`global`/`ignoreCase`/`multiline`/`sticky`/`lastIndex` 属性。
 
 - **flags**：`g` `i` `m` `s` `y`（`u` 接受但忽略——字符串本就按 UTF-8 字节处理）。
 - **语法**：字面量字符、`.`、`\d\D\w\W\s\S`、`\b\B`、`\n\t\r\f\v\0\xHH\uHHHH`、字符类（范围/取反）、量词 `* + ? {n} {n,} {n,m}`（贪婪 + 惰性）、捕获组、非捕获组 `(?:)`、先行断言 `(?=)`/`(?!)`、`|`、`^ $`、反向引用 `\1`–`\9`。

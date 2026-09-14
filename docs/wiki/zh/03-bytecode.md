@@ -2,7 +2,7 @@
 
 字节码是编译器和虚拟机之间的「契约」。编译器把源码翻译成字节码，虚拟机逐条执行字节码。本章彻底讲清楚这套契约。
 
-所有指令常量都定义在 [`mario/mario.h`](../../mario/mario.h) 的 `MARIO_BC` 区块。
+所有指令常量都定义在 [`mario/mario.h`](../../../mario/mario.h) 的 `MARIO_BC` 区块。
 
 ## 3.1 一条指令 = 一个 32 位整数
 
@@ -183,10 +183,14 @@ typedef struct st_bytecode {
 | `INSTR_GRT` | 0x02C | `>` |
 | `INSTR_GEQ` | 0x02B | `>=` |
 | `INSTR_NOT` | 0x01A | `!` |
-| `INSTR_AAND` | 0x033 | `&&`（短路） |
-| `INSTR_OOR` | 0x034 | `\|\|`（短路） |
+| `INSTR_AAND` | 0x033 | 逻辑与（旧路径，`handle_logic`，结果为布尔） |
+| `INSTR_OOR` | 0x034 | 逻辑或（旧路径，`handle_logic`，结果为布尔） |
+| `INSTR_SCAND` | 0x087 | `&&` 短路（实际编译产物，返回操作数本身的值） |
+| `INSTR_SCOR` | 0x086 | `\|\|` 短路（实际编译产物，返回操作数本身的值） |
 | `INSTR_TYPEOF` | 0x03A | `typeof` |
 | `INSTR_INSTOF` | 0x055 | `instanceof` |
+
+> 注意：源码里的 `&&` / `\|\|` 现在由编译器生成为 `INSTR_SCAND` / `INSTR_SCOR`（见 `compiler.c`），它们遵循 JS 短路语义并**返回操作数本身的值**（而非强制转成布尔）；`INSTR_AAND` / `INSTR_OOR` 是早期的布尔逻辑实现（`handle_logic`），仍保留在分发表中。
 
 ### 3.4.7 跳转与控制流
 
@@ -273,7 +277,93 @@ static int parse_func_name(const char* full, mstr_t* name);
 | `INSTR_CACHE` | 0x048 | 从变量缓存加载并压栈 |
 | `INSTR_NCACHE` | 0x049 | 从成员访问缓存加载并压栈 |
 | `INSTR_END` | 0x058 | 代码结束标记，`vm_run` 遇到即停止 |
-| `INSTR_MAX` | 0x059 | 操作码上限（分发表大小） |
+| `INSTR_MAX` | 0x090 | 操作码上限（分发表大小） |
+
+### 3.4.12 ES6+ 扩展指令（0x059–0x087）
+
+随着 ES6+ 特性的加入，操作码从 `0x059` 一直扩展到 `0x087`（`INSTR_MAX` 为 `0x090`）。下面按主题归类：
+
+**展开 / 剩余（spread / rest）**
+
+| 指令 | 码 | 说明 |
+| --- | --- | --- |
+| `INSTR_ARR_SPREAD` | 0x059 | 弹出一个数组，把其元素逐个追加到正在构造的数组字面量 |
+| `INSTR_OBJ_SPREAD` | 0x05A | 弹出一个对象，把其成员拷入正在构造的对象字面量 |
+| `INSTR_CALL_SPREAD` | 0x05B | 弹出参数数组，以运行时参数个数调用函数 `x`（`f(...a)`） |
+| `INSTR_CALLO_SPREAD` | 0x05C | 弹出参数数组，调用 `obj.x(...a)`（obj 在数组之下） |
+| `INSTR_NEW_SPREAD` | 0x05D | 弹出参数数组，以运行时参数个数 `new x(...a)` |
+| `INSTR_CALLX_SPREAD` | 0x062 | 弹出参数数组，调用其下方的函数值（运行时参数个数） |
+| `INSTR_CALLXO_SPREAD` | 0x074 | 弹出参数数组，调用其下方的函数值（接收者在更下方，`obj[k](...a)`） |
+
+**幂运算 / 一元 / 位运算赋值**
+
+| 指令 | 码 | 说明 |
+| --- | --- | --- |
+| `INSTR_POW` | 0x05F | `**` 幂运算 |
+| `INSTR_POWEQ` | 0x060 | `**=` |
+| `INSTR_POS` | 0x068 | 一元 `+`（对栈顶值做 ToNumber） |
+| `INSTR_BNOT` | 0x07F | 一元按位取反 `~x`（ToInt32 后取反；BigInt → -(x+1)） |
+| `INSTR_BITANDEQ` | 0x080 | `&=` |
+| `INSTR_BITOREQ` | 0x081 | `\|=` |
+| `INSTR_BITXOREQ` | 0x082 | `^=` |
+| `INSTR_LSHIFTEQ` | 0x083 | `<<=` |
+| `INSTR_RSHIFTEQ` | 0x084 | `>>=` |
+| `INSTR_URSHIFTEQ` | 0x085 | `>>>=` |
+
+**函数调用形式 / 箭头函数 / 生成器**
+
+| 指令 | 码 | 说明 |
+| --- | --- | --- |
+| `INSTR_CALLX` | 0x061 | 调用位于其 n 个参数之下的函数值（IIFE / `(expr)()`） |
+| `INSTR_CALLXO` | 0x073 | 调用栈上的函数值，接收者在其下方（`obj[k](..)`） |
+| `INSTR_FUNC_ARROW` | 0x06F | 定义 ES6 箭头函数（词法 `this`、无 `prototype`、不可构造） |
+| `INSTR_FUNC_GEN` | 0x067 | 生成器函数/方法定义（函数体组织同 `INSTR_FUNC`） |
+| `INSTR_YIELD` | 0x065 | 弹出产出值、挂起生成器；恢复时压入 `next()` 传入的值 |
+| `INSTR_YIELD_STAR` | 0x066 | `yield*`：弹出一个可迭代对象，委托产出，压入其返回值 |
+
+**对象 / 成员 / 计算键 / 原型**
+
+| 指令 | 码 | 说明 |
+| --- | --- | --- |
+| `INSTR_MEMBERV` | 0x05E | 弹出值、弹出键，设 `scope-obj[key] = value`（计算键） |
+| `INSTR_GETW` | 0x064 | 作为赋值目标的成员取值（若属性为访问器则调用 setter） |
+| `INSTR_SET_PROTO` | 0x06E | 弹出 v，把正在构造对象的 `[[Prototype]]` 设为 v（`{__proto__: v}`） |
+| `INSTR_ARRAY_AT_M` | 0x072 | 保留接收者的下标访问（先压接收者再压成员），用于 `obj[k](..)` |
+| `INSTR_ARRAY_AT_W` | 0x07C | 作为赋值目标的下标访问；用于 `ta[i] = ..` / `ta[i] += ..`（TypedArray） |
+
+**可选链 / 空值合并 / 逻辑赋值**
+
+| 指令 | 码 | 说明 |
+| --- | --- | --- |
+| `INSTR_OPT_GET` | 0x069 | 可选链成员取值 `?.x`；基对象为 nullish 时结果为 undefined |
+| `INSTR_NULLISH` | 0x06A | `??` 短路：栈顶非 nullish 则跳转 x（保留它），否则弹出并顺序执行 |
+| `INSTR_OREQ` | 0x06B | `\|\|=` |
+| `INSTR_ANDEQ` | 0x06C | `&&=` |
+| `INSTR_NULLISHEQ` | 0x06D | `??=` |
+
+**迭代协议 / 模板字符串 / 字面量**
+
+| 指令 | 码 | 说明 |
+| --- | --- | --- |
+| `INSTR_GET_ITER` | 0x070 | 弹出可迭代对象，压入其迭代器（`obj[Symbol.iterator]()`） |
+| `INSTR_ITER_STEP` | 0x071 | 窥视迭代器并调 `next()`；若 done 则跳转 offset，否则压入 `step.value` |
+| `INSTR_TAG_RAW` | 0x063 | 弹出 rawArr、stringsArr，设 `stringsArr.raw = rawArr`，压回 stringsArr（标签模板） |
+| `INSTR_INT64` | 0x075 | 压入一个 int64 字面量（存于连续 2 个 PC 字） |
+| `INSTR_FLOAT64` | 0x076 | 压入一个 double 字面量（存于连续 2 个 PC 字） |
+| `INSTR_BIGINT` | 0x077 | 压入 BigInt 字面量；数字串像 `INSTR_STR` 一样存于 mstr_table（任意宽度） |
+
+**delete / in / switch**
+
+| 指令 | 码 | 说明 |
+| --- | --- | --- |
+| `INSTR_DELETE` | 0x078 | 弹出 obj，删除自有成员 `$n`，压入 bool（`delete o.x`） |
+| `INSTR_DELETE_AT` | 0x07A | 弹出 key、obj，删除自有成员 `[key]`，压入 bool（`delete o[k]`） |
+| `INSTR_DELETE_VAR` | 0x07B | 删除全局绑定 `$n`，压入 bool（`delete x`） |
+| `INSTR_IN` | 0x079 | 弹出 obj、key，压入 bool（`key in obj`：自有 + 原型链） |
+| `INSTR_SWITCH` | 0x07D | 压入一个 switch 作用域（break 锚点），与 `INSTR_SWITCH_END` 成对 |
+| `INSTR_SWITCH_END` | 0x07E | 弹出 switch 作用域 |
+
+> 这些指令的具体语义在 [`mario/mario.c`](../../../mario/mario.c) 的各个 `handle_*` 函数中实现，并在 `init_instr_table()`（分发表 `instr_table[INSTR_MAX]` 的初始化）里登记；ES6+ 语法层面的对应关系见第 11 章。
 
 ## 3.5 把指令连起来看：一个完整例子
 
@@ -293,7 +383,7 @@ static int parse_func_name(const char* full, mstr_t* name);
 
 ## 3.6 反汇编器 bcdump
 
-把机器码翻译回可读文本的工具在 [`mario/bcdump/bcdump.c`](../../mario/bcdump/bcdump.c)：
+把机器码翻译回可读文本的工具在 [`mario/bcdump/bcdump.c`](../../../mario/bcdump/bcdump.c)：
 
 - `inmstr_str(ins)`：操作码 → 助记符字符串（一张大 `switch`）。
 - `bc_dump(bc)`：先打印字符串表，再逐条打印指令；遇到 `INT`/`FLOAT` 会多读一条双字数据；跳转类指令按整数打印偏移，其余按字符串表下标打印。

@@ -4,8 +4,8 @@
 
 Mario 的词法分析分成两层：
 
-1. **基础词法**（[`mario/lex/mario_lex.c`](../../mario/lex/mario_lex.c)）：与语言无关，负责识别标识符、数字、字符串、单字符符号、空白与注释。
-2. **JS 扩展词法**（[`lang/js/compiler.c`](../../lang/js/compiler.c) 顶部）：在基础词法之上，识别多字符运算符（`==`、`+=`、`=>`）和保留字（`if`、`while`、`class`……）。
+1. **基础词法**（[`mario/lex/mario_lex.c`](../../../mario/lex/mario_lex.c)）：与语言无关，负责识别标识符、数字、字符串、单字符符号、空白与注释。
+2. **JS 扩展词法**（[`lang/js/compiler.c`](../../../lang/js/compiler.c) 顶部）：在基础词法之上，识别多字符运算符（`==`、`+=`、`=>`）和保留字（`if`、`while`、`class`……）。
 
 ## 4.1 词法分析器状态：lex_t
 
@@ -30,7 +30,7 @@ typedef struct st_lex {
 
 ## 4.2 基础 token 类型
 
-定义在 [`mario/lex/mario_lex.h`](../../mario/lex/mario_lex.h)：
+定义在 [`mario/lex/mario_lex.h`](../../../mario/lex/mario_lex.h)：
 
 ```c
 typedef enum {
@@ -39,6 +39,7 @@ typedef enum {
     LEX_INT,           // 整数，如 42、0x2A
     LEX_FLOAT,         // 浮点，如 3.14、1e-5
     LEX_STR,           // 字符串字面量
+    LEX_BIGINT,        // BigInt 字面量（带 n 后缀，如 123n）
     LEX_BASIC_END      // 基础类型结束标记（JS 扩展从这之后编号）
 } lex_basic_type_t;
 ```
@@ -50,12 +51,21 @@ typedef enum {
     LEX_EQUAL = LEX_BASIC_END,  // ==
     LEX_TYPEEQUAL,              // ===
     ...
-    LEX_R_IF, LEX_R_ELSE, LEX_R_WHILE, ...  // 保留字
+    LEX_POWER, LEX_POWEREQUAL,  // **  **=
+    LEX_OPTCHAIN,               // ?.   可选链
+    LEX_NULLISH,                // ??   空值合并
+    LEX_NULLISHEQUAL,           // ??=
+    LEX_OREQUALOR, LEX_ANDEQUALAND,  // ||=  &&=
+    // 保留字
+    LEX_R_IF, LEX_R_ELSE, LEX_R_WHILE, ...
+    LEX_R_ASYNC, LEX_R_AWAIT,   // async / await
+    LEX_R_DELETE, LEX_R_IN,     // delete / in
+    LEX_R_SWITCH, LEX_R_CASE, LEX_R_DEFAULT,  // switch / case / default
     LEX_R_LIST_END
 } LEX_TYPES;
 ```
 
-这种「接力式编号」保证基础层与 JS 层的 token 值不冲突。
+这种「接力式编号」保证基础层与 JS 层的 token 值不冲突。随着 ES6+ 特性的加入，JS 层新增了幂运算（`**`）、可选链（`?.`）、空值合并（`??`）与一系列逻辑/空值赋值运算符，以及 `async`/`await`/`delete`/`in`/`switch`/`case`/`default` 等保留字。
 
 ## 4.3 字符分类工具
 
@@ -99,8 +109,8 @@ if (is_alpha(lex->curr_ch)) {
 }
 ```
 
-### ② 数字（INT / FLOAT）
-支持十进制、`0x` 十六进制、小数点、科学计数法 `e/E`：
+### ② 数字（INT / FLOAT / BIGINT）
+支持十进制、`0x` 十六进制、小数点、科学计数法 `e/E`；若数字后面跟着 `n` 后缀，则识别为 `LEX_BIGINT`：
 
 ```c
 } else if (is_numeric(lex->curr_ch)) {
@@ -167,7 +177,9 @@ void lex_get_next_token(lex_t* lex) {
 
 - **`lex_get_reserved_word`**：如果刚读到的是标识符，用一连串 `strcmp` 检查它是不是 `if`/`while`/`class`/`function`…… 若是，就把 `tk` 改成对应的保留字 token。
 - **`lex_get_js_str`**：处理单引号字符串 `'...'`，比双引号多了 `\x`（十六进制）、八进制转义的支持。
-- **`lex_get_op_token`**：处理多字符运算符。例如读到 `=` 且 `curr_ch=='='` → 变成 `LEX_EQUAL`(`==`)，若再有一个 `=` → `LEX_TYPEEQUAL`(`===`)。同理处理 `!=`、`<=`、`<<`、`>>`、`>>>`、`++`、`--`、`&&`、`||`、`=>`（箭头函数）等。
+- **`lex_get_op_token`**：处理多字符运算符。例如读到 `=` 且 `curr_ch=='='` → 变成 `LEX_EQUAL`(`==`)，若再有一个 `=` → `LEX_TYPEEQUAL`(`===`)。同理处理 `!=`、`<=`、`<<`、`>>`、`>>>`、`++`、`--`、`&&`、`||`、`=>`（箭头函数），以及 ES6+ 新增的 `**`、`?.`（可选链）、`??`（空值合并）、`??=`、`||=`、`&&=` 等。
+
+> 模板字符串（反引号 `` ` ``）的处理方式比较特别：词法器把开头的反引号当作一个**单字符 token** 交给上层，真正的模板解析在编译阶段由 `factor_template()` 完成（它直接扫描字符、处理 `${...}` 嵌套与转义，完成后再调 `lex_get_next_token` 回到正常 token 流）。详见第 5、第 11 章。
 
 ## 4.7 位置记录与报错定位
 

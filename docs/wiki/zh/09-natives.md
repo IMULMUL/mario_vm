@@ -4,7 +4,7 @@
 
 ## 9.1 内建类总览
 
-Mario 的 JS 前端自带一大批内建类，分布在 [`lang/js/native/`](../../lang/js/native/)，覆盖从基础类型到 ES6+ 的元编程、二进制、弱引用等（完整的 ES6+ 内建对象清单与用法见 [第 11 章](11-es6-support.md)）：
+Mario 的 JS 前端自带一大批内建类，分布在 [`lang/js/native/`](../../../lang/js/native/)，覆盖从基础类型到 ES6+ 的元编程、二进制、弱引用等（完整的 ES6+ 内建对象清单与用法见 [第 11 章](11-es6-support.md)）：
 
 ```
 native/
@@ -95,7 +95,7 @@ const char* get_str(var_t* obj, const char* name);
 
 ## 9.4 一个完整例子：Console
 
-看最简单的 [`native_Console.c`](../../lang/js/native/builtin/console/native_Console.c)：
+看最简单的 [`native_Console.c`](../../../lang/js/native/builtin/Console/native_Console.c)：
 
 ```c
 // 把 arguments 里所有参数转成字符串、空格拼接
@@ -168,7 +168,7 @@ node_t* vm_reg_native(vm_t* vm, var_t* cls, const char* decl, native_func_t nati
 
 ## 9.6 实例方法与 this：Number.toString
 
-看 [`native_Number.c`](../../lang/js/native/builtin/number/native_Number.c) 的实例方法，它需要访问调用者（`this`）：
+看 [`native_Number.c`](../../../lang/js/native/builtin/Number/native_Number.c) 的实例方法，它需要访问调用者（`this`）：
 
 ```c
 var_t* native_Number_toString(vm_t* vm, var_t* env, void* data) {
@@ -215,7 +215,7 @@ void reg_native_MyMath(vm_t* vm) {
 
 接入步骤：
 
-1. 在 [`lang/js/lang.mk`](../../lang/js/lang.mk) 的 `NATIVE_OBJS` 里加上你的 `.o`（里面已列出全部内建类的 `.o`，照样子加一行即可）。
+1. 在 [`lang/js/lang.mk`](../../../lang/js/lang.mk) 的 `NATIVE_OBJS` 里加上你的 `.o`（里面已列出全部内建类的 `.o`，照样子加一行即可）。
 2. 在 `reg_natives()`（`natives.c`）或 `reg_builtin_natives()` 里调用 `reg_native_MyMath(vm)`。
 3. `make` 重新编译。
 

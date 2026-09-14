@@ -51,7 +51,12 @@ typedef struct st_var {
 #define V_OBJECT 4   // 对象/数组/类
 #define V_BOOL   5   // 布尔
 #define V_NULL   6   // null
+#define V_INT64  7   // int64_t（精确大整数：2^31..2^63-1）
+#define V_FLOAT64 8  // double（规范浮点：所有浮点字面量/带小数结果）
+#define V_BIGINT 9   // bignum_t*（任意精度整数；typeof → "bigint"）
 ```
+
+> ES6+ 扩展了数值类型：除了早期的 `V_INT`/`V_FLOAT`，现在还区分精确的 64 位整数 `V_INT64`、规范双精度 `V_FLOAT64`，以及任意精度的 `V_BIGINT`（对应 `123n` 字面量与 BigInt 内建类，见第 11 章）。
 
 ### 创建值的工厂函数
 
@@ -263,13 +268,19 @@ typedef struct st_func {
     native_func_t  native;     // 原生函数：C 函数指针（脚本函数为 NULL）
     int8_t  regular: 4;        // 是否普通函数（get/set 为非普通）
     int8_t  is_static: 4;      // 是否静态
+    int8_t  is_generator: 4;   // ES6 `function*` / 生成器方法
+    int8_t  is_arrow: 4;       // ES6 箭头函数：词法 this、无 prototype、不可构造
     PC      pc;                // 脚本函数：函数体在字节码里的入口
     void*   data;              // 传给 native 的用户数据
     m_array_t args;            // 形参名列表
     var_t*  owner;             // 所属对象（用于 super）
+    var_t*  owner_var;         // 拥有本 func_t 的 var_t 回指针（供 GC 沿词法链 root 住 func_t）
     struct { var_t* var; struct st_func* func; } closure;  // 闭包：捕获的环境
+    var_t*  closure_func_ref;  // 对 closure.func 所属 owner var 的持有引用（防止外层函数被提前回收而悬空）
 } func_t;
 ```
+
+除了「脚本/原生」的区分，`func_t` 还用 `is_generator`、`is_arrow` 标记 ES6 的生成器函数与箭头函数（箭头函数捕获词法 `this`、无 `prototype`、不可 `new`）。`owner_var` 与 `closure_func_ref` 是为了让 GC 能沿闭包词法链正确 root 住 `func_t`，避免外层函数被提前回收后内层闭包的 `closure.func` 悬空（详见第 8 章）。
 
 两种函数：
 
