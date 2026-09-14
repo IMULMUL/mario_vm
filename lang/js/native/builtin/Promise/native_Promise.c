@@ -55,6 +55,20 @@ static void promise_anchor(vm_t* vm, var_t* promise, promise_data* pd) {
     vm->gc.gc_defer--;
 }
 
+/* Allocate the two callback lists, taking an own ref on each. They are C-side
+ * storage exactly like pd->value, so they need the same treatment (see the note
+ * in native_PromiseAll): promise_free() unrefs both, and promise_anchor()'s
+ * rebuild drops the @@keep node's ref through var_remove_all(). Created bare
+ * with var_new_array() they sat at refs=1 (the anchor's), so re-anchoring on a
+ * deferred settle freed the lists outright - registered .then callbacks and
+ * all. That is why a promise resolved from a timer or event callback ran none
+ * of them, while the same promise resolved synchronously inside its executor
+ * (before any re-anchor) worked. */
+static void promise_alloc_callbacks(vm_t* vm, promise_data* pd) {
+    pd->fulfilled_callbacks = var_ref(var_new_array(vm));
+    pd->rejected_callbacks = var_ref(var_new_array(vm));
+}
+
 static var_t* get_promise_proto(vm_t* vm) {
     node_t* n = vm_load_node(vm, CLS_PROMISE, false);
     if (n != NULL && n->var != NULL) {
@@ -181,8 +195,7 @@ var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
     promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
     pd->state = PROMISE_STATE_PENDING;
     pd->value = NULL;
-    pd->fulfilled_callbacks = var_new_array(vm);
-    pd->rejected_callbacks = var_new_array(vm);
+    promise_alloc_callbacks(vm, pd);
 
     var_t* obj = var_new_obj_no_proto(vm, pd, promise_free);
     var_instance_from(obj, thisV);
@@ -201,6 +214,17 @@ var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
         var_t* resolve_args = var_new_array(vm);
         var_array_add(resolve_args, rn->var);
         var_array_add(resolve_args, jn->var);
+        /* call_m_func expects the LAST argument at index 0 (it pushes from the
+         * tail so the first parameter lands on top of the value stack), so the
+         * natural-order [resolve, reject] pair has to be reversed like every
+         * other multi-arg call site in the tree. Without it the executor's two
+         * parameters were swapped: `new Promise(function(res, rej){ res(1); })`
+         * actually called __reject, leaving the promise REJECTED. A following
+         * .then(onFulfilled) then took neither the fulfilled nor the pending
+         * branch, so the callback never ran and `then` returned undefined -
+         * which is what silenced w3.org's
+         * `Promise.all([myFont.load()]).then(... fonts-loaded ...)` bootstrap. */
+        var_array_reverse(resolve_args);
 
         call_m_func(vm, obj, executor, resolve_args);
         var_unref(resolve_args);
@@ -223,8 +247,7 @@ var_t* native_PromiseResolve(vm_t* vm, var_t* env, void* data) {
     promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
     pd->state = PROMISE_STATE_FULFILLED;
     pd->value = var_ref(value);
-    pd->fulfilled_callbacks = var_new_array(vm);
-    pd->rejected_callbacks = var_new_array(vm);
+    promise_alloc_callbacks(vm, pd);
 
     var_t* proto = get_promise_proto(vm);
     var_t* promise = var_new_obj(vm, proto, pd, promise_free);
@@ -241,8 +264,7 @@ var_t* native_PromiseReject(vm_t* vm, var_t* env, void* data) {
     promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
     pd->state = PROMISE_STATE_REJECTED;
     pd->value = var_ref(reason);
-    pd->fulfilled_callbacks = var_new_array(vm);
-    pd->rejected_callbacks = var_new_array(vm);
+    promise_alloc_callbacks(vm, pd);
 
     var_t* proto = get_promise_proto(vm);
     var_t* promise = var_new_obj(vm, proto, pd, promise_free);
@@ -263,15 +285,13 @@ var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
         pd = (promise_data*)mario_malloc(sizeof(promise_data));
         pd->state = PROMISE_STATE_PENDING;
         pd->value = NULL;
-        pd->fulfilled_callbacks = var_new_array(vm);
-        pd->rejected_callbacks = var_new_array(vm);
+        promise_alloc_callbacks(vm, pd);
     }
 
     promise_data* newPd = (promise_data*)mario_malloc(sizeof(promise_data));
     newPd->state = pd->state;
     newPd->value = pd->value ? var_ref(pd->value) : NULL;
-    newPd->fulfilled_callbacks = var_new_array(vm);
-    newPd->rejected_callbacks = var_new_array(vm);
+    promise_alloc_callbacks(vm, newPd);
 
     var_t* proto = var_get_prototype(promise);
     var_t* newPromise = var_new_obj(vm, proto, newPd, promise_free);
@@ -374,8 +394,7 @@ var_t* native_PromiseAll(vm_t* vm, var_t* env, void* data) {
      * the promise let promise_free drop the array to 0 -- freeing the adopted value,
      * so the chained .then saw undefined. */
     pd->value = var_ref(var_new_array(vm));
-    pd->fulfilled_callbacks = var_new_array(vm);
-    pd->rejected_callbacks = var_new_array(vm);
+    promise_alloc_callbacks(vm, pd);
 
     if (promises != NULL && promises->is_array) {
         uint32_t len = var_array_size(promises);
@@ -415,8 +434,7 @@ var_t* native_PromiseRace(vm_t* vm, var_t* env, void* data) {
     promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
     pd->state = PROMISE_STATE_PENDING;
     pd->value = NULL;
-    pd->fulfilled_callbacks = var_new_array(vm);
-    pd->rejected_callbacks = var_new_array(vm);
+    promise_alloc_callbacks(vm, pd);
 
     if (promises != NULL && promises->is_array) {
         uint32_t len = var_array_size(promises);
@@ -455,8 +473,7 @@ var_t* native_PromiseAllSettled(vm_t* vm, var_t* env, void* data) {
     pd->state = PROMISE_STATE_FULFILLED;
     /* Own a ref on the result array; see the identical note in native_PromiseAll. */
     pd->value = var_ref(var_new_array(vm));
-    pd->fulfilled_callbacks = var_new_array(vm);
-    pd->rejected_callbacks = var_new_array(vm);
+    promise_alloc_callbacks(vm, pd);
 
     if (promises != NULL && promises->is_array) {
         uint32_t len = var_array_size(promises);
@@ -499,8 +516,7 @@ var_t* native_PromiseAny(vm_t* vm, var_t* env, void* data) {
     promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
     pd->state = PROMISE_STATE_PENDING;
     pd->value = NULL;
-    pd->fulfilled_callbacks = var_new_array(vm);
-    pd->rejected_callbacks = var_new_array(vm);
+    promise_alloc_callbacks(vm, pd);
 
     bool fulfilled = false;
     bool sawPending = false;

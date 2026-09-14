@@ -1307,6 +1307,20 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
             bc_gen_str(bc, INSTR_NEW, s->cstr);
             mstr_free(s);
         }
+    } else {
+        /* `new Foo` with no argument list: a NewExpression may omit Arguments
+         * entirely, and means exactly `new Foo()`. Emitting nothing here (the
+         * old behaviour) left the value stack one slot short, so the expression
+         * evaluated to undefined AND desynced every later operand of the
+         * enclosing statement - `console.log(x, (new Date))` then reported
+         * "can not find function 'log'", and fontfaceobserver.js's
+         * `(new Date).getTime()` cascaded into 'getTime'/'all'/'then' failures
+         * on w3.org. gen_func_name with arg_num 0 yields the bare name, the
+         * same payload `new Foo()` produces. */
+        mstr_t* s = mstr_new("");
+        gen_func_name(class_name->cstr, 0, s);
+        bc_gen_str(bc, INSTR_NEW, s->cstr);
+        mstr_free(s);
     }
     mstr_free(class_name);
     return true;

@@ -10,6 +10,7 @@ NATIVE_OBJS= \
 	\
 	$(NATIVES_PATH_BUILTIN)/natives_builtin.o  \
 	$(NATIVES_PATH_BUILTIN)/Object/native_Object.o  \
+	$(NATIVES_PATH_BUILTIN)/Function/native_Function.o  \
 	$(NATIVES_PATH_BUILTIN)/Error/native_Error.o  \
 	$(NATIVES_PATH_BUILTIN)/Number/native_Number.o  \
 	$(NATIVES_PATH_BUILTIN)/BigInt/native_BigInt.o  \

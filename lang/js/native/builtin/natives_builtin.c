@@ -1,5 +1,6 @@
 #include "natives_builtin.h"
 #include "Object/native_Object.h"
+#include "Function/native_Function.h"
 #include "Number/native_Number.h"
 #include "BigInt/native_BigInt.h"
 #include "ArrayBuffer/native_ArrayBuffer.h"
@@ -27,6 +28,7 @@ extern "C" {
 
 void reg_builtin_natives(vm_t* vm) {
 	reg_native_Object(vm);
+	reg_native_Function(vm);
 	reg_native_Error(vm);
 	reg_native_Array(vm);
 	reg_native_String(vm);

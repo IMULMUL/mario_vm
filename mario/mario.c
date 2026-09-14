@@ -2368,6 +2368,30 @@ static inline void remove_from_gc(var_t* var) {
 static void func_bind_closure_func(func_t* f, func_t* outer) {
 	if(f == NULL)
 		return;
+	/* Refuse a binding that would close the captured lexical chain into a cycle.
+	 * vm_find_in_scopes() and gc_mark() both walk closure.func strictly outward,
+	 * assuming it is acyclic; a cycle makes those walks spin forever. Because they
+	 * run inside a single vm_run instruction dispatch (and inside gc), the step-hook
+	 * watchdog cannot see them, so the engine thread pegs at 100% CPU or overflows
+	 * the C stack in gc_mark's recursion. The trigger is a function that captures
+	 * itself: handle_return's func_set_closure(ret, sc->var, sc->func) is handed the
+	 * very func_t now running when a function returns itself (or an object holding
+	 * itself), and mutual capture (A->B then B->A) does the same. Detect f anywhere
+	 * on outer's chain and drop the binding - losing one lexical link is far cheaper
+	 * than a wedge, and a function is never its own lexical parent. */
+	if(outer != NULL) {
+		func_t* p = outer;
+		int guard = 0;
+		while(p != NULL) {
+			if(p == f) {
+				outer = NULL;
+				break;
+			}
+			if(++guard > VM_CLOSURE_CHAIN_MAX)
+				break;
+			p = p->closure.func;
+		}
+	}
 	f->closure.func = outer;
 	/* Drop any previously pinned owner var before taking a new one (re-capture). */
 	if(f->closure_func_ref != NULL) {
@@ -2409,15 +2433,28 @@ static void gc_mark_callback(const char* key, void* value, void* user_data) {
   	bool mark = *(bool*)user_data;
   	node_t* node = (node_t*)value;
 	if(!node_empty(node)) {
-		node->var->gc_marked = mark;
-		if(node->var->gc_marking == false) {
-			gc_mark(node->var, mark);
-		}
+		/* Delegate fully to gc_mark: it sets gc_marked and guards re-entry on
+		 * gc_marked == mark (visited-in-this-pass). Pre-setting gc_marked here
+		 * would make that guard fire immediately and skip the child's whole
+		 * subtree, sweeping live vars. The visited guard also breaks cycles, so
+		 * no separate gc_marking test is needed. */
+		gc_mark(node->var, mark);
 	}
 }
 
 static inline void gc_mark(var_t* var, bool mark) {
   	if(var_empty(var))
+  		return;
+
+  	/* Visited guard: gc_marked is set to `mark` just below, so a var already
+  	 * handled in THIS pass is skipped on every later path that reaches it. The
+  	 * re-entry check used to be gc_marking alone - an "on the DFS stack right
+  	 * now" flag that is cleared on return - so a shared subtree was re-walked
+  	 * once per inbound edge: exponential on a diamond-heavy object graph, which
+  	 * froze the engine inside gc_mark (100% CPU, no forward progress). gc_marked
+  	 * also subsumes the cycle guard: a var on the current DFS stack already has
+  	 * gc_marked == mark, so a back-edge stops here instead of recursing. */
+  	if(var->gc_marked == mark)
   		return;
 
   	var->gc_marking = true;
@@ -2447,7 +2484,13 @@ static inline void gc_mark(var_t* var, bool mark) {
 			 * mirroring vm_find_in_scopes()'s own walk; gc_marking guards re-entry. */
 			var_t* closure = func->closure.var;
 			func_t* closure_func = func->closure.func;
+			int chain_guard = 0;
 			while(closure != NULL || closure_func != NULL) {
+				/* Bounded by VM_CLOSURE_CHAIN_MAX (see mario.h): a recycled
+				 * closure.func can close the chain into a cycle, and gc_mark
+				 * recurses here, so an unbounded walk overflows the C stack. */
+				if(++chain_guard > VM_CLOSURE_CHAIN_MAX)
+					break;
 				if(!var_empty(closure) && closure->gc_marking == false)
 					gc_mark(closure, mark);
 				if(closure_func == NULL)
@@ -3943,13 +3986,20 @@ bool var_instanceof(var_t* var, var_t* proto) {
 	return false;
 }
 
+/* Every closure-chain walk below is bounded by VM_CLOSURE_CHAIN_MAX (see
+ * mario.h): a recycled closure.func can close the chain into a cycle, and this
+ * walk runs inside one vm_run dispatch where the step-hook watchdog cannot see
+ * it, so an unbounded loop would pin the engine thread forever. */
 static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 	node_t* ret = NULL;
 	scope_t* sc = vm_get_scope(vm);
 	if(sc != NULL && sc->is_func) {
 		var_t* closure = sc->func->closure.var;
 		func_t* closure_func = sc->func->closure.func;
+		int chain_guard = 0;
 		while(closure != NULL) {
+			if(++chain_guard > VM_CLOSURE_CHAIN_MAX)
+				break;
 			ret = var_find_own_member(closure, name);	
 			if(ret != NULL)
 				return ret;
@@ -3970,7 +4020,10 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 	}
 	
 	bool closure_done = (sc != NULL && sc->is_func); /* already walked above */
+	int scope_guard = 0;
 	while(sc != NULL) {
+		if(++scope_guard > VM_SCOPE_STACK_MAX)
+			break;
 		if(!var_empty(sc->var)) {
 			ret = var_find_own_member(sc->var, name);
 			if(ret != NULL)
@@ -3992,7 +4045,10 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 			closure_done = true;
 			var_t* closure = (sc->func != NULL) ? sc->func->closure.var : NULL;
 			func_t* closure_func = (sc->func != NULL) ? sc->func->closure.func : NULL;
+			int chain_guard = 0;
 			while(closure != NULL) {
+				if(++chain_guard > VM_CLOSURE_CHAIN_MAX)
+					break;
 				ret = var_find_own_member(closure, name);
 				if(ret != NULL)
 					return ret;
@@ -4345,11 +4401,32 @@ static var_t* var_new_func(vm_t* vm, func_t* func) {
 	return var;
 }
 
+var_t* var_new_native_func(vm_t* vm, native_func_t native, void* data) {
+	func_t* func = func_new();
+	if(func == NULL)
+		return NULL;
+	func->native = native;
+	func->data = data;
+	return var_new_func(vm, func);
+}
+
 static var_t* find_func(vm_t* vm, var_t* obj, const char* fname) {
 	//try full name with arg_num
 	node_t* node = NULL;
 	if(obj != NULL) {
 		node = var_find_member(obj, fname);
+	}
+	/* Function.prototype.call/apply/bind. Function objects receive Object.prototype
+	 * as their "prototype" member (var_new_func), and that member doubles as the
+	 * instance prototype for `new f()` (do_new reads var_get_prototype(func)), so
+	 * functions cannot simply be relinked to a real Function.prototype. Resolve the
+	 * three universal methods here instead, for any callable receiver that does not
+	 * already shadow them with an own or inherited member. */
+	if(node == NULL && obj != NULL && obj->is_func &&
+			vm->builtin_vars.var_Function != NULL &&
+			(strcmp(fname, "call") == 0 || strcmp(fname, "apply") == 0 ||
+			 strcmp(fname, "bind") == 0)) {
+		node = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Function), fname);
 	}
 	if(node == NULL) {
 		node = vm_find_in_scopes(vm, fname);
@@ -4475,6 +4552,32 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		 * it builds a suspended generator object driven by next()/return()/throw(). */
 		ret = gen_create(vm, func_var, env);
 	}
+	else if(vm->call_depth >= MARIO_MAX_CALL_DEPTH ||
+	        vm->stack_top + MARIO_STACK_HEADROOM >= VM_STACK_MAX ||
+	        vm->scope_stack_top + MARIO_SCOPE_HEADROOM >= VM_SCOPE_STACK_MAX) {
+		/* Runaway script recursion (a JS function calling itself without a
+		 * reachable base case). Recursing into vm_run here would grow the native
+		 * thread stack until it overflows and crashes the process with a Bus
+		 * error, and would push this frame's env/scope past the fixed value and
+		 * scope stacks - where vm_push()/vm_push_scope() silently drop entries
+		 * (while still taking a ref), desyncing the stack so a later vm_pop()
+		 * dereferences garbage.
+		 *
+		 * Abort the whole run instead, exactly like handle_throw's uncaught
+		 * branch: report it, then vm_terminate() clears the value/scope stacks
+		 * and parks vm->pc at end-of-code. Every nested vm_run frame then exits
+		 * its loop (pc < code_size is false) and returns false, and the pending
+		 * func_call frames unwind safely - vm_pop() on the emptied stack is a
+		 * no-op, so the env-pop / ret-push protocol never dereferences a stale
+		 * slot. Delivering a catchable error from here is NOT safe: func_call is
+		 * a C frame between two vm_run frames, and the VM's flat throw trampoline
+		 * (redirecting vm->pc to an ancestor catch across live C frames) desyncs
+		 * the value stack. A runaway recursion is a broken script, so killing the
+		 * run is the correct, stable outcome. */
+		mario_printf("Uncaught RangeError: Maximum call stack size exceeded\n");
+		vm_terminate(vm);
+		ret = NULL;
+	}
 	else {
 		scope_t* sc = scope_new(env);
 		sc->pc = vm->pc;
@@ -4487,7 +4590,10 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 
 		//script function
 		vm->pc = func->pc;
-		if(vm_run(vm)) { //with function return;
+		vm->call_depth++;
+		bool returned = vm_run(vm); //with function return;
+		vm->call_depth--;
+		if(returned) {
 			ret = vm_pop2(vm);
 			ret->refs--;
 		}
