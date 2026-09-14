@@ -433,6 +433,21 @@ extern const char* _mario_lang;
 #define PROXY_SLOT_KEY   "@@pkey"      // hidden member on the @@proxyslot node's var: the key var
 #define OBJ_NO_EXT       "@@noext"     // hidden own member (V_BOOL true): preventExtensions applied
 
+/* Transient-receiver member write sentinel: `getObj().x = v` where the receiver
+ * is a transient value (refs<=1, e.g. a getter result such as the el.style
+ * wrapper). do_get(for_write) can not push the receiver's own node, because
+ * handle_getw releases the receiver the instant do_get returns and the node would
+ * dangle. It pushes a @@wslot node instead: a placeholder var carrying hidden
+ * @@wobj (the receiver, ref'd so it - and thus its member node - survives GC) and
+ * @@wname (the member name). wslot_write() resolves the real member node and
+ * writes through it. Without this the old path pushed the bare rvalue, so
+ * vm_pop2node returned NULL and handle_asign consumed two operands while pushing
+ * none - desyncing the value stack by one and corrupting every later receiver
+ * pick ("can not find function 'all'/'then'/'play'"). */
+#define WSLOT            "@@wslot"  // synthetic write-target node name (transient receiver)
+#define WSLOT_OBJ        "@@wobj"   // hidden member on the @@wslot node's var: the ref'd receiver
+#define WSLOT_KEY        "@@wkey"   // hidden member on the @@wslot node's var: the member key (string/symbol/number var)
+
 /* WeakRef / FinalizationRegistry (Phase 6). A WeakRef holds its target's raw
  * pointer in var->value (NEVER ref'd, so the target stays collectable) with a
  * no-op free_func; value==NULL means the reference has been cleared. A

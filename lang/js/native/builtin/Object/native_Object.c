@@ -158,30 +158,18 @@ var_t* native_enum_keys(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
 	var_t* obj = get_obj(env, "obj");
-	const char* name = get_str(env, "name");
+	var_t* name = get_obj(env, "name");
 	var_t* descriptor = get_obj(env, "descriptor");
-	if(var_is_proxy(obj)) {
-		var_t* keyv = var_new_str(vm, name);
-		var_ref(keyv);                                       // own it across the trap borrow
-		proxy_define_property(vm, obj, keyv, descriptor);    // defineProperty trap
-		var_unref(keyv);
-		return obj;
-	}
-	var_t* v = var_find_own_member_var(descriptor, "value");
-	node_t* node = var_add(obj, name, v);
-
-	v = var_find_own_member_var(descriptor, "writable");
-	if(v != NULL)
-		node->be_const = !var_get_bool(v);
-
-	v = var_find_own_member_var(descriptor, "enumerable");
-	if(v != NULL)
-		node->be_unenumerable = !var_get_bool(v);
-
-	v = var_find_own_member_var(descriptor, "configurable");
-	if(v != NULL)
-		node->be_const = !var_get_bool(v);
-	return NULL;
+	/* Route through the shared proxy-aware primitive so `Object.defineProperty`
+	 * and `Reflect.defineProperty` share one descriptor implementation. It
+	 * honours both data (`value`) and accessor (`get`/`set`) descriptors and
+	 * forwards a proxy target to its defineProperty trap. The previous open-coded
+	 * version only read `value`, so `{get:f}` installed nothing. */
+	var_t* keyv = (name != NULL) ? name : var_new_str(vm, get_str(env, "name"));
+	if(keyv != name) var_ref(keyv);                       // own the fallback string across the call
+	mario_define_property_var(vm, obj, keyv, descriptor);
+	if(keyv != name) var_unref(keyv);
+	return obj;                                           // spec: returns the target (was NULL, breaking chaining)
 }
 
 /* ---- ES6+ Object statics ---- */

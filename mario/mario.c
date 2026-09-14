@@ -4610,6 +4610,7 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		vm_push_scope(vm, sc);
 
 		//script function
+		int32_t frame_base = vm->stack_top; //value-stack baseline for this frame (env on top; == sc->stack_top)
 		vm->pc = func->pc;
 		vm->call_depth++;
 		bool returned = vm_run(vm); //with function return;
@@ -4618,6 +4619,20 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 			ret = vm_pop2(vm);
 			ret->refs--;
 		}
+		/* Contain any operands the body leaked BELOW the return value: truncate the
+		 * value stack back to the frame baseline (env left on top), exactly like
+		 * the throw path (vm_throw_truncate) and the generator completion path
+		 * (`while(vm->stack_top > stack_base) vm_pop`). handle_return pushes the
+		 * single return value on top of whatever the body left behind, so a callee
+		 * whose bytecode is imbalanced (observed in the minified FontFaceObserver
+		 * Promise executor on w3.org) otherwise hands its stale operands up to the
+		 * caller; the caller then picks the wrong receiver and
+		 * `Promise.all([font.load()])` fails with "can not find function 'all'".
+		 * Balanced bodies leave stack_top == frame_base after the vm_pop2 above, so
+		 * this is a single comparison in the common case. A terminated run
+		 * (vm_terminate clears the stack) leaves stack_top < frame_base: no-op. */
+		while(vm->stack_top > frame_base)
+			vm_pop(vm);
 		//scope's already poped with function return
 	}
 
@@ -4781,6 +4796,86 @@ static bool proxy_slot_write(vm_t* vm, node_t* n, var_t* val) {
 	return true;
 }
 
+/* ---- Transient-receiver member write sentinel ----
+ * `getObj().x = v` / `recv().x = v` where the receiver is a transient value
+ * (refs<=1, e.g. a getter result). do_get(for_write) can not push the receiver's
+ * own node: handle_getw releases the receiver the instant do_get returns, so the
+ * node would dangle. It pushes a @@wslot sentinel instead - a fresh placeholder
+ * var (never the member's own value, so a real object is not polluted) carrying
+ * hidden @@wobj (the receiver, ref'd so it and its member node survive GC) and
+ * @@wname (the member name). wslot_write() resolves the receiver's real member
+ * node and writes through it. The old path pushed the bare rvalue; vm_pop2node
+ * then returned NULL and handle_asign's null-target branch consumed two operands
+ * while pushing none, desyncing the value stack by one so the next opcode picked
+ * the wrong receiver - `Promise.all([fn()])` failed with "can not find function
+ * 'all'" and cascaded into every later lookup in the same script. */
+static inline bool is_wslot(node_t* n) {
+	return n != NULL && n->name != NULL && n->name[0] == '@' && strcmp(n->name, WSLOT) == 0;
+}
+
+static inline var_t* wslot_obj(node_t* n) { return var_find_own_member_var(n->var, WSLOT_OBJ); }
+static inline var_t* wslot_key(node_t* n) { return var_find_own_member_var(n->var, WSLOT_KEY); }
+
+/* Push a @@wslot write-target for `recv[key] = ..` on a transient `obj`. Adopts a
+ * reference each on `obj` and `key` (via the hidden @@wobj/@@wkey members) so the
+ * receiver - and thus the member node the write resolves to - outlives the
+ * caller's var_unref of its popped stack refs. `key` is a string/symbol var for a
+ * named member (do_get) or the subscript var for a computed one (array_at_push);
+ * a fresh refs-0 var is adopted directly, a popped stack var keeps its ref for the
+ * caller to release. */
+static void wslot_push(vm_t* vm, var_t* obj, var_t* key) {
+	var_t* cur = var_new(vm);   /* fresh placeholder; refs 0, adopted by the two refs below */
+	vm->gc.gc_defer++;          /* sn/cur are unrooted until vm_push_node */
+	var_ref(cur);               /* node's own reference */
+	node_t* sn = (node_t*)mario_malloc(sizeof(node_t));
+	memset(sn, 0, sizeof(node_t));
+	sn->magic = 1;
+	sn->name = (char*)mario_malloc(strlen(WSLOT)+1);
+	memcpy(sn->name, WSLOT, strlen(WSLOT)+1);
+	sn->var = cur;
+	node_t* on = var_add(cur, WSLOT_OBJ, obj);      /* var_add refs obj: keeps the receiver alive */
+	on->invisable = 1; on->be_unenumerable = 1;
+	node_t* kn = var_add(cur, WSLOT_KEY, key);      /* var_add refs key */
+	kn->invisable = 1; kn->be_unenumerable = 1;
+	vm_push_node(vm, sn);                           /* adds the stack reference to cur */
+	vm->gc.gc_defer--;
+}
+
+/* If `n` is a @@wslot write-target, write `val` through the receiver's real member
+ * node and return true (the caller frees the sentinel with node_free instead of
+ * node_replace). The hidden @@wobj/@@wkey back-refs are dropped afterwards so the
+ * receiver/key references are released once the sentinel is freed. */
+static bool wslot_write(vm_t* vm, node_t* n, var_t* val) {
+	if(!is_wslot(n))
+		return false;
+	var_t* obj = wslot_obj(n);
+	var_t* key = wslot_key(n);
+	if(obj != NULL && key != NULL) {
+		node_t* tn = NULL;
+		if(var_is_symbol(key)) {
+			const char* sk = var_symbol_key(key);
+			if(sk != NULL) tn = var_find_member_create(obj, sk);
+		}
+		else if(key->type == V_STRING) {
+			tn = var_find_member_create(obj, var_get_str(key));
+		}
+		else if(obj->is_array) {
+			tn = var_array_get(obj, var_get_int(key));
+		}
+		else {
+			char kb[32];
+			snprintf(kb, sizeof(kb), "%d", var_get_int(key));
+			tn = var_find_member_create(obj, kb);
+		}
+		if(tn != NULL)
+			node_replace(tn, val);      /* write through the receiver's real node (refs val) */
+	}
+	var_delete_own_member(n->var, WSLOT_OBJ);
+	var_delete_own_member(n->var, WSLOT_KEY);
+	return true;
+}
+
+
 
 /* Publish an arithmetic result. For a compound assignment (`x += y`) the freshly
  * built result var is installed through the lvalue's node instead of being
@@ -4792,8 +4887,10 @@ static inline void math_result(vm_t* vm, opr_code_t op, node_t* n, var_t* res) {
 		/* A synthetic @@taslot target (INSTR_ARRAY_AT_W): encode the result into
 		 * the TypedArray's buffer and free the sentinel instead of node_replace
 		 * (which would only rebind the throw-away node->var). A @@proxyslot target
-		 * drives the proxy set trap and is freed the same way. */
-		if(ta_slot_write(vm, n, res) || proxy_slot_write(vm, n, res))
+		 * drives the proxy set trap, and a @@wslot target (member write on a
+		 * transient receiver) writes through the receiver's real node; both are
+		 * freed the same way. */
+		if(ta_slot_write(vm, n, res) || proxy_slot_write(vm, n, res) || wslot_write(vm, n, res))
 			node_free(n);
 		else
 			node_replace(n, res); //the node takes its own reference to res.
@@ -5392,10 +5489,26 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		}
 	}
 
-	/* If v is transient the caller releases it right after we return, which
-	 * would free the node we push (e.g. `getObj().prop`). Push the value in
-	 * that case; keep node semantics for persistent objects so member
-	 * assignment (obj.x = v) can still write through the node. */
+	/* Read path: if v is transient the caller releases it right after we return,
+	 * which would free the node we push (e.g. `getObj().prop`), so push the value
+	 * (vm_push refs it); a persistent object keeps node semantics. */
+	if(for_write) {
+		/* Assignment target. A persistent receiver keeps its node alive, so push
+		 * the node and let handle_asign write through it. A TRANSIENT receiver
+		 * (refs<=1, e.g. a getter result) is released by handle_getw's var_unref(v)
+		 * the instant we return, dangling its node - route it through a @@wslot
+		 * sentinel that adopts a reference on the receiver and carries the member
+		 * name (see wslot_push). Pushing the bare rvalue here (the old behaviour)
+		 * made vm_pop2node return NULL and handle_asign consume two operands while
+		 * pushing none, desyncing the value stack by one. */
+		if(v->refs <= 1) {
+			var_t* kv = var_new_str(vm, name);   /* refs 0; adopted by wslot_push's @@wkey */
+			wslot_push(vm, v, kv);
+		}
+		else
+			vm_push_node(vm, n);
+		return;
+	}
 	if(v->refs <= 1)
 		vm_push(vm, n->var);
 	else
@@ -6518,8 +6631,27 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	 * collector out until v is back on the stack or released. See vm_step_op(). */
 	vm->gc.gc_defer++;
 	if(n == NULL) {
+		/* The target did not resolve to a writable node (e.g. `(a+b) = v`, or a
+		 * write through a bare rvalue). Still honour the assignment-expression
+		 * contract so the value stack stays balanced: yield the RHS (or elide it
+		 * when the result is immediately popped). Dropping the operand here - the
+		 * old behaviour - left the stack one slot short and desynced every later
+		 * receiver pick in the enclosing expression. */
 		mario_debug("Error: Can not find an assignable target!\n");
-		var_unref(v);
+		if((ins & INSTR_OPT_CACHE) == 0) {
+			if(OP(code[vm->pc]) != INSTR_POP) {
+				vm_push(vm, (v != NULL) ? v : var_new(vm));
+			}
+			else {
+				code[vm->pc] = INSTR_NIL;
+				code[vm->pc-1] |= INSTR_OPT_CACHE;
+			}
+		}
+		else {
+			vm->pc++;
+		}
+		if(v != NULL)
+			var_unref(v);
 		vm->gc.gc_defer--;
 		return;
 	}
@@ -6528,8 +6660,10 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	 * buffer, free the sentinel, and yield v as the assignment expression's
 	 * value. vm_pop2node left the decoded element holding its stack reference, so
 	 * release it here (mirroring the var_unref(n->var) on the normal path);
-	 * node_free then releases the node's own reference and frees the sentinel. */
-	if(ta_slot_write(vm, n, v) || proxy_slot_write(vm, n, v)) {
+	 * node_free then releases the node's own reference and frees the sentinel.
+	 * A @@wslot target (member write on a transient receiver) and a @@proxyslot
+	 * target are consumed the same way. */
+	if(ta_slot_write(vm, n, v) || proxy_slot_write(vm, n, v) || wslot_write(vm, n, v)) {
 		var_unref(n->var);
 		node_free(n);
 		if((ins & INSTR_OPT_CACHE) == 0) {
@@ -7079,6 +7213,19 @@ static inline void handle_func(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		 * enclosing function env (vm_find_in_scopes). Unlike the disabled
 		 * vm_capture_closure this never captures a call env at definition time. */
 		scope_t* dsc = vm_get_scope(vm);
+		/* Walk past transient literal scopes first: a function written as a member
+		 * of an object/array literal - e.g. the getter inside the descriptor
+		 * `{get:function(){ return someLet; }}` handed to Object.defineProperty -
+		 * has the literal's scope on top, which is neither a block nor a function
+		 * scope. Testing only the immediate scope made capture fall through to the
+		 * nearest function env (vm_capture_closure below) and skip the intervening
+		 * block that actually holds the `let`/`const` binding the closure reads.
+		 * Once that block scope pops and the gc collects the unrooted block, the
+		 * getter resolves the name to garbage - the w3.org webpack module exports
+		 * failed as `'accountMenu'/'cardEnhancement'/... undefined!`. Climbing to
+		 * the innermost block (or function) scope captures the right env. */
+		while(dsc != NULL && !dsc->is_block && !dsc->is_func)
+			dsc = dsc->prev;
 		if(dsc != NULL && dsc->is_block && !var_empty(dsc->var)) {
 			func_t* f = var_get_func(v);
 			if(f != NULL && f->closure.var == NULL) {
@@ -7954,7 +8101,7 @@ static int64_t ta_key_index(var_t* v2) {
  * arrive owning their value-stack references and are released here. Pushes the
  * element/member value or, for a persistent receiver, the binding node so a
  * following assignment can write through it. */
-static void array_at_push(vm_t* vm, var_t* v1, var_t* v2) {
+static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 	/* Proxy indexed read: `p[key]` routes the get trap with the key var (string,
 	 * symbol or number). v1/v2 arrive holding the caller's popped stack refs, which
 	 * this branch releases exactly like the plain path below. */
@@ -8010,6 +8157,18 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2) {
 		int at = var_get_int(v2);
 		n = var_array_get(v1, at);
 	}
+	if(for_write && v1->refs <= 1) {
+		/* Computed write on a TRANSIENT receiver (`getArr()[i] = v`, `f()["k"] = v`):
+		 * the node lives inside v1 and would dangle once v1 is released below, and
+		 * pushing the bare rvalue made vm_pop2node return NULL so handle_asign
+		 * dropped an operand and desynced the value stack. Route through a @@wslot
+		 * sentinel that adopts refs on v1 and the key v2; wslot_write re-resolves
+		 * the member node and writes through it. */
+		wslot_push(vm, v1, v2);
+		var_unref(v1);
+		var_unref(v2);
+		return;
+	}
 	if(n != NULL) {
 		/* If v1 is transient (its only reference is the one released just
 		 * below), the node lives inside v1 and would dangle once v1 is freed
@@ -8036,7 +8195,7 @@ static inline void handle_array_at(vm_t* vm, PC ins, opr_code_t instr, uint32_t 
 		if(v2 != NULL) var_unref(v2);
 		return;
 	}
-	array_at_push(vm, v1, v2);
+	array_at_push(vm, v1, v2, false);
 }
 
 /* Subscript as an assignment target (`ta[i] = ..`, `ta[i] += ..`, `ta[i]++`).
@@ -8086,7 +8245,7 @@ static inline void handle_array_at_w(vm_t* vm, PC ins, opr_code_t instr, uint32_
 		var_unref(v2);
 		return;
 	}
-	array_at_push(vm, v1, v2);
+	array_at_push(vm, v1, v2, true);
 }
 
 
@@ -8448,6 +8607,44 @@ static bool mario_define_default(vm_t* vm, var_t* obj, var_t* key, var_t* desc) 
 		return false;
 	char numbuf[32];
 	const char* ks = proxy_key_cstr(key, numbuf, sizeof(numbuf));
+
+	/* ES6 accessor descriptor: `{get:f}` / `{set:f}` / both. Represent it exactly
+	 * like an object-literal accessor (see merge_accessor): the getter's func_t is
+	 * tagged FUNC_GETTER and becomes the primary member var; when a setter is
+	 * present too it is tagged FUNC_SETTER and hangs off the getter as the hidden
+	 * FUNC_SETTER_KEY member, so do_get/do_set dispatch through the same path as a
+	 * `{get f(){}}` literal. The previous value-only implementation installed
+	 * `undefined` for a `{get:f}` descriptor, which broke webpack's ESM export
+	 * getters (`Object.defineProperty(exports, key, {enumerable:true, get: fn})`)
+	 * and surfaced downstream as cascading "value is not a function!" errors. */
+	var_t* getter = (desc != NULL) ? var_find_own_member_var(desc, "get") : NULL;
+	var_t* setter = (desc != NULL) ? var_find_own_member_var(desc, "set") : NULL;
+	bool has_get = (getter != NULL && getter->is_func);
+	bool has_set = (setter != NULL && setter->is_func);
+	if(has_get || has_set) {
+		if(has_get) {
+			func_t* gf = var_get_func(getter);
+			if(gf != NULL) gf->regular = FUNC_GETTER;
+		}
+		if(has_set) {
+			func_t* sf = var_get_func(setter);
+			if(sf != NULL) sf->regular = FUNC_SETTER;
+		}
+		var_t* primary = has_get ? getter : setter;
+		if(has_get && has_set) {
+			node_t* sn = var_add(getter, FUNC_SETTER_KEY, setter);
+			if(sn != NULL) { sn->invisable = 1; sn->be_unenumerable = 1; }
+		}
+		node_t* node = var_add(obj, ks, primary);
+		if(node == NULL)
+			return false;
+		var_t* e = var_find_own_member_var(desc, "enumerable");
+		if(e != NULL) node->be_unenumerable = !var_get_bool(e);
+		var_t* c = var_find_own_member_var(desc, "configurable");
+		if(c != NULL) node->be_const = !var_get_bool(c);
+		return true;
+	}
+
 	var_t* val = (desc != NULL) ? var_find_own_member_var(desc, "value") : NULL;
 	node_t* node = var_add(obj, ks, val);
 	if(node == NULL)
@@ -8535,7 +8732,7 @@ var_t* mario_get_var(vm_t* vm, var_t* obj, var_t* key, var_t* receiver) {
 		var_ref(obj);
 		var_t* k = (key != NULL) ? key : var_new(vm);
 		var_ref(k);
-		array_at_push(vm, obj, k);           // consumes both refs; pushes
+		array_at_push(vm, obj, k, false);    // consumes both refs; pushes
 		res = vm_pop2(vm);
 	}
 	if(res != NULL && res->refs > 0) res->refs--;   // release the push ref -> baseline
