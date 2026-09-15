@@ -3509,12 +3509,26 @@ void var_to_str(var_t* var, mstr_t* ret) {
 		{
 			vm_t* vm = var->vm;
 			var_t* rval = NULL;
-			if(vm != NULL && !var->is_func && vm->to_str_depth < 16) {
-				/* Symbol.toPrimitive takes precedence over toString. */
-				if(!var_is_symbol(var))
+			if(vm != NULL && vm->to_str_depth < 16) {
+				/* Symbol.toPrimitive takes precedence over toString (plain objects).
+				 * Functions skip ToPrimitive and go straight to their toString. */
+				if(!var_is_symbol(var) && !var->is_func)
 					rval = vm_to_primitive(vm, var, "string");
 				if(rval == NULL) {
 					node_t* ts = var_find_member(var, "toString");
+					/* Functions don't chain to Function.prototype (see find_func), so a
+					 * plain member walk lands on Object.prototype.toString. Serve the
+					 * Function class's toString instead so String(fn) shows the
+					 * "[native code]" marker core-js's inspectSource checks for. */
+					if(var->is_func && vm->builtin_vars.var_Function != NULL &&
+					   vm->builtin_vars.var_Object != NULL) {
+						node_t* ots = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Object), "toString");
+						if(ts == NULL || ts == ots) {
+							node_t* fn = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Function), "toString");
+							if(fn != NULL)
+								ts = fn;
+						}
+					}
 					if(ts != NULL && ts->var != NULL && ts->var->is_func) {
 						vm->to_str_depth++;
 						rval = call_m_func(vm, var, ts->var, NULL);
@@ -4523,6 +4537,19 @@ static var_t* find_func(vm_t* vm, var_t* obj, const char* fname) {
 			(strcmp(fname, "call") == 0 || strcmp(fname, "apply") == 0 ||
 			 strcmp(fname, "bind") == 0)) {
 		node = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Function), fname);
+	}
+	/* Same wiring gap for `fn.toString()`: the chain hands Object.prototype's
+	 * toString, so core-js's inspectSource never sees "[native code]". When the
+	 * resolved member is Object.prototype's own toString (or nothing), call the
+	 * Function class's toString instead. */
+	if(obj != NULL && obj->is_func && strcmp(fname, "toString") == 0 &&
+			vm->builtin_vars.var_Function != NULL && vm->builtin_vars.var_Object != NULL) {
+		node_t* ots = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Object), "toString");
+		if(node == NULL || (ots != NULL && node == ots)) {
+			node_t* fn = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Function), "toString");
+			if(fn != NULL)
+				node = fn;
+		}
 	}
 	if(node == NULL) {
 		node = vm_find_in_scopes(vm, fname);
@@ -5589,6 +5616,23 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 	}	
 
 	node_t* n = var_find_member(v, name);
+	/* Function.prototype.toString: functions carry Object.prototype as their
+	 * prototype (see native_Function.c), so `fn.toString` would resolve to
+	 * Object.prototype.toString ("[object Function]") and core-js's
+	 * inspectSource could never see the "[native code]" marker it uses to trust
+	 * builtins. When the chain resolved toString to Object.prototype's own
+	 * member (or to nothing), serve the Function class's own toString. */
+	if(!for_write && v->is_func && strcmp(name, "toString") == 0 &&
+	   vm->builtin_vars.var_Function != NULL && vm->builtin_vars.var_Object != NULL) {
+		node_t* ots = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Object), "toString");
+		if(n == NULL || (ots != NULL && n == ots)) {
+			node_t* fn = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Function), "toString");
+			if(fn != NULL && fn->var != NULL) {
+				vm_push(vm, fn->var);
+				return;
+			}
+		}
+	}
 	/* Reading `.call`/`.apply`/`.bind` off a callable: the universal Function
 	 * methods are resolved here (same fallback find_func uses for calls) so
 	 * `var c = f.call` and `typeof f.call` behave like a real engine. */
@@ -8725,6 +8769,38 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 		int at = var_get_int(v2);
 		n = var_array_get(v1, at);
 	}
+	/* Accessor via computed key (`navigator["userAgent"]`, `obj[k]` where k names
+	 * a getter property): the string/symbol path above resolves the member node
+	 * but, unlike do_get, never invoked the getter - core-js reads builtins
+	 * exclusively through `global[ns][method]`, so it received the getter
+	 * FUNCTION itself (then e.g. ua.match(...) missed on a non-string). Mirror
+	 * do_get: a read invokes the getter with this=v1; an assignment target pushes
+	 * [obj, node] so handle_asign drives the setter. */
+	if(n != NULL && var_is_accessor(n->var)) {
+		if(for_write) {
+			if(v1->refs <= 1)
+				wslot_push(vm, v1, v2);
+			else {
+				vm_push(vm, v1);      /* setter's `this` */
+				vm_push_node(vm, n);
+			}
+			var_unref(v1);
+			var_unref(v2);
+			return;
+		}
+		var_t* getter = var_accessor_getter(n->var);
+		if(getter != NULL) {
+			var_ref(getter);
+			func_call(vm, v1, getter, 0); /* pushes the computed value; v1 stays rooted by our stack ref */
+			var_unref(getter);
+		}
+		else {
+			vm_push(vm, var_new(vm)); /* write-only property reads as undefined */
+		}
+		var_unref(v1);
+		var_unref(v2);
+		return;
+	}
 	if(for_write && v1->refs <= 1) {
 		/* Computed write on a TRANSIENT receiver (`getArr()[i] = v`, `f()["k"] = v`):
 		 * the node lives inside v1 and would dangle once v1 is released below, and
@@ -10334,6 +10410,13 @@ static node_t* reg_native_to(vm_t* vm, var_t* target, const char* decl, native_f
 	var_t* var = var_new_func(vm, func);
 	node_t* node = var_add(cls_var, name->cstr, var);
 	node->be_unenumerable = true;
+	/* Remember the declared name on the function var itself so
+	 * Function.prototype.toString can render `function name() { [native code] }`
+	 * (core-js's inspectSource relies on that marker to trust natives). Hidden
+	 * and unenumerable, like V8's internal name slot. */
+	node_t* fnn = var_add(var, "@@fname", var_new_str(vm, name->cstr));
+	fnn->invisable = 1;
+	fnn->be_unenumerable = true;
 	mstr_free(name);
 
 	return node;
