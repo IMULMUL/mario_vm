@@ -2139,8 +2139,15 @@ node_t* var_array_get(var_t* var, int32_t index) {
 	}
 
 	node_t* node = (node_t*)hash_map_get(&arr_var->children, key);
-	if(node_empty(node))
+	if(node_empty(node)) {
+		if(getenv("MARIO_ARRDBG")) { /* DIAG (temp): why did the index read miss? */
+			var_t* sub = var->is_array ? var_find_own_member_var(var, "_ARRAY_") : NULL;
+			fprintf(stderr, "[DIAGARR] get[%d] miss: var=%p is_array=%u type=%u sub=%p subsize=%u\n",
+				(int)index, (void*)var, (unsigned)var->is_array, (unsigned)var->type,
+				(void*)sub, sub ? (unsigned)hash_map_size(&sub->children) : 9999u);
+		}
 		return NULL;
+	}
 	return node;
 }
 
@@ -7527,10 +7534,14 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		func_call(vm, obj, func, arg_num);
 	}
 	else {
-		if(getenv("MARIO_CNFDBG")) { /* DIAG (opt-in): identify the receiver that lacks the member */
-			fprintf(stderr, "[DIAGCNF] '%s' obj=%p type=%u is_array=%u is_func=%u\n",
+		if(getenv("MARIO_CNFDBG") ||
+		   strcmp(name->cstr, "insertBefore") == 0 ||
+		   strcmp(name->cstr, "match") == 0 ||
+		   strcmp(name->cstr, "concat") == 0) { /* DIAG (temp): identify the receiver that lacks the member */
+			fprintf(stderr, "[DIAGCNF] '%s' obj=%p type=%u is_array=%u is_func=%u vm=%d refs=%d\n",
 				name->cstr, (void*)obj, obj ? (unsigned)obj->type : 99u,
-				obj ? (unsigned)obj->is_array : 0u, obj ? (unsigned)obj->is_func : 0u);
+				obj ? (unsigned)obj->is_array : 0u, obj ? (unsigned)obj->is_func : 0u,
+				(obj != NULL && obj->vm != NULL) ? 1 : 0, obj ? (int)obj->refs : -1);
 			if(obj != NULL && obj->type == V_STRING) {
 				const char* cs = var_get_str(obj);
 				fprintf(stderr, "[DIAGCNF]   str=%.60s\n", cs ? cs : "(null)");
@@ -8668,6 +8679,20 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 		return;
 	}
 	node_t* n = NULL;
+	if(getenv("MARIO_ARRDBG") && v1 != NULL && v1->is_array) { /* DIAG (temp): which subscript branch does arr[i] take? */
+		var_t* sub = var_find_own_member_var(v1, "_ARRAY_");
+		fprintf(stderr, "[DIAGAT] v1=%p is_array=%u v2type=%u v2i=%d sub=%p subsize=%u keys=[",
+			(void*)v1, (unsigned)v1->is_array, v2 ? (unsigned)v2->type : 99u,
+			v2 ? var_get_int(v2) : -1, (void*)sub,
+			sub ? (unsigned)hash_map_size(&sub->children) : 9999u);
+		if(sub != NULL) {
+			uint32_t shown = 0;
+			for(uint32_t b = 0; b < sub->children.capacity && shown < 24; ++b)
+				for(hash_entry_t* e = sub->children.buckets[b]; e != NULL && shown < 24; e = e->next, ++shown)
+					fprintf(stderr, "%s,", e->key);
+		}
+		fprintf(stderr, "]\n");
+	}
 	if(var_is_symbol(v2)) {
 		/* ES6 symbol key: obj[sym] resolves through the symbol's unique key. */
 		const char* sk = var_symbol_key(v2);
