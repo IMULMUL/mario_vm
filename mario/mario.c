@@ -2160,6 +2160,16 @@ node_t* var_array_set(var_t* var, int32_t index, var_t* set_var) {
 
 node_t* var_array_add(var_t* var, var_t* add_var) {
 	node_t* ret = NULL;
+	/* A refcount underflow can leave `var` (the array `this`) dangling: it was
+	 * freed and recycled while a stale value-stack slot still aliased it, so a
+	 * later nested bound-call -> push reaches here with a dead pointer whose
+	 * reused block can read as status-live (var_empty alone misses it).
+	 * var_find_own_member_var() on it walks wild children buckets (SIGSEGV in
+	 * hash_map_get). The is_array identity bit rejects recycled non-array
+	 * garbage; bail to NULL so the push is a harmless no-op instead of
+	 * killing the process. */
+	if(var_empty(var) || !var->is_array)
+		return NULL;
 	var_t* arr_var = var_find_own_member_var(var, "_ARRAY_");
 	if(arr_var != NULL) {
 		// Get current size to use as next index
@@ -2174,6 +2184,8 @@ node_t* var_array_add(var_t* var, var_t* add_var) {
 
 node_t* var_array_add_head(var_t* var, var_t* add_var) {
 	node_t* ret = NULL;
+	if(var_empty(var) || !var->is_array)
+		return NULL;
 	var_t* arr_var = var_find_own_member_var(var, "_ARRAY_");
 	if(arr_var != NULL)
 		ret = var_add_head(arr_var, "", add_var);
@@ -3858,7 +3870,7 @@ static var_t* vm_stack_pick(vm_t* vm, int depth) {
 static inline var_t* vm_get_scope_var(vm_t* vm) {
 	var_t* ret = vm->root;
 	scope_t* sc = vm_get_scope(vm);
-	if(sc != NULL && !var_empty(sc->var))
+	if(sc != NULL && (sc->is_with || !var_empty(sc->var)))
 		ret = sc->var;
 	return ret;
 }
@@ -3876,6 +3888,8 @@ static scope_t* scope_new(var_t* var) {
 	sc->is_try = false;
 	sc->is_loop = false;
 	sc->is_switch = false;
+	sc->is_label = false;
+	sc->label = NULL;
 	return sc;
 }
 
@@ -4040,15 +4054,20 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 		if(++scope_guard > VM_SCOPE_STACK_MAX)
 			break;
 		if(!var_empty(sc->var)) {
-			ret = var_find_own_member(sc->var, name);
+			/* with-object scope: resolve through the member chain (prototype
+			 * included), because native hosts (Math, document) carry their
+			 * methods on the prototype and may have no own members at all. */
+			ret = sc->is_with ? var_find_member(sc->var, name)
+			                  : var_find_own_member(sc->var, name);
 			if(ret != NULL)
 				return ret;
-			
-			var_t* obj = get_obj(sc->var, THIS);
-			if(obj != NULL) {
-				ret = var_find_member(obj, name);
-				if(ret != NULL)
-					return ret;
+			if(!sc->is_with) {
+				var_t* obj = get_obj(sc->var, THIS);
+				if(obj != NULL) {
+					ret = var_find_member(obj, name);
+					if(ret != NULL)
+						return ret;
+				}
 			}
 		}
 		/* Nested block / object-literal scopes are not is_func, so their captured
@@ -4537,7 +4556,15 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		}	
 		if(v != NULL) {
 			var_array_add(args, v);
-			var_add(env, arg_name, v);
+			/* env can be recycled out from under this frame: get_from_free() may hand
+			 * back a var whose address is still sitting in a stale value-stack slot (a
+			 * var freed while stacked). A vm_pop2()/var_unref() of that slot during the
+			 * argument collection above then drops env to 0 refs mid-setup, and binding
+			 * into the dead env dereferences its zeroed children map (SIGSEGV inside
+			 * hash_map_add). Skip the bind; the liveness bail below unwinds the frame
+			 * cleanly with undefined instead of crashing. */
+			if(!var_empty(env))
+				var_add(env, arg_name, v);
 			var_unref(v);
 		}
 	}
@@ -4559,6 +4586,14 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 	}
 
 	var_t* ret = NULL;
+	if(var_empty(env)) {
+		/* env died during argument setup (see the guard above): this frame is
+		 * unrecoverable. Drop the setup gc-defer and deliver undefined rather than
+		 * pushing/running a native or body on a freed env. */
+		vm->gc.gc_defer--;
+		vm_push(vm, var_new(vm));
+		return true;
+	}
 	vm_push(vm, env); //avoid for gc
 	vm->gc.gc_defer--; //env is now rooted on the stack; gc is safe again.
 	if(func->native != NULL) { //native function
@@ -5463,6 +5498,19 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 	}	
 
 	node_t* n = var_find_member(v, name);
+	/* Reading `.call`/`.apply`/`.bind` off a callable: the universal Function
+	 * methods are resolved here (same fallback find_func uses for calls) so
+	 * `var c = f.call` and `typeof f.call` behave like a real engine. */
+	if(n == NULL && !for_write && v->is_func &&
+	   vm->builtin_vars.var_Function != NULL &&
+	   (strcmp(name, "call") == 0 || strcmp(name, "apply") == 0 ||
+	    strcmp(name, "bind") == 0)) {
+		node_t* fn = var_find_own_member(var_get_prototype(vm->builtin_vars.var_Function), name);
+		if(fn != NULL && fn->var != NULL) {
+			vm_push(vm, fn->var);
+			return;
+		}
+	}
 	if(n != NULL && var_is_accessor(n->var)) {
 		if(for_write) {
 			vm_push(vm, v);        //object for the setter's `this`
@@ -5529,6 +5577,7 @@ static void do_extends(vm_t* vm, var_t* cls_var, const char* super_name) {
 	}
 
 	var_set_father(cls_var, n->var);
+	var_add(cls_var, "@super", n->var); // var_add takes its own reference
 }
 
 /** create object by classname or function */
@@ -5568,6 +5617,71 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 	var_t* protoV = var_get_prototype(ctor_var);
 	obj = var_new_obj(vm, protoV, NULL, NULL);
 	var_t* constructor = NULL;
+
+	/* ES2022 instance fields: replay the (name, initializer-fn) pairs recorded
+	 * by INSTR_FIELDN on the fresh object with `this` bound to it, superclass
+	 * first, before the constructor body runs. The chain is walked through the
+	 * hidden "@super" link recorded at extends time. */
+	{
+		var_t* chain[32];
+		int cn = 0;
+		for(var_t* c = ctor_var; c != NULL && cn < 32; c = NULL)
+		{
+			chain[cn++] = c;
+			node_t* sn = var_find_own_member(c, "@super");
+			c = (sn != NULL) ? sn->var : NULL;
+		}
+		/* The chain always holds at least ctor_var, so `cn > 0` is no guard at all.
+		 * obj is created at baseline refs (0) and is handed back to the caller at
+		 * baseline refs, so a var_ref()/var_unref() pair around a no-op loop dropped
+		 * it to 0 and FREED the fresh instance: var_clean() memset it (prototype link
+		 * included) and pushed it onto the free pool, then func_call()'s argument
+		 * setup recycled that very address, so every `new X()` returned an object
+		 * with no prototype - inherited methods and `instanceof` were dead while own
+		 * members the constructor added still worked. Only take the protection ref
+		 * when a class in the chain really declares fields, and release it with a
+		 * bare decrement (never var_unref) to honour the baseline-refs contract. */
+		bool has_fields = false;
+		for(int i = 0; i < cn; i++) {
+			node_t* fe = var_find_own_member(chain[i], "@fields");
+			if(fe != NULL && fe->var != NULL && fe->var->is_array &&
+			   var_array_size(fe->var) > 0) {
+				has_fields = true;
+				break;
+			}
+		}
+		if(has_fields) {
+			var_ref(obj);
+			for(int i = cn - 1; i >= 0; i--) {
+				node_t* fe = var_find_own_member(chain[i], "@fields");
+				if(fe == NULL || fe->var == NULL || !fe->var->is_array)
+					continue;
+				uint32_t fc = var_array_size(fe->var);
+				for(uint32_t k = 0; k < fc; k++) {
+					var_t* pair = var_array_get_var(fe->var, (int32_t)k);
+					if(pair == NULL || !pair->is_array)
+						continue;
+					var_t* nmv = var_array_get_var(pair, 0);
+					var_t* fnv = var_array_get_var(pair, 1);
+					if(nmv == NULL || fnv == NULL || !fnv->is_func)
+						continue;
+					const char* fs = var_get_str(nmv);
+					if(fs == NULL)
+						continue;
+					var_ref(fnv);
+					func_call(vm, obj, fnv, 0);
+					var_t* rv = vm_pop2(vm);
+					if(rv == NULL)
+						rv = var_new(vm);
+					node_t* rn = var_add(obj, fs, rv);
+					if(rn != NULL)
+						var_unref(rv);
+					var_unref(fnv);
+				}
+			}
+			obj->refs--; //release protection ref without freeing (baseline-refs contract)
+		}
+	}
 
 	if(ctor_var->is_func) { // new object built by function call
 		constructor = ctor_var;
@@ -5813,6 +5927,59 @@ static void do_include(vm_t* vm, const char* jsname) {
 	vm->pc = pc;
 }
 
+/* ES6 module resolution/evaluation. Returns the namespace object of module
+ * `spec`, loading and running its source exactly once (the registry caches by
+ * specifier, so a diamond import shares one evaluation and a circular import
+ * gets the partially-populated namespace instead of re-entering). The namespace
+ * is registered BEFORE the body runs so `export` instructions executed by the
+ * body land in it via vm->cur_module.
+ *
+ * The returned var is owned by the registry (a hidden "@@modules" member of
+ * root, hence GC-rooted); the caller treats it as borrowed and, if it pushes it
+ * onto the value stack, vm_push takes the balancing reference. On a loader
+ * failure an empty namespace is returned so the importer still binds undefined
+ * rather than crashing. */
+static var_t* do_module(vm_t* vm, const char* spec) {
+	if(vm->modules == NULL) {
+		vm->modules = var_new_obj_no_proto(vm, NULL, NULL);
+		node_t* mn = var_add(vm->root, "@@modules", vm->modules);
+		if(mn != NULL) {
+			mn->invisable = 1;
+			mn->be_unenumerable = 1;
+		}
+	}
+
+	node_t* hit = var_find_own_member(vm->modules, spec);
+	if(hit != NULL && hit->var != NULL)
+		return hit->var; // already loaded, or in-progress (circular import)
+
+	if(_load_m_func == NULL) {
+		mario_printf("Error: no module loader, can not import '%s'!\n", spec);
+		return var_new_obj_no_proto(vm, NULL, NULL); // empty, unregistered
+	}
+
+	/* Create + register the namespace first (circular-import safe). var_add takes
+	 * the reference, so the freshly-created (refs==0) var is owned by the registry
+	 * afterwards and must NOT be unref'd here. */
+	var_t* ns = var_new_obj_no_proto(vm, NULL, NULL);
+	var_add(vm->modules, spec, ns);
+
+	mstr_t* js = _load_m_func(vm, spec);
+	if(js == NULL) {
+		mario_printf("Error: module '%s' not found!\n", spec);
+		return ns; // registered but empty
+	}
+
+	var_t* saved_mod = vm->cur_module;
+	PC saved_pc = vm->pc;
+	vm->cur_module = ns;
+	vm_load_run(vm, js->cstr);
+	mstr_free(js);
+	vm->cur_module = saved_mod;
+	vm->pc = saved_pc;
+	return ns;
+}
+
 /* Instruction handler function type for table-based dispatch */
 typedef void (*instr_handler_t)(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset);
 
@@ -5842,7 +6009,7 @@ static inline void handle_njmp(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	var_unref(v);
 }
 
-static inline void handle_load(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe) {
 	bool loaded = false;
 	node_t* node = NULL;
 	if(offset == vm->this_strIndex) {
@@ -5862,6 +6029,13 @@ static inline void handle_load(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		const char* s = bc_getstr(&vm->bc, offset);
 		node = vm_load_node(vm, s, false);
 		if(node == NULL) {
+			if(safe) {
+				/* `typeof undeclared` is "undefined", never a ReferenceError,
+				 * even inside strict code: push undefined and (unlike the
+				 * non-strict LOAD path) create no binding. */
+				vm_push(vm, var_new(vm));
+				return;
+			}
 			scope_t* sc = vm_get_strict_scope(vm); //check strict mode
 			if(sc != NULL) {
 				vm_throw(vm, "'%s' undefined!", s);	
@@ -5878,6 +6052,16 @@ static inline void handle_load(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 
 	if(vm->gen_depth == 0 && vm_get_loop_scope(vm) != NULL) //only cache in loop scope (never in a generator: suspension outlives the cached nodes).
 		load_ncache(vm, node, vm->pc-1);
+}
+
+static inline void handle_load(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	handle_load_impl(vm, offset, false);
+}
+
+/* LOAD_SAFE $n: the direct bare-identifier operand of `typeof`. Resolution is
+ * identical to LOAD; only an unresolvable name differs (undefined, no throw). */
+static inline void handle_load_safe(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	handle_load_impl(vm, offset, true);
 }
 
 static inline void handle_compare(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -5925,6 +6109,15 @@ static inline void handle_block(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		sc->is_switch = true;
 		sc->pc = vm->pc+1;
 	}
+	else if(instr == INSTR_LABEL) {
+		/* Labeled-statement scope (`outer: { ... }`): sc->pc is the break anchor
+		 * (the reserved JMP-to-end slot the compiler emits right after the LABEL's
+		 * flow-skip JMP), and sc->label names it so a matching `break outer` can
+		 * find it. An unlabeled break/continue never stops here. */
+		sc->is_label = true;
+		sc->label = bc_getstr(&vm->bc, offset);
+		sc->pc = vm->pc+1;
+	}
 	vm_push_scope(vm, sc);
 }
 
@@ -5933,6 +6126,13 @@ static inline void handle_block_end(vm_t* vm, PC ins, opr_code_t instr, uint32_t
 }
 
 static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	/* `break <label>` carries the label name as its string operand; an unlabeled
+	 * `break` has an empty operand (OFF_MASK -> ""). A labeled break unwinds to
+	 * the matching labeled-statement scope (skipping any inner loops/switches,
+	 * which are popped here), while an unlabeled break stops at the innermost
+	 * loop or switch. */
+	const char* label = bc_getstr(&vm->bc, offset);
+	bool labeled = (label != NULL && label[0] != 0);
 	while(true) {
 		scope_t* sc = vm_get_scope(vm);
 		if(sc == NULL) {
@@ -5940,7 +6140,13 @@ static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 			vm_terminate(vm);
 			break;
 		}
-		if(sc->is_loop || sc->is_switch) {
+		if(labeled) {
+			if(sc->is_label && sc->label != NULL && strcmp(sc->label, label) == 0) {
+				vm->pc = sc->pc;
+				break;
+			}
+		}
+		else if(sc->is_loop || sc->is_switch) {
 			vm->pc = sc->pc;
 			break;
 		}
@@ -5949,6 +6155,43 @@ static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 }
 
 static inline void handle_continue(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	/* `continue <label>` carries the label name as its string operand; an
+	 * unlabeled `continue` has an empty operand (OFF_MASK -> ""). An unlabeled
+	 * continue restarts the innermost enclosing loop. A labeled continue restarts
+	 * the loop that the label directly wraps (`L: for(...){ ... continue L; }`):
+	 * walk the scope chain to the labeled scope L, take its immediate child (the
+	 * loop it labels), pop every scope above that loop, then jump to the loop's
+	 * start. The label and loop scopes stay on the stack since iteration
+	 * continues. */
+	const char* label = bc_getstr(&vm->bc, offset);
+	bool labeled = (label != NULL && label[0] != 0);
+	if(labeled) {
+		scope_t* target_loop = NULL;
+		scope_t* child = NULL;
+		scope_t* sc = vm_get_scope(vm);
+		while(sc != NULL) {
+			if(sc->is_label && sc->label != NULL && strcmp(sc->label, label) == 0) {
+				if(child != NULL && child->is_loop)
+					target_loop = child;
+				break;
+			}
+			child = sc;
+			sc = sc->prev;
+		}
+		if(target_loop == NULL) {
+			mario_printf("Error: 'continue %s' has no matching labeled loop!\n", label);
+			vm_terminate(vm);
+			return;
+		}
+		while(true) {
+			scope_t* top = vm_get_scope(vm);
+			if(top == NULL || top == target_loop)
+				break;
+			vm_pop_scope(vm);
+		}
+		vm->pc = target_loop->pc_start;
+		return;
+	}
 	while(true) {
 		scope_t* sc = vm_get_scope(vm);
 		if(sc == NULL) {
@@ -6546,8 +6789,21 @@ static inline void handle_const(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	var_t* v = vm_get_scope_var(vm);
 	node_t *node = var_find_own_member(v, s);
 	if(node != NULL) {
-		mario_debug("Error: let '%s' has already existed!\n", s);
-		vm_throw(vm, "let '%s' has already existed!", s);
+		if(node->be_import) {
+			/* A circular import bound this name as a placeholder before the real
+			 * declaration ran; adopt the existing node instead of throwing. */
+			node->be_import = 0;
+			if(node->var != NULL) {
+				var_unref(node->var);
+				node->var = var_ref(var_new(vm));
+			}
+			if(instr == INSTR_CONST)
+				node->be_const = true;
+		}
+		else {
+			mario_debug("Error: let '%s' has already existed!\n", s);
+			vm_throw(vm, "let '%s' has already existed!", s);
+		}
 	}
 	else {
 		node = var_add(v, s, NULL);
@@ -8084,6 +8340,13 @@ static inline void handle_memberv(vm_t* vm, PC ins, opr_code_t instr, uint32_t o
 		node_t* n = var_add(var, key, v);
 		if(key_is_symbol && n != NULL)
 			n->be_unenumerable = 1; /* symbol keys hidden from Object.keys/for..in */
+		/* computed class method (`[Symbol.iterator](){} `): like named class
+		 * methods it lives on the prototype non-enumerably. */
+		if(n != NULL && v->is_func) {
+			scope_t* sc = vm_get_scope(vm);
+			if(sc != NULL && sc->class_var != NULL)
+				n->be_unenumerable = 1;
+		}
 	}
 	var_unref(v);
 	if(k != NULL)
@@ -8331,6 +8594,81 @@ static inline void handle_class_end(vm_t* vm, PC ins, opr_code_t instr, uint32_t
 		cls = vm_get_scope_var(vm);
 	vm_push(vm, cls);
 	vm_pop_scope(vm);
+}
+
+/* `extends <expr>` where the superclass is a general left-hand-side expression
+ * (a member expression `namespace.Base`, a call `getBase()`, a parenthesised
+ * expression, ...) rather than a bare identifier. handle_class has already
+ * created the class var and pushed the class-definition scope (sc->class_var),
+ * and the compiler evaluated <expr> right after, so the superclass VALUE sits on
+ * top of the stack. Pop it and link the class's prototype chain, exactly like the
+ * name-based do_extends() path does for a simple identifier. */
+static inline void handle_extends_v(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* sup = vm_pop2(vm);
+	scope_t* sc = vm_get_scope(vm);
+	var_t* cls = (sc != NULL) ? sc->class_var : NULL;
+	if(cls != NULL && sup != NULL) {
+		var_set_father(cls, sup);
+		node_t* sn = var_add(cls, "@super", sup);
+		if(sn != NULL) {
+			var_unref(sup); // node holds its own reference
+			sup = NULL;
+		}
+	}
+	if(sup != NULL)
+		var_unref(sup);
+}
+
+/* ES2022 instance field: the compiler pushed a hidden zero-arg function whose
+ * body is the field initializer. Record (name, fn) pairs on the class under
+ * definition in a hidden "@fields" array; new_obj_with_ctor() replays them on
+ * every instance (superclass first) before the constructor body runs. */
+static inline void handle_fieldn(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	const char* s = bc_getstr(&vm->bc, offset);
+	var_t* fn = vm_pop2(vm);
+	scope_t* sc = vm_get_scope(vm);
+	var_t* cls = (sc != NULL) ? sc->class_var : NULL;
+	if(cls != NULL && fn != NULL) {
+		node_t* ex = var_find_own_member(cls, "@fields");
+		var_t* arr = (ex != NULL) ? ex->var : NULL;
+		if(arr == NULL || !arr->is_array) {
+			arr = var_new_array(vm);
+			node_t* an = var_add(cls, "@fields", arr);
+			if(an != NULL)
+				var_unref(arr);
+		}
+		var_t* pair = var_new_array(vm);
+		var_t* nm = var_new_str(vm, s);
+		var_array_add(pair, nm);
+		var_unref(nm);
+		var_array_add(pair, fn);
+		var_unref(fn);
+		var_array_add(arr, pair);
+		var_unref(pair);
+	} else if(fn != NULL) {
+		var_unref(fn);
+	}
+}
+
+/* ES2022 static field: the value is on the stack, define it on the constructor
+ * object itself so `Cls.name` sees it. */
+static inline void handle_staticn(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	const char* s = bc_getstr(&vm->bc, offset);
+	var_t* v = vm_pop2(vm);
+	scope_t* sc = vm_get_scope(vm);
+	var_t* cls = (sc != NULL) ? sc->class_var : NULL;
+	if(cls != NULL && v != NULL) {
+		if(v->is_func) {
+			func_t* func = (func_t*)v->value;
+			if(func != NULL)
+				func->owner = cls;
+		}
+		node_t* n = var_add(cls, s, v);
+		if(n != NULL)
+			var_unref(v);
+	} else if(v != NULL) {
+		var_unref(v);
+	}
 }
 
 static inline void handle_instof(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -9130,6 +9468,82 @@ static inline void handle_include(vm_t* vm, PC ins, opr_code_t instr, uint32_t o
 	var_unref(v);
 }
 
+/* INSTR_MODULE spec: ensure the module named by the string operand is loaded and
+ * evaluated, then push its namespace object. Used as the RHS of every import
+ * form and of a re-export (`export .. from`). do_module caches by specifier, so
+ * repeated MODULE instructions for the same module (one per imported binding)
+ * only evaluate it once. vm_push takes the reference the registry does not. */
+static inline void handle_module(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	const char* spec = bc_getstr(&vm->bc, offset);
+	var_t* ns = do_module(vm, spec);
+	if(ns == NULL)
+		ns = var_new_obj_no_proto(vm, NULL, NULL);
+	vm_push(vm, ns);
+}
+
+/* INSTR_EXPORT name: copy the current scope binding `name` into the module
+ * namespace under the same key (`export function f`, `export class C`,
+ * `export const x`, `export { a }`). Shares the binding's var (a reference), so
+ * object/function exports stay live; the declaration runs before this marker. */
+static inline void handle_export(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	if(vm->cur_module == NULL)
+		return; // `export` outside a module body: nothing to publish into
+	const char* name = bc_getstr(&vm->bc, offset);
+	node_t* node = vm_load_node(vm, name, false);
+	if(node == NULL || node->var == NULL)
+		return;
+	var_add(vm->cur_module, name, node->var);
+}
+
+/* INSTR_EXPORT_VALUE key: pop a value and set the current module namespace's
+ * `key` member to it (`export default e`, `export { a as b }`, and each binding
+ * of a re-export after the source namespace member has been fetched). */
+static inline void handle_export_value(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	const char* key = bc_getstr(&vm->bc, offset);
+	var_t* v = vm_pop2(vm);
+	if(vm->cur_module != NULL && v != NULL)
+		var_add(vm->cur_module, key, v);
+	if(v != NULL)
+		var_unref(v); // release the stack reference; the namespace node holds its own
+}
+
+/* INSTR_EXPORT_STAR: pop a module namespace and copy all of its exports into the
+ * current namespace (`export * from m`). Reuses the object-spread copier, which
+ * skips inherited / invisable / non-enumerable members. */
+static inline void handle_export_star(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* src = vm_pop2(vm);
+	if(vm->cur_module != NULL && src != NULL) {
+		obj_spread_data d;
+		d.target = vm->cur_module;
+		hash_map_iterate(&src->children, obj_spread_cb, &d);
+	}
+	if(src != NULL)
+		var_unref(src);
+}
+
+/* INSTR_IMPORT_BIND name: pop the imported value and bind it to `name` in the
+ * current (module/script top-level) scope. This is the write half of every
+ * `import` form. It bypasses the const guard on purpose: in this single-global-
+ * scope module model an imported name can coincide with the source module's own
+ * top-level binding (e.g. `export const PI` + `import {PI}`), and re-binding it
+ * to the very value it already holds must not raise "can not change a const".
+ * Only the compiler's import path emits this, so ordinary const assignments are
+ * unaffected. */
+static inline void handle_import_bind(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	const char* name = bc_getstr(&vm->bc, offset);
+	var_t* v = vm_pop2(vm);
+	node_t* n = vm_load_node(vm, name, true);
+	if(n != NULL) {
+		/* Mark as an import binding so that, in a circular import, the source
+		 * module's own `const`/`let` declaration that runs LATER adopts this
+		 * placeholder node instead of throwing "has already existed". */
+		n->be_import = 1;
+		if(v != NULL)
+			node_replace(n, v);
+	}
+	if(v != NULL)
+		var_unref(v); // release the stack reference; the node holds its own
+}
 
 static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	vm_throw_truncate(vm); // the thrown value is on top; drop operands the interrupted expression leaked
@@ -9173,6 +9587,25 @@ static inline void handle_catch(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	var_unref(v);
 }
 
+/* WITH: pop the object expression and push it as the innermost scope, so
+ * bare-name loads in the body hit its members first (ES1 `with` semantics).
+ * The scope takes its own ref; the pairing INSTR_BLOCK_END pops the scope
+ * and releases it. A primitive value scopes as an empty object: member
+ * lookups miss and fall through to the enclosing scopes. */
+static inline void handle_with(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* v = vm_pop2(vm);
+	scope_t* sc;
+	if(v == NULL) {
+		v = var_new(vm);
+	}
+	sc = scope_new(v);
+	var_unref(v);
+	sc->is_block = true;
+	sc->is_with = true;
+	sc->stack_top = vm->stack_top;
+	vm_push_scope(vm, sc);
+}
+
 /* Instruction handler table - initialized at startup */
 static instr_handler_t instr_table[INSTR_MAX];
 static bool instr_table_initialized = false;
@@ -9192,6 +9625,7 @@ static void init_instr_table(void) {
 	instr_table[INSTR_VAR] = handle_var;
 	instr_table[INSTR_CONST] = handle_const;
 	instr_table[INSTR_LOAD] = handle_load;
+	instr_table[INSTR_LOAD_SAFE] = handle_load_safe;
 	instr_table[INSTR_GET] = handle_get;
 	instr_table[INSTR_GETW] = handle_getw;
 	instr_table[INSTR_ASIGN] = handle_asign;
@@ -9222,6 +9656,9 @@ static void init_instr_table(void) {
 	instr_table[INSTR_TAG_RAW] = handle_tag_raw;
 	instr_table[INSTR_CLASS] = handle_class;
 	instr_table[INSTR_CLASS_END] = handle_class_end;
+	instr_table[INSTR_FIELDN] = handle_fieldn;
+	instr_table[INSTR_STATICN] = handle_staticn;
+	instr_table[INSTR_EXTENDS_V] = handle_extends_v;
 	instr_table[INSTR_MEMBER] = handle_member;
 	instr_table[INSTR_MEMBERN] = handle_member;
 	instr_table[INSTR_FUNC_STC] = handle_func;
@@ -9325,9 +9762,12 @@ static void init_instr_table(void) {
 	instr_table[INSTR_TRY_END] = handle_block_end;
 	instr_table[INSTR_SWITCH] = handle_block;
 	instr_table[INSTR_SWITCH_END] = handle_block_end;
+	instr_table[INSTR_LABEL] = handle_block;
+	instr_table[INSTR_LABEL_END] = handle_block_end;
 
 	instr_table[INSTR_THROW] = handle_throw;
 	instr_table[INSTR_CATCH] = handle_catch;
+	instr_table[INSTR_WITH] = handle_with;
 	instr_table[INSTR_INSTOF] = handle_instof;
 	instr_table[INSTR_DELETE] = handle_delete;
 	instr_table[INSTR_DELETE_AT] = handle_delete_at;
@@ -9338,6 +9778,11 @@ static void init_instr_table(void) {
 	instr_table[INSTR_YIELD_STAR] = handle_yield;
 
 	instr_table[INSTR_INCLUDE] = handle_include;
+	instr_table[INSTR_MODULE] = handle_module;
+	instr_table[INSTR_EXPORT] = handle_export;
+	instr_table[INSTR_EXPORT_VALUE] = handle_export_value;
+	instr_table[INSTR_EXPORT_STAR] = handle_export_star;
+	instr_table[INSTR_IMPORT_BIND] = handle_import_bind;
 
 	instr_table_initialized = true;
 }
@@ -9369,6 +9814,18 @@ bool vm_run(vm_t* vm) {
 
 		/* Table-based instruction dispatch */
 		instr_table[instr](vm, ins, instr, offset);
+
+		/* INSTR_INCLUDE / INSTR_MODULE compile and run nested source mid-run
+		 * (do_include / do_module -> vm_load_run). Appending bytecode can realloc
+		 * vm->bc.code_buf, so the cached `code`/`code_size` would dangle and the
+		 * next `code[vm->pc++]` reads freed memory (Bus error). Refresh them from
+		 * the live buffer. vm->pc was already restored to the outer instruction
+		 * stream by the loader, and the outer script's own INSTR_END still bounds
+		 * this run even though code_size now spans the appended module code. */
+		if(instr == INSTR_INCLUDE || instr == INSTR_MODULE) {
+			code = vm->bc.code_buf;
+			code_size = vm->bc.cindex;
+		}
 
 		/* Page-independent service cadence (see mario.h): one increment+compare
 		 * per dispatch when armed, nothing when step_interval is 0. The hook may

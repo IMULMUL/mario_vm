@@ -26,6 +26,7 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_ARRAY        : return "ARR";
 		case INSTR_ARRAY_END    : return "ARRE";
 		case INSTR_LOAD         : return "LOAD";
+		case INSTR_LOAD_SAFE    : return "LOADS";
 		case INSTR_STORE        : return "STORE";
 		case INSTR_JMP          : return "JMP";
 		case INSTR_NJMP         : return "NJMP";
@@ -38,6 +39,7 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_CLASS        : return "CLASS";
 		case INSTR_CLASS_END    : return "CLASSE";
 		case INSTR_EXTENDS      : return "EXTENDS";
+		case INSTR_EXTENDS_V    : return "EXTENDSV";
 		case INSTR_CALL         : return "CALL";
 		case INSTR_CALLO        : return "CALLO";
 		case INSTR_CALLX        : return "CALLX";
@@ -87,6 +89,8 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_AND          : return "AND";
 		case INSTR_ASIGN        : return "ASIGN";
 		case INSTR_BREAK        : return "BREAK";
+		case INSTR_LABEL        : return "LABEL";
+		case INSTR_LABEL_END    : return "LABELE";
 		case INSTR_CONTINUE     : return "CONTINUE";
 		case INSTR_RETURN       : return "RETURN";
 		case INSTR_RETURNV      : return "RETURNV";
@@ -112,6 +116,13 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_IN           : return "IN";
 		case INSTR_STRICT       : return "STRICT";
 		case INSTR_INCLUDE      : return "INCLUDE";
+		case INSTR_MODULE       : return "MODULE";
+		case INSTR_EXPORT       : return "EXPORT";
+		case INSTR_EXPORT_VALUE : return "EXPORTV";
+		case INSTR_EXPORT_STAR  : return "EXPORTS";
+		case INSTR_IMPORT_BIND  : return "IMPBIND";
+		case INSTR_FIELDN       : return "FIELDN";
+		case INSTR_STATICN      : return "STATICN";
 		default                 : return "";
 	}
 }

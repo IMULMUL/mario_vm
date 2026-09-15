@@ -307,8 +307,15 @@ var_t* native_Array_concat(vm_t* vm, var_t* env, void* data) {
 }
 
 var_t* native_Array_push(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
+	(void)data;
 	var_t* arr = get_obj(env, THIS);
+	/* A dangling/freed `arr` (refcount underflow via nested bound-call chains)
+	 * must not be returned: the caller var_ref()s and pushes it, resurrecting a
+	 * freed var. The is_array identity bit also rejects recycled garbage whose
+	 * reused block reads as status-live. Deliver a fresh undefined instead so
+	 * the frame unwinds safely. */
+	if(arr == NULL || arr->status <= V_ST_GC_FREE || !arr->is_array)
+		return var_new(vm);
 	uint32_t args_num = get_func_args_num(env);
 	uint32_t i;
 	for(i=0; i<args_num; ++i) {

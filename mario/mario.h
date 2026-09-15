@@ -324,8 +324,20 @@ typedef struct st_bytecode {
 #define INSTR_SCAND        0x087 // SCAND : short-circuit `&&` (LHS falsy  -> keep LHS, jump past RHS; else pop LHS, eval RHS)
 #define INSTR_NEWX         0x088 // NEWX $n: construct with the constructor VALUE on the stack below its n args (`new (expr)(args)`)
 #define INSTR_NEWX_SPREAD  0x089 // NEWX_SPREAD : pop args array, construct with the constructor value beneath it (runtime arity)
+#define INSTR_EXTENDS_V    0x08B // EXTENDS_V : pop the superclass VALUE on the stack and link the class-under-definition's prototype chain (`extends namespace.Base`, `extends getBase()`)
+#define INSTR_LABEL        0x08C // LABEL name : push a labeled-statement scope (a `break name` target); pairs with INSTR_LABEL_END
+#define INSTR_LABEL_END    0x08D // LABEL_END : pop the labeled-statement scope
+#define INSTR_LOAD_SAFE    0x08A // LOAD_SAFE $n : like LOAD, but an unresolvable name pushes undefined instead of throwing (direct `typeof x` operand)
+#define INSTR_WITH         0x08E // WITH : pop the object expr, push it as the innermost scope (`with (obj) stmt`); pairs with INSTR_BLOCK_END
+#define INSTR_EXPORT       0x08F // EXPORT name      : copy the scope binding `name` into the current module namespace under key `name`
+#define INSTR_EXPORT_VALUE 0x090 // EXPORT_VALUE key : pop a value, set current-module-namespace[key] (`export default e`, `export {a as b}`)
+#define INSTR_EXPORT_STAR  0x091 // EXPORT_STAR      : pop a module namespace, copy all its exports into the current namespace (`export * from m`)
+#define INSTR_MODULE       0x092 // MODULE spec      : ensure module `spec` is loaded/evaluated, push its namespace object (import / re-export RHS)
+#define INSTR_IMPORT_BIND  0x093 // IMPORT_BIND name : pop a value, bind it to scope name `name` (an import binding; bypasses the const guard)
+#define INSTR_FIELDN       0x095 // FIELDN name : pop an initializer function, register it as an instance field of the class under definition (runs per `new` with this=instance)
+#define INSTR_STATICN      0x096 // STATICN name : pop a value, define it as a static member of the class under definition (ES2022 `static x = e`)
 
-#define INSTR_MAX          0x090 // Maximum instruction opcode value
+#define INSTR_MAX          0x097 // Maximum instruction opcode value
 
 
 PC          bc_gen(bytecode_t* bc, opr_code_t instr);
@@ -532,6 +544,11 @@ typedef struct st_node {
 	uint32_t            be_inherited : 8;
 	uint32_t            be_unenumerable : 4;
 	uint32_t            invisable : 4;
+	/* be_import marks a binding created eagerly by `import` (INSTR_IMPORT_BIND).
+	 * In a circular import the importer binds a name before the source module's
+	 * own `const`/`let` declaration has run; the declaration handler adopts such
+	 * a placeholder node instead of throwing "has already existed". */
+	uint32_t            be_import : 8;
 	uint32_t            ncache_instr;
 	char*               name;
 	var_t*              var;
@@ -592,7 +609,10 @@ typedef struct st_scope {
 	uint32_t is_try: 8;
 	uint32_t is_loop: 4;
 	uint32_t is_switch: 4; // switch scope: a `break` stops here, a `continue` does not (it belongs to an enclosing loop)
+	uint32_t is_label: 4;  // labeled-statement scope: only a `break <label>` with a matching label stops here (never an unlabeled break/continue)
 	uint32_t is_strict: 4;
+	uint32_t is_with: 4;   // `with (obj)` scope: sc->var IS the with object; name resolution walks its member/prototype chain even when it carries no own members
+	const char* label;     // for a labeled scope: the label name (points into the bytecode string table, valid for the whole run); NULL otherwise
 	func_t*  func;
 	/* The function OBJECT var that owns `func` (func_t). func_call() picks
 	 * func_var off the value stack (vm_stack_pick) or receives it as a borrowed
@@ -661,6 +681,15 @@ typedef struct st_vm {
 	int32_t             call_depth;   // live script func_call frames; func_call raises RangeError at MARIO_MAX_CALL_DEPTH so runaway recursion can't overflow the native thread stack
 
 	m_array_t           included;
+
+	/* ES6 module registry. `modules` is a hidden invisable member "@@modules" of
+	 * root (so the GC roots every namespace); its members map a module specifier
+	 * to that module's namespace object. `cur_module` is the namespace the
+	 * running module body populates via `export` (INSTR_EXPORT*); it is NULL for
+	 * the top-level script and is saved/restored around each nested module run.
+	 * Both are borrowed pointers - the registry member owns the only reference. */
+	var_t*              modules;
+	var_t*              cur_module;
 
 	void                (*on_init)(struct st_vm* vm);
 	m_array_t           init_natives;

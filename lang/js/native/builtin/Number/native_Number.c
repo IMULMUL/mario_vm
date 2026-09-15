@@ -52,6 +52,50 @@ var_t* native_Number_constructor(vm_t* vm, var_t* env, void* data) {
 	return this_v;
 }
 
+/* Number->string in a non-decimal radix for fractional values: mstr_from_float64
+ * only emits decimal, so `(0.5).toString(2)` used to return "0.5" and, worse,
+ * `Math.random().toString(32)` yielded a decimal string whose .substr(2) can be
+ * empty - taobao's jstracker uniqId loop (`while(e.length<32) e+=...substr(2)`)
+ * then spins forever and blocks every bundle queued behind it. Emit integer
+ * digits in the radix plus up to 52 fractional digits (beyond double precision).
+ * Static result buffer, same lifetime contract as mstr_from_int(). */
+static const char* number_tostr_radix(double d, int radix) {
+	static const char dig[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+	static char buf[192];
+	if(d != d) return "NaN";
+	if(d == 1.0/0.0) return "Infinity";
+	if(d == -1.0/0.0) return "-Infinity";
+	int pos = 0;
+	if(d < 0) { buf[pos++] = '-'; d = -d; }
+	double ip = floor(d);
+	double fr = d - ip;
+	char ibuf[96];
+	int ipos = 0;
+	if(ip < 1.0) ibuf[ipos++] = '0';
+	while(ip >= 1.0 && ipos < (int)sizeof(ibuf)) {
+		double q = floor(ip / (double)radix);
+		int rem = (int)(ip - q * (double)radix);
+		if(rem < 0) rem = 0;
+		if(rem >= radix) rem = radix - 1;
+		ibuf[ipos++] = dig[rem];
+		ip = q;
+	}
+	while(ipos > 0 && pos < (int)sizeof(buf) - 1) buf[pos++] = ibuf[--ipos];
+	if(fr > 0.0) {
+		buf[pos++] = '.';
+		int n = 0;
+		while(fr > 0.0 && n < 52 && pos < (int)sizeof(buf) - 1) {
+			fr *= (double)radix;
+			double dg = floor(fr);
+			buf[pos++] = dig[(int)dg];
+			fr -= dg;
+			n++;
+		}
+	}
+	buf[pos] = 0;
+	return buf;
+}
+
 var_t* native_Number_toString(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	const char *s;
@@ -63,8 +107,10 @@ var_t* native_Number_toString(vm_t* vm, var_t* env, void* data) {
 	switch(v->type) {
 		case V_INT:     s = mstr_from_int(var_get_int(v), radix); break;
 		case V_INT64:   s = mstr_from_int64(var_get_int64(v), radix); break;
-		case V_FLOAT:   s = mstr_from_float(var_get_float(v)); break;
-		case V_FLOAT64: s = mstr_from_float64(var_get_float64(v)); break;
+		case V_FLOAT:   s = (radix == 10) ? mstr_from_float(var_get_float(v))
+		                                  : number_tostr_radix((double)var_get_float(v), radix); break;
+		case V_FLOAT64: s = (radix == 10) ? mstr_from_float64(var_get_float64(v))
+		                                  : number_tostr_radix(var_get_float64(v), radix); break;
 		default:        s = mstr_from_int(var_get_int(v), radix); break;
 	}
 	var_t* ret = var_new_str(vm, s);

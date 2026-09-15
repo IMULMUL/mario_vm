@@ -298,8 +298,21 @@ void lex_read_u_escape(lex_t* lex) {
 
 void lex_get_basic_token(lex_t* lex) {
 	// tokens
-	if (is_alpha(lex->curr_ch) || lex->curr_ch == '$') { //  IDs (JS allows '$' in identifiers, e.g. jQuery's $)
-		while (is_alpha(lex->curr_ch) || is_numeric(lex->curr_ch) || lex->curr_ch == '$') {
+	if (is_alpha(lex->curr_ch) || lex->curr_ch == '$' ||
+	    (lex->curr_ch == '\\' && lex->next_ch == 'u')) { //  IDs (JS allows '$' in identifiers, e.g. jQuery's $)
+		/* Identifiers may embed unicode escapes: bundlers emit CJK property
+		 * names as `\u4E0A\u62A5...` and mixed forms like `SDK\u7248\u672C`.
+		 * Decode them into tk_str exactly like string literals do
+		 * (lex_read_u_escape leaves curr_ch on the last consumed char, hence
+		 * the trailing step). */
+		while (is_alpha(lex->curr_ch) || is_numeric(lex->curr_ch) || lex->curr_ch == '$' ||
+		       (lex->curr_ch == '\\' && lex->next_ch == 'u')) {
+			if (lex->curr_ch == '\\') {
+				lex_get_nextch(lex); /* onto 'u' */
+				lex_read_u_escape(lex);
+				lex_get_nextch(lex);
+				continue;
+			}
 			mstr_add(lex->tk_str, lex->curr_ch);
 			lex_get_nextch(lex);
 		}
@@ -329,7 +342,13 @@ void lex_get_basic_token(lex_t* lex) {
 			mstr_add(lex->tk_str, lex->curr_ch);
 			lex_get_nextch(lex);
 		}
-		if (!isHex && lex->curr_ch=='.' && (is_numeric(lex->next_ch) || lex->next_ch=='_')) {
+		// JS greedily folds a '.' into a decimal literal even when no digit
+		// follows, so `1.` is the float 1.0. This makes `1..toString` lex as
+		// FLOAT(1.) then '.' then ID(toString) -- the member-access form that
+		// minifiers and compat shims emit for `(1).toString`. (Consequently
+		// `1.toString` lexes as FLOAT(1.) ID(toString), which is a syntax error
+		// in JS too.) Hex literals have no decimal point, hence the !isHex guard.
+		if (!isHex && lex->curr_ch=='.') {
 			lex->tk = LEX_FLOAT;
 			mstr_add(lex->tk_str, '.');
 			lex_get_nextch(lex);

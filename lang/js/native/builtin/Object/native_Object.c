@@ -642,6 +642,71 @@ var_t* native_obj_rest(vm_t* vm, var_t* env, void* data) {
 
 #define CLS_OBJECT "Object"
 
+/* ---- Object.prototype methods --------------------------------------------
+ * Frameworks borrow these constantly (`Object.prototype.toString.call(x)`,
+ * `hasOwnProperty.call(o, k)`), so the values must exist on the prototype,
+ * not only as Object statics. */
+
+var_t* native_Object_proto_toString(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        var_t* self = get_obj(env, THIS);
+        const char* tag = "Object";
+        char buf[64];
+        if(self == NULL || self->type == V_UNDEF)
+                tag = "Undefined";
+        else if(self->type == V_NULL)
+                tag = "Null";
+        else if(self->is_array)
+                tag = "Array";
+        else if(self->is_func)
+                tag = "Function";
+        else if(self->type == V_STRING)
+                tag = "String";
+        else if(self->type == V_INT || self->type == V_FLOAT ||
+                        self->type == V_INT64 || self->type == V_FLOAT64)
+                tag = "Number";
+        else if(self->type == V_BOOL)
+                tag = "Boolean";
+        else {
+                node_t* tn = var_find_member(self, SYMKEY_TOSTRINGTAG);
+                if(tn != NULL && tn->var != NULL && tn->var->type == V_STRING &&
+                   tn->var->value != NULL)
+                        tag = (const char*)tn->var->value;
+        }
+        snprintf(buf, sizeof(buf), "[object %s]", tag);
+        return var_new_str(vm, buf);
+}
+
+var_t* native_Object_proto_valueOf(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        var_t* self = get_obj(env, THIS);
+        if(self == NULL)
+                return var_new(vm);
+        var_ref(self);
+        return self;
+}
+
+var_t* native_Object_proto_isPrototypeOf(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        var_t* self = get_obj(env, THIS);
+        var_t* v = get_obj(env, "v");
+        var_t* p = var_get_prototype(v);
+        while(p != NULL) {
+                if(p == self)
+                        return var_new_bool(vm, true);
+                p = var_get_prototype(p);
+        }
+        return var_new_bool(vm, false);
+}
+
+var_t* native_Object_proto_propEnum(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        var_t* self = get_obj(env, THIS);
+        const char* k = get_str(env, "k");
+        node_t* n = var_find_own_member(self, k);
+        return var_new_bool(vm, (n != NULL && n->be_unenumerable == 0 && n->invisable == 0));
+}
+
 void reg_native_Object(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_OBJECT);
 	vm_reg_static(vm, cls, "create(proto)", native_Object_create, NULL); 
@@ -667,6 +732,15 @@ void reg_native_Object(vm_t* vm) {
 	vm_reg_static(vm, cls, "isSealed(obj)", native_Object_isSealed, NULL);
 	vm_reg_static(vm, cls, "preventExtensions(obj)", native_Object_preventExtensions, NULL);
 	vm_reg_static(vm, cls, "isExtensible(obj)", native_Object_isExtensible, NULL);
+	
+	/* Object.prototype: toString/valueOf/hasOwnProperty/... borrowed via
+	 * .call/.apply all over bundled framework code. */
+	vm_reg_native(vm, cls, "toString()", native_Object_proto_toString, NULL);
+	vm_reg_native(vm, cls, "toLocaleString()", native_Object_proto_toString, NULL);
+	vm_reg_native(vm, cls, "valueOf()", native_Object_proto_valueOf, NULL);
+	vm_reg_native(vm, cls, "hasOwnProperty(name)", native_Object_hasOwnProperty, NULL);
+	vm_reg_native(vm, cls, "isPrototypeOf(v)", native_Object_proto_isPrototypeOf, NULL);
+	vm_reg_native(vm, cls, "propertyIsEnumerable(k)", native_Object_proto_propEnum, NULL);
 	vm_reg_native(vm, NULL, "__obj_rest(src, excluded)", native_obj_rest, NULL);
 	/* for-in lowering (stmt_for_in) calls this by INSTR_CALL "__enum_keys$1". */
 	vm_reg_native(vm, NULL, "__enum_keys(o)", native_enum_keys, NULL);
