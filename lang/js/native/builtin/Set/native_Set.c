@@ -67,6 +67,7 @@ static bool set_val_eq(var_t* a, var_t* b) {
 }
 
 static int32_t set_find(set_data* sd, var_t* v) {
+    if (sd == NULL) return -1; /* receiver without a set payload: never deref NULL */
     for (uint32_t i = 0; i < sd->size; ++i)
         if (set_val_eq(sd->items[i], v)) return (int32_t)i;
     return -1;
@@ -93,6 +94,7 @@ static void set_sync_size(var_t* this_v, set_data* sd) {
 }
 
 static void set_add_impl(var_t* this_v, set_data* sd, var_t* v) {
+    if (sd == NULL) return;
     if (set_find(sd, v) >= 0) return; /* already present */
     if (sd->size >= sd->cap) set_grow(sd);
     sd->items[sd->size++] = var_ref(v);

@@ -322,7 +322,9 @@ var_t* native_Array_push(vm_t* vm, var_t* env, void* data) {
 		var_t* arg = get_func_arg(env, i);
 		var_array_add(arr, arg);
 	}
-	return arr;
+	/* Spec: push yields the new length. Returning the borrowed receiver here used
+	 * to leak a stack ref through call/apply chains (see mario_apply_var). */
+	return var_new_int(vm, (int)var_array_size(arr));
 }
 
 var_t* native_Array_unshift(vm_t* vm, var_t* env, void* data) {
@@ -353,7 +355,7 @@ var_t* native_Array_unshift(vm_t* vm, var_t* env, void* data) {
 	}
 	var_unref(rest);
 	vm->gc.gc_defer--;
-	return arr;
+	return var_new_int(vm, (int)var_array_size(arr));
 }
 
 var_t* native_Array_pop(vm_t* vm, var_t* env, void* data) {

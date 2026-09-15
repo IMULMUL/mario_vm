@@ -74,6 +74,7 @@ static bool map_key_eq(var_t* a, var_t* b) {
 }
 
 static int32_t map_find(map_data* md, var_t* key) {
+    if (md == NULL) return -1; /* receiver without a map payload: never deref NULL */
     for (uint32_t i = 0; i < md->size; ++i)
         if (map_key_eq(md->keys[i], key)) return (int32_t)i;
     return -1;
@@ -103,6 +104,7 @@ static void map_sync_size(var_t* this_v, map_data* md) {
 
 /* core insert/update; takes owning refs on key & value only when new */
 static void map_set_impl(var_t* this_v, map_data* md, var_t* key, var_t* value) {
+    if (md == NULL) return;
     int32_t idx = map_find(md, key);
     if (idx >= 0) {
         var_t* old = md->vals[idx];

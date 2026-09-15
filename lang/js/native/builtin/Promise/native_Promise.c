@@ -187,6 +187,30 @@ static var_t* native_promise_reject_cb(vm_t* vm, var_t* env, void* data) {
     return NULL;
 }
 
+/* If a .then callback aborted with a propagated error (mario's cooperative
+ * unwind), settle the chained promise as rejected with it - exactly what a real
+ * engine does when onFulfilled/onRejected throws - and tell the caller to skip
+ * result adoption. Consumes the propagation so it does not escape outward. */
+static bool promise_settle_propagated(vm_t* vm, promise_data* newPd, var_t* newPromise) {
+    if (vm->propagating_err == NULL) {
+        return false;
+    }
+    var_t* err = vm->propagating_err;
+    vm->propagating_err = NULL;
+    vm->abort_run = false;
+    var_t* old = newPd->value;
+    newPd->state = PROMISE_STATE_REJECTED;
+    newPd->value = err; /* adopts the propagation's reference */
+    promise_anchor(vm, newPromise, newPd);
+    if (old != NULL) {
+        var_unref(old);
+    }
+    return true;
+}
+
+/* The executor's throws reach here through mario's cooperative propagation:
+ * vm_run() frames unwind their own C frames and hand the error outward instead
+ * of redirecting vm->pc across the nested run this constructor started. */
 var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* thisV = get_obj(env, THIS);
@@ -200,8 +224,10 @@ var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
     var_t* obj = var_new_obj_no_proto(vm, pd, promise_free);
     var_instance_from(obj, thisV);
     promise_anchor(vm, obj, pd);
-    var_ref(obj); /* off the gc list: the executor call below may trigger a gc */
-    vm_push(vm, obj); /* stack-anchored so its children get gc-marked during the call */
+    var_ref(obj); /* off the gc list: the executor call below may trigger a gc.
+                   * A plain ref, NOT a vm_push anchor: an executor throw unwinds
+                   * the value stack (vm_throw_truncate), so a blind vm_pop2()
+                   * afterwards could remove the wrong slots and free obj. */
 
     if (executor != NULL) {
         node_t* rn = vm_reg_native_on(vm, obj, "__resolve(value)", native_promise_resolve_cb, obj);
@@ -227,15 +253,38 @@ var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
         var_array_reverse(resolve_args);
 
         call_m_func(vm, obj, executor, resolve_args);
+
+        if (vm->propagating_err != NULL) {
+            /* The executor threw and nothing inside it caught: reject (ES spec)
+             * and run any already-registered rejection handlers. */
+            var_t* err = vm->propagating_err;
+            vm->propagating_err = NULL;
+            vm->abort_run = false;
+            if (pd->state == PROMISE_STATE_PENDING) {
+                pd->state = PROMISE_STATE_REJECTED;
+                pd->value = err; /* adopts the propagation's reference */
+                promise_anchor(vm, obj, pd);
+                uint32_t n = var_array_size(pd->rejected_callbacks);
+                for (uint32_t i = 0; i < n; i++) {
+                    var_t* cb = var_array_get_var(pd->rejected_callbacks, i);
+                    if (cb != NULL && cb->is_func) {
+                        var_t* cargs = var_new_array(vm);
+                        var_array_add(cargs, pd->value);
+                        var_t* r = call_m_func(vm, obj, cb, cargs);
+                        if (r != NULL) var_unref(r);
+                        var_unref(cargs);
+                    }
+                }
+            } else if (err != NULL) {
+                var_unref(err);
+            }
+        }
         var_unref(resolve_args);
     }
 
-    /* vm_pop would unref the anchor, putting obj back on the gc list where the
-     * gc it may itself trigger sweeps it before we return. vm_pop2 keeps the
-     * ref; drop both (anchor + ours) bare so obj stays OFF the gc list until
-     * func_call re-refs it as the return value. */
-    vm_pop2(vm);
-    obj->refs -= 2;
+    /* Drop the protection ref with a bare decrement (never var_unref) so obj
+     * goes back to baseline refs for the return; func_call re-refs it. */
+    obj->refs -= 1;
     return obj;
 }
 
@@ -296,42 +345,52 @@ var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
     var_t* proto = var_get_prototype(promise);
     var_t* newPromise = var_new_obj(vm, proto, newPd, promise_free);
     promise_anchor(vm, newPromise, newPd);
-    var_ref(newPromise); /* off the gc list: the callback calls below may trigger a gc */
-    vm_push(vm, newPromise); /* stack-anchored so its children get gc-marked during callbacks */
+    var_ref(newPromise); /* off the gc list: the callback calls below may trigger a gc.
+                          * A plain ref, NOT a vm_push anchor: a throwing callback
+                          * unwinds the value stack, so a blind vm_pop2() afterwards
+                          * could remove the wrong slots and free newPromise. */
 
     if (pd->state == PROMISE_STATE_FULFILLED && onFulfilled != NULL) {
         var_t* args = var_new_array(vm);
         var_array_add(args, pd->value);
         var_t* result = call_m_func(vm, promise, onFulfilled, args);
-        result = promise_unwrap(vm, result);
-        var_t* old = newPd->value;
-        if (result != NULL) {
-            newPd->value = result; /* adopt the ref result already carries */
+        if (promise_settle_propagated(vm, newPd, newPromise)) {
+            var_unref(args);
         } else {
-            newPd->value = var_ref(var_new_null(vm));
+            result = promise_unwrap(vm, result);
+            var_t* old = newPd->value;
+            if (result != NULL) {
+                newPd->value = result; /* adopt the ref result already carries */
+            } else {
+                newPd->value = var_ref(var_new_null(vm));
+            }
+            promise_anchor(vm, newPromise, newPd); /* gc-reachable before any unref below */
+            if (old) {
+                var_unref(old);
+            }
+            var_unref(args);
         }
-        promise_anchor(vm, newPromise, newPd); /* gc-reachable before any unref below */
-        if (old) {
-            var_unref(old);
-        }
-        var_unref(args);
     } else if (pd->state == PROMISE_STATE_REJECTED && onRejected != NULL) {
         var_t* args = var_new_array(vm);
         var_array_add(args, pd->value);
         var_t* result = call_m_func(vm, promise, onRejected, args);
-        result = promise_unwrap(vm, result);
-        var_t* old = newPd->value;
-        if (result != NULL) {
-            newPd->value = result; /* adopt the ref result already carries */
+        if (promise_settle_propagated(vm, newPd, newPromise)) {
+            var_unref(args);
         } else {
-            newPd->value = var_ref(var_new_null(vm));
+            result = promise_unwrap(vm, result);
+            var_t* old = newPd->value;
+            if (result != NULL) {
+                newPd->value = result; /* adopt the ref result already carries */
+            } else {
+                newPd->value = var_ref(var_new_null(vm));
+            }
+            newPd->state = PROMISE_STATE_FULFILLED;
+            promise_anchor(vm, newPromise, newPd); /* gc-reachable before any unref below */
+            if (old) {
+                var_unref(old);
+            }
+            var_unref(args);
         }
-        newPd->state = PROMISE_STATE_FULFILLED;
-        promise_anchor(vm, newPromise, newPd); /* gc-reachable before any unref below */
-        if (old) {
-            var_unref(old);
-        }
-        var_unref(args);
     } else if (pd->state == PROMISE_STATE_PENDING) {
         if (onFulfilled != NULL) {
             var_array_add(pd->fulfilled_callbacks, onFulfilled);
@@ -341,8 +400,9 @@ var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
         }
     }
 
-    vm_pop2(vm); /* pop the anchor keeping its ref (vm_pop could gc-sweep newPromise) */
-    newPromise->refs -= 2; /* drop anchor ref + ours; stays off the gc list for the return */
+    /* Drop the protection ref with a bare decrement (never var_unref) so
+     * newPromise goes back to baseline refs for the return. */
+    newPromise->refs -= 1;
     return newPromise;
 }
 

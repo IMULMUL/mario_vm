@@ -3963,7 +3963,11 @@ node_t* vm_find(vm_t* vm, const char* name) {
 
 node_t* vm_find_in_class(var_t* var, const char* name) {
 	var_t* proto = var_get_prototype(var);
-	while(proto != NULL) {
+	/* A cyclic prototype chain (a class linked, directly or through a mixin,
+	 * as its own ancestor) would spin here forever; bound the walk so a
+	 * pathological chain degrades to a miss instead of freezing the engine. */
+	int hops = 0;
+	while(proto != NULL && hops++ < 4096) {
 		node_t* ret = NULL;
 		ret = var_find_own_member(proto, name);
 		if(ret != NULL) {
@@ -3974,6 +3978,13 @@ node_t* vm_find_in_class(var_t* var, const char* name) {
 			return ret;
 		}
 		proto = var_get_prototype(proto);
+	}
+	if(proto != NULL) {
+		static int chain_warned = 0;
+		if(!chain_warned) {
+			chain_warned = 1;
+			fprintf(stderr, "[mario] prototype chain exceeded 4096 hops while looking up '%s' (cycle?)\n", name);
+		}
 	}
 	return NULL;
 }
@@ -4162,6 +4173,50 @@ static inline scope_t* vm_get_loop_scope(vm_t* vm) {
 	return NULL;
 }
 
+/* Innermost try scope belonging to the CURRENT vm_run invocation: only scopes
+ * pushed since this loop entered (index >= run_scope_base) can be unwound to
+ * without executing another frame's bytecode in this loop. NULL when this run
+ * can not catch, i.e. the error must propagate outward. */
+static scope_t* vm_find_inrange_try(vm_t* vm) {
+	for(int32_t i = vm->scope_stack_top - 1; i >= vm->run_scope_base; i--) {
+		scope_t* sc = vm->scope_stack[i];
+		if(sc != NULL && sc->is_try)
+			return sc;
+	}
+	return NULL;
+}
+
+/* Start propagating `err` (adopts the reference): every vm_run frame unwinds
+ * until one catches it in-range or the script top reports it. */
+static void vm_propagate(vm_t* vm, var_t* err) {
+	if(vm->propagating_err != NULL)
+		var_unref(vm->propagating_err);
+	vm->propagating_err = err;
+	vm->abort_run = true;
+	{
+		mstr_t* ds = mstr_new("");
+		var_to_str(err, ds);
+		if(getenv("MARIO_DIAGX"))
+			mario_printf("[DIAGX] propagate err=%s scope_top=%d base=%d\n", ds->cstr, vm->scope_stack_top, vm->run_scope_base);
+		mstr_free(ds);
+	}
+}
+
+void vm_report_uncaught(vm_t* vm) {
+	var_t* err = vm->propagating_err;
+	vm->propagating_err = NULL;
+	vm->abort_run = false;
+	if(err == NULL)
+		return;
+	mstr_t* es = mstr_new("");
+	var_to_str(err, es);
+	char tagsfx[160] = {0};
+	if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
+	mario_printf("Uncaught %s%s\n", es->cstr, tagsfx);
+	mstr_free(es);
+	var_unref(err);
+}
+
 void vm_throw(vm_t* vm, const char *format, ...) {
 	char message[BUF_SIZE+1] = {0};
 	va_list ap;
@@ -4175,33 +4230,22 @@ void vm_throw(vm_t* vm, const char *format, ...) {
 		var_set_str(msg, message);
 	vm_push(vm, err);
 
-	scope_t* try_sc = vm_get_try_catch_scope(vm);
+	scope_t* try_sc = vm_find_inrange_try(vm);
 	if(try_sc == NULL) {
-		/* Nobody handles this throw: report it like a browser console
-		 * would, then drop it - silently swallowing leaves the page
-		 * misbehaving with no diagnostic at all. */
-		char tagsfx[160] = {0};
-		if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
-		mario_printf("Uncaught Error: %s%s\n", message, tagsfx);
-		vm_pop(vm);
+		/* No frame of this run can catch: propagate outward. The interrupted
+		 * body must NOT keep executing (the old report-and-continue let a
+		 * throwing Promise executor still resolve), and redirecting vm->pc to an
+		 * outer frame's catch would run that frame's bytecode in this loop. */
+		vm_pop2(vm); // lift err off the value stack keeping its ref for the propagation
+		vm_propagate(vm, err);
 		return;
 	}
 
 	vm_throw_truncate(vm); // drop operands the interrupted expression leaked (keep err on top)
-	while(true) {
-		scope_t* sc = vm_get_scope(vm);
-		if(sc == NULL) {
-			vm_pop(vm);
-			break;
-		}
-
-		if(sc->is_try) {
-			sc->is_try = false; //consume: a throw inside this catch must not re-trigger the same handler (infinite loop)
-			vm->pc = sc->pc;
-			break;
-		}
+	while(vm_get_scope(vm) != try_sc)
 		vm_pop_scope(vm);
-	}
+	try_sc->is_try = false; //consume: a throw inside this catch must not re-trigger the same handler (infinite loop)
+	vm->pc = try_sc->pc;
 }
 
 /* Record an exception raised inside a native function. The actual unwinding is
@@ -4390,6 +4434,13 @@ static void var_set_father(var_t* var, var_t* father) {
 	if(super_proto == NULL)
 		return;
 
+	/* Vars without an explicit PROTOTYPE member share the builtin default
+	 * prototype object; linking it to itself (class X extends <something that
+	 * resolves to the same default>) made EVERY later member lookup walk a
+	 * self-cycle. A class can never be its own ancestor, so drop the link. */
+	if(super_proto == proto)
+		return;
+
 	var_set_prototype(proto, super_proto);
 }
 
@@ -4570,7 +4621,18 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 	}
 	var_array_reverse(args); // reverse the args array coz stack index.
 
-	if(func->owner != NULL) {
+	if(func->owner != NULL && func->owner->type == V_OBJECT &&
+	   func->owner->children.buckets != NULL) {
+		/* func->owner is a RAW pointer with no refcount and no gc root (see
+		 * func_t): nothing keeps the method's home object alive for as long as
+		 * the func_t. A throw-propagation unwind that drops the last reference to
+		 * the scope holding that object recycles it (var_clean memsets the var,
+		 * zeroing children.buckets/capacity and type), leaving owner dangling.
+		 * var_get_prototype() would then hash_string("prototype") into
+		 * buckets[hash % 0] == NULL[huge] -> SIGSEGV at a fixed address. Reading a
+		 * recycled var's fields is safe (it sits on mario's internal free list, not
+		 * returned to the system allocator), so validate before dereferencing: a
+		 * dead owner has no meaningful superclass to bind, so skip it. */
 		var_t* super_v = var_get_prototype(func->owner);
 		if(super_v != NULL)
 			var_add(env, SUPER, super_v);
@@ -4598,6 +4660,8 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 	vm->gc.gc_defer--; //env is now rooted on the stack; gc is safe again.
 	if(func->native != NULL) { //native function
 		ret = func->native(vm, env, func->data);
+		if(vm->propagating_err != NULL)
+			ret = NULL; // a callee of this native aborted: placeholder result, keep propagating
 		if(ret == NULL)
 			ret = var_new(vm);
 	}
@@ -4650,6 +4714,24 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		vm->call_depth++;
 		bool returned = vm_run(vm); //with function return;
 		vm->call_depth--;
+		if(vm->propagating_err != NULL) {
+			/* The callee aborted with an error none of its frames could catch. vm_run
+			 * already unwound the body's block scopes down to this call's func scope
+			 * (sc), so sc is on top; the explicit unwind here is belt-and-suspenders.
+			 * Restore the caller's resume pc (saved in sc->pc at entry, never restored
+			 * because no RET ran), pop sc, truncate to this frame's baseline, drop the
+			 * env slot and hand the caller handler a placeholder result (the outer
+			 * loop's abort check discards it and propagates further, or catches). */
+			while(vm_get_scope(vm) != sc && vm->scope_stack_top > 0)
+				vm_pop_scope(vm);
+			vm->pc = sc->pc;
+			vm_pop_scope(vm);
+			while(vm->stack_top > frame_base)
+				vm_pop(vm);
+			vm_pop(vm);              // the env slot pushed before vm_run
+			vm_push(vm, var_new(vm)); // keep the caller handler's stack protocol
+			return true;
+		}
 		if(returned) {
 			ret = vm_pop2(vm);
 			/* vm_pop2 returns NULL on an underflowed value stack - which is what a
@@ -4696,20 +4778,22 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		vm_push(vm, err);
 		var_unref(err); //the stack ref keeps it alive now
 		vm_throw_truncate(vm); //drop operands the caller's interrupted expression leaked (e.g. `let x = nativeCall()`)
-		while(true) { //same unwinding as handle_throw
-			scope_t* sc = vm_get_scope(vm);
-			if(sc == NULL) {
-				mario_printf("Error: uncaught exception from native function!\n");
-				vm_terminate(vm);
-				break;
-			}
-			if(sc->is_try) {
-				sc->is_try = false; //consume: a throw inside this catch must not re-trigger the same handler (infinite loop)
-				vm->pc = sc->pc;
-				break;
-			}
-			vm_pop_scope(vm);
+		scope_t* tsc = vm_find_inrange_try(vm);
+		if(tsc == NULL) {
+			/* No frame of this run can catch: propagate outward instead of
+			 * killing the whole VM (the old vm_terminate), and give the caller
+			 * handler its placeholder result. */
+			var_t* e2 = vm_pop2(vm);
+			vm_propagate(vm, e2);
+			vm_push(vm, var_new(vm));
+			vm->gc.gc_defer--;
+			vm->gc.gc_defer--; //the outer ret-delivery guard
+			return true;
 		}
+		while(vm_get_scope(vm) != tsc)
+			vm_pop_scope(vm);
+		tsc->is_try = false; //consume: a throw inside this catch must not re-trigger the same handler
+		vm->pc = tsc->pc;
 		vm->gc.gc_defer--;
 		vm->gc.gc_defer--; //the outer ret-delivery guard
 		return true;
@@ -5590,6 +5674,34 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 
 	if(ctor_var == NULL || ctor_var->type != V_OBJECT) {
 		mario_debug("Error: There is no class: '%s'!\n", name);
+		if(getenv("MARIO_NEWDBG")) {
+			fprintf(stderr, "[newdbg] '%s' ctor=%p type=%u pc=%u\n", name, (void*)ctor_var,
+				ctor_var ? (unsigned)ctor_var->type : 99u, vm->pc);
+			for(PC i = (vm->pc > 10 ? vm->pc - 10 : 0); i <= vm->pc + 1; i++) {
+				PC insw = vm->bc.code_buf[i];
+				PC op = OP(insw), oph = insw & 0xFFFFF;
+				bool hs = (op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64);
+				fprintf(stderr, "  pc=%u op=%02x oph=%05x%s%s\n", i, op, oph, hs ? " str=" : "", hs ? bc_getstr(&vm->bc, oph) : "");
+			}
+		}
+		vm_throw(vm, "there is no class: '%s'!", name);
+		return NULL;
+	}
+
+	/* Defensive: a var that reads as V_OBJECT but whose children hash-map was never
+	 * initialised (buckets==NULL / capacity==0) is a DANGLING class binding - the
+	 * var_t block was freed (var_clean memsets type to V_UNDEF) and the memory
+	 * reused by a non-var allocation whose bytes alias type==V_OBJECT here while
+	 * offsets 0x38/0x44 stay zero. var_get_prototype() below would hash_string()
+	 * into buckets[hash % 0] -> NULL[huge] -> SIGSEGV/SIGBUS at a fixed address.
+	 * Throw catchably instead of crashing the whole engine, and name the class so
+	 * the dangling binding can be traced. */
+	if(ctor_var->children.buckets == NULL || ctor_var->children.capacity == 0) {
+		mario_printf("[newdbg-corrupt] class '%s' ctor=%p has an empty children map (dangling binding)\n",
+			name, (void*)ctor_var);
+		int k = arg_num;
+		while(k-- > 0)
+			vm_pop(vm);
 		vm_throw(vm, "there is no class: '%s'!", name);
 		return NULL;
 	}
@@ -5734,11 +5846,51 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 	return obj;
 }
 
+/* fwd-decl: MARIO_NEWDBG's scope/closure dump reuses the const-debug member printer */
+static void dbg_dump_member(const char* key, void* value, void* ud);
+
 var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
 	node_t* n = vm_load_node(vm, name, false); //load class;
 
 	if(n == NULL) {
 		mario_debug("Error: There is no class: '%s'!\n", name);
+		if(getenv("MARIO_NEWDBG")) {
+			fprintf(stderr, "[newdbg-unbound] '%s' pc=%u sstop=%d\n", name, vm->pc, vm->scope_stack_top);
+			for(PC i = (vm->pc > 10 ? vm->pc - 10 : 0); i <= vm->pc + 1; i++) {
+				PC insw = vm->bc.code_buf[i];
+				PC op = OP(insw), oph = insw & 0xFFFFF;
+				bool hs = (op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64);
+				fprintf(stderr, "  pc=%u op=%02x oph=%05x%s%s\n", i, op, oph, hs ? " str=" : "", hs ? bc_getstr(&vm->bc, oph) : "");
+			}
+			/* dump the live scope stack + each func scope's closure chain */
+			for(int si = vm->scope_stack_top - 1; si >= 0; si--) {
+				scope_t* sc = vm->scope_stack[si];
+				if(sc == NULL)
+					continue;
+				fprintf(stderr, "  scope[%d] func=%d block=%d cls=%d var=%p own:", si,
+					sc->is_func?1:0, sc->is_block?1:0, sc->class_var?1:0, (void*)sc->var);
+				if(sc->var != NULL)
+					hash_map_iterate(&sc->var->children, dbg_dump_member, NULL);
+				fprintf(stderr, "\n");
+				if(sc->is_func && sc->func != NULL) {
+					var_t* cl = sc->func->closure.var;
+					func_t* cf = sc->func->closure.func;
+					int hop = 0;
+					while(cl != NULL && hop++ < 12) {
+						fprintf(stderr, "    closure[%d] var=%p own:", hop, (void*)cl);
+						hash_map_iterate(&cl->children, dbg_dump_member, NULL);
+						fprintf(stderr, "\n");
+						node_t* lex = var_find_own_member(cl, "@@lex");
+						if(lex != NULL && !var_empty(lex->var)) { cl = lex->var; continue; }
+						if(cf == NULL) break;
+						cl = cf->closure.var;
+						cf = cf->closure.func;
+					}
+					if(cl == NULL)
+						fprintf(stderr, "    closure: EMPTY\n");
+				}
+			}
+		}
 		vm_throw(vm, "there is no class: '%s'!", name);
 		return NULL;
 	}
@@ -5801,7 +5953,12 @@ static bool do_new(vm_t* vm, const char* full) {
 	mstr_free(name);
 
 	if(obj == NULL)
-		return false;
+		/* new_obj already vm_throw'd: the error is either seated at an in-range
+		 * catch (vm->pc redirected) or propagating outward. Returning false made
+		 * handle_new vm_terminate() over that dispatch - a catchable `new` failure
+		 * (e.g. `new undefined_param()`) silently killed the whole run instead of
+		 * reaching its catch. The throw IS the handling; report success. */
+		return true;
 	vm_push(vm, obj);
 	return true;
 }
@@ -5835,6 +5992,14 @@ var_t* call_m_func(vm_t* vm, var_t* obj, var_t* func, var_t* args) {
 	while(vm->gc.is_doing_gc);
 	func_call(vm, obj, func, arg_num);
 	var_t* ret = vm_pop2(vm);
+	if(vm->propagating_err != NULL) {
+		/* The callee aborted: discard its placeholder result so the native caller
+		 * sees NULL; propagation continues when that native returns. */
+		if(ret != NULL)
+			var_unref(ret);
+		vm->gc.gc_defer--;
+		return NULL;
+	}
 	if(ret != NULL && obj == ret)
 		ret->refs--;
 	vm->gc.gc_defer--;
@@ -5869,7 +6034,26 @@ var_t* call_m_func_by_name(vm_t* vm, var_t* obj, const char* func_name, uint32_t
 /*****************/
 
 var_t* vm_new_class(vm_t* vm, const char* cls) {
-	node_t* n = vm_load_node(vm, cls, true);
+	/* A class declaration creates a FRESH binding in the current (block or
+	 * function) scope, exactly like `let` - it must NOT resolve to an outer
+	 * binding that merely shares the (minified) name. The old vm_load_node(create)
+	 * path walked the live scope stack and, on finding any enclosing `u`, reused
+	 * that var instead of declaring one here. The class methods/prototype were then
+	 * installed on the outer var, while a deferred inner closure created in the
+	 * constructor (e.g. `this.create=()=>(new u)._setExec(this)`) captures only the
+	 * block chain via @@lex/closure.func - which never reaches that outer scope - so
+	 * the later `new u` threw "there is no class: 'u'". Bind into the current scope
+	 * var directly so the name lives right where sibling `let`s (e.g. `let c=null`)
+	 * do, and any closure capturing this block sees it. */
+	var_t* scope_var = vm_get_scope_var(vm);
+	node_t* n = NULL;
+	if(scope_var != NULL)
+		n = var_find_own_member(scope_var, cls);
+	if(n == NULL || n->var == NULL || n->var->status == V_ST_FREE) {
+		if(scope_var == NULL)
+			return NULL;
+		n = var_add(scope_var, cls, NULL);
+	}
 	if(n == NULL)
 		return NULL;
 	var_t* cls_var = n->var;
@@ -6888,6 +7072,11 @@ static inline void handle_bigint(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 	vm_push(vm, v);
 }
 
+static void dbg_dump_member(const char* key, void* value, void* ud) {
+	node_t* nd = (node_t*)value;
+	fprintf(stderr, " %s%s", key, (nd && nd->be_const) ? "!" : "");
+}
+
 static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	register PC* code = vm->bc.code_buf;
 	var_t* v = vm_pop2(vm);
@@ -6973,18 +7162,40 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		return;
 	}
 
-	bool modi = (!n->be_const || n->var->type == V_UNDEF);
-	var_unref(n->var);
-	if(modi) {
-		node_replace(n, v);
-	}
-	else {
+	/* Writing to a const binding is a TypeError in BOTH strict and sloppy mode
+	 * (and Object.freeze marks members non-writable the same way), so throw per
+	 * spec. An earlier band-aid let such writes through to keep a minified webpack
+	 * bundle alive, but that only papered over a class-binding bug: `class u` used
+	 * to reuse an outer const `u` and the constructor then wrote to it. With
+	 * vm_new_class now declaring a fresh binding (see there), the stray const write
+	 * is gone, so restore correct behaviour. MARIO_CONSTDBG still dumps the owning
+	 * scope chain if a real bundle ever trips this again. */
+	if(n->be_const && n->var->type != V_UNDEF) {
 		mario_debug("Error: Can not change a const variable: '%s'!\n", n->name);
+		if(getenv("MARIO_CONSTDBG")) {
+			fprintf(stderr, "[constdbg] name=%s pc=%u sstop=%d\n", n->name, vm->pc, vm->scope_stack_top);
+			for(int si = vm->scope_stack_top - 1; si >= 0; si--) {
+				scope_t* sc = vm->scope_stack[si];
+				if(sc == NULL || sc->var == NULL)
+					continue;
+				node_t* own = var_find_own_member(sc->var, n->name);
+				fprintf(stderr, "  scope[%d] func=%d block=%d own=%s%s\n", si, sc->is_func ? 1 : 0, sc->is_block ? 1 : 0,
+					own ? "yes" : "no", (own && own->be_const) ? "(const)" : "");
+				if(own) {
+					fprintf(stderr, "    members:");
+					hash_map_iterate(&sc->var->children, dbg_dump_member, NULL);
+					fprintf(stderr, "\n");
+				}
+			}
+		}
+		var_unref(n->var);
 		vm_throw(vm, "can not change a const variable: '%s'!", n->name);
 		var_unref(v);
 		vm->gc.gc_defer--;
 		return;
 	}
+	var_unref(n->var);
+	node_replace(n, v);
 
 	if((ins & INSTR_OPT_CACHE) == 0) {
 		if(OP(code[vm->pc]) != INSTR_POP) {
@@ -7213,6 +7424,27 @@ static inline void handle_newx_spread(vm_t* vm, PC ins, opr_code_t instr, uint32
 	vm->gc.gc_defer--;
 }
 
+/* `with (obj) { f(); }`: JS reference semantics make `obj` the `this` of a bare
+ * call whose callee resolves on the with-object (the same object a member read
+ * would use). Without this the call falls back to the ambient `this`, which is
+ * NULL at top level, and host natives dereference a missing receiver. Returns
+ * the innermost with scope var that provides `name`, else NULL. */
+static var_t* vm_with_owner_for(vm_t* vm, const char* name) {
+	scope_t* sc = vm_get_scope(vm);
+	int guard = 0;
+	while(sc != NULL) {
+		if(++guard > VM_SCOPE_STACK_MAX)
+			break;
+		if(sc->is_with && !var_empty(sc->var)) {
+			var_t* f = find_func(vm, sc->var, name);
+			if(f != NULL)
+				return sc->var;
+		}
+		sc = sc->prev;
+	}
+	return NULL;
+}
+
 static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	var_t* func = NULL;
 	var_t* obj = NULL;
@@ -7242,8 +7474,15 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		}
 	}
 	else {
-		obj = vm_this_in_scopes(vm);
-		func = find_func(vm, sc_var, name->cstr);
+		var_t* wobj = vm_with_owner_for(vm, name->cstr);
+		if(wobj != NULL) {
+			obj = wobj;
+			func = find_func(vm, wobj, name->cstr);
+		}
+		else {
+			obj = vm_this_in_scopes(vm);
+			func = find_func(vm, sc_var, name->cstr);
+		}
 	}
 
 	if(func == NULL && obj != NULL)
@@ -7288,6 +7527,34 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		func_call(vm, obj, func, arg_num);
 	}
 	else {
+		if(getenv("MARIO_CNFDBG")) { /* DIAG (opt-in): identify the receiver that lacks the member */
+			fprintf(stderr, "[DIAGCNF] '%s' obj=%p type=%u is_array=%u is_func=%u\n",
+				name->cstr, (void*)obj, obj ? (unsigned)obj->type : 99u,
+				obj ? (unsigned)obj->is_array : 0u, obj ? (unsigned)obj->is_func : 0u);
+			if(obj != NULL && obj->type == V_STRING) {
+				const char* cs = var_get_str(obj);
+				fprintf(stderr, "[DIAGCNF]   str=%.60s\n", cs ? cs : "(null)");
+				if(getenv("MARIO_PCDBG")) {
+					for(PC i = (vm->pc > 16 ? vm->pc - 16 : 0); i <= vm->pc + 1; i++) {
+						PC insw = vm->bc.code_buf[i];
+						PC op = OP(insw), oph = insw & 0xFFFFF;
+						fprintf(stderr, "  pc=%u op=%02x oph=%05x%s%s\n", i, op, oph,
+							(op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64) ? " str=" : "", 
+							(op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64) ? bc_getstr(&vm->bc, oph) : "");
+					}
+				}
+			}
+			if(obj != NULL && obj->type == V_OBJECT) {
+				/* SAFE scalar-only dump: the receiver may be a recycled var (internal
+				 * free list), so NEVER walk children/prototype here - a hash lookup
+				 * into a zeroed children map crashes (the very bug being diagnosed).
+				 * buckets/capacity/refs/vm distinguish live wrapper vs recycled. */
+				fprintf(stderr, "[DIAGCNF]   obj vm=%d refs=%d buckets=%d cap=%u\n",
+					obj->vm != NULL ? 1 : 0, (int)obj->refs,
+					obj->children.buckets != NULL ? 1 : 0,
+					(unsigned)obj->children.capacity);
+			}
+		}
 		vm->gc.gc_defer++; //obj is a bare C pointer while the args are popped and the throw unwinds
 		while(arg_num > 0) {
 			vm_pop(vm);
@@ -8295,8 +8562,9 @@ static inline void handle_new_spread(vm_t* vm, PC ins, opr_code_t instr, uint32_
 	if(args != NULL && args->is_array)
 		vm_pop(vm); //drop the args anchor
 	if(obj == NULL) {
+		/* new_obj already vm_throw'd (catch seated or propagating): terminate here
+		 * would kill the run over a handled throw, same bug as do_new's old path. */
 		vm_push(vm, var_new(vm));
-		vm_terminate(vm);
 	}
 	else {
 		vm_push(vm, obj);
@@ -9220,7 +9488,12 @@ var_t* mario_apply_var(vm_t* vm, var_t* func, var_t* thisArg, var_t* argsNatural
 	if(var_is_proxy(func))
 		return proxy_apply(vm, func, thisArg, argsNatural);  // refs=0
 	var_t* r = call_with_args(vm, thisArg, func, argsNatural);
-	if(r != NULL && r->refs > 0) r->refs--;
+	/* call_m_func hands back the stack ref OWNED, except when the callee returned
+	 * its own receiver (push/sort/reverse/...): that path already dropped the
+	 * stack ref and the value is borrowed. Decrementing again here underflowed
+	 * the receiver (e.g. `Array.prototype.push.apply(o.phases, ..)` freed the
+	 * member var, which the allocator then recycled for a string temp). */
+	if(r != NULL && r != thisArg && r->refs > 0) r->refs--;
 	return (r != NULL) ? r : var_new(vm);
 }
 
@@ -9547,33 +9820,24 @@ static inline void handle_import_bind(vm_t* vm, PC ins, opr_code_t instr, uint32
 
 static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	vm_throw_truncate(vm); // the thrown value is on top; drop operands the interrupted expression leaked
-	while(true) {
-		scope_t* sc = vm_get_scope(vm);
-		if(sc == NULL) {
-			/* Unhandled user throw: report the value like a console would,
-			 * then abort this script run only (vm_terminate resets on the
-			 * next vm_run). */
-			var_t* tv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
-			mstr_t* es = mstr_new("");
-			var_to_str(tv, es);
-			char tagsfx[160] = {0};
-			if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
-			mario_printf("Uncaught %s%s\n", es->cstr, tagsfx);
-			mstr_free(es);
-			vm_terminate(vm);
-			break;
+	scope_t* try_sc = vm_find_inrange_try(vm);
+	if(try_sc == NULL) {
+		/* Unhandled user throw: propagate outward (a vm_run frame with an
+		 * in-range catch consumes it; the script top reports it). */
+		var_t* tv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
+		if(tv != NULL) {
+			vm_pop2(vm);
+			vm_propagate(vm, tv);
 		}
-		if(sc->is_try) {
-			/* Consume this try: the catch handler is entered now, so a throw raised
-			 * from within its own catch body must NOT re-match the same scope (the
-			 * scope lives until INSTR_TRY_END, after the catch body). Without this
-			 * the second throw jumps back to the same catch forever -> hang. */
-			sc->is_try = false;
-			vm->pc = sc->pc;
-			break;
+		else {
+			vm_propagate(vm, var_new(vm));
 		}
-		vm_pop_scope(vm);
+		return;
 	}
+	while(vm_get_scope(vm) != try_sc)
+		vm_pop_scope(vm);
+	try_sc->is_try = false; //consume: a re-throw inside this catch must not loop back to the same handler
+	vm->pc = try_sc->pc;
 }
 
 static inline void handle_catch(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -9795,8 +10059,49 @@ bool vm_run(vm_t* vm) {
 
 	register PC code_size = vm->bc.cindex;
 	register PC* code = vm->bc.code_buf;
+	/* This frame's catch/propagate baselines: a try scope or stack operand from
+	 * an OUTER vm_run frame must never be touched by this loop (see mario.h). */
+	int32_t save_scope_base = vm->run_scope_base;
+	int32_t save_stack_base = vm->run_stack_base;
+	vm->run_scope_base = vm->scope_stack_top;
+	vm->run_stack_base = vm->stack_top;
+	bool rv = false;
 
 	do {
+		if(vm->abort_run) {
+			scope_t* try_sc = vm_find_inrange_try(vm);
+			if(getenv("MARIO_DIAGX"))
+				mario_printf("[DIAGX] vm_run abort try_sc=%p base=%d top=%d stack=%d sbase=%d\n", (void*)try_sc, vm->run_scope_base, vm->scope_stack_top, vm->stack_top, vm->run_stack_base);
+			if(try_sc != NULL) {
+				/* Catch in THIS frame: discard operands the interrupted expression
+				 * leaked, re-seat the propagated error for handle_catch, enter the
+				 * catch body and keep running this loop. */
+				while(vm->stack_top > vm->run_stack_base)
+					vm_pop(vm);
+				var_t* err = vm->propagating_err;
+				vm->propagating_err = NULL;
+				vm->abort_run = false;
+				vm_push(vm, (err != NULL) ? err : var_new(vm));
+				if(err != NULL)
+					var_unref(err); // the stack slot holds the only reference now
+				while(vm_get_scope(vm) != try_sc && vm->scope_stack_top > vm->run_scope_base)
+					vm_pop_scope(vm);
+				try_sc->is_try = false; //consume: a throw inside this catch must not re-trigger it
+				vm->pc = try_sc->pc;
+				continue;
+			}
+			/* Propagate: unwind this frame's leftover block scopes AND value-stack
+			 * operands back to the entry baselines, so the func_call / call_m_func C
+			 * frame above finds its own func scope on top and its env slot intact.
+			 * Leaving the body's block scopes here made func_call read vm->pc from a
+			 * block scope and pop only one scope, stranding sc+env on the scope stack
+			 * (scope-stack desync -> a later vm_get_scope var is freed -> UAF). */
+			while(vm->scope_stack_top > vm->run_scope_base)
+				vm_pop_scope(vm);
+			while(vm->stack_top > vm->run_stack_base)
+				vm_pop(vm);
+			break;
+		}
 		/* Opportunistic gc safe point: between instructions the value stack and
 		 * scope stack hold every live var, so a collection here cannot sweep a
 		 * var a C frame still references bare (native_Array_sort et al.). */
@@ -9838,17 +10143,21 @@ bool vm_run(vm_t* vm) {
 
 		/* Handle return instructions */
 		if(instr == INSTR_RETURN || instr == INSTR_RETURNV) {
-			return true;
+			rv = true;
+			break;
 		}
 
 		/* A yield suspended the generator body this vm_run() frame is running:
 		 * hand control back to gen_resume() with the stacks left as they are. */
 		if(vm->yielded && (instr == INSTR_YIELD || instr == INSTR_YIELD_STAR)) {
-			return false;
+			rv = false;
+			break;
 		}
 	}
 	while(vm->pc < code_size && !vm->terminated);
-	return false;
+	vm->run_scope_base = save_scope_base;
+	vm->run_stack_base = save_stack_base;
+	return rv;
 }
 
 bool vm_load(vm_t* vm, const char* s) {
@@ -9866,6 +10175,8 @@ bool vm_load_run(vm_t* vm, const char* s) {
 	bool ret = false;
 	if(vm_load(vm, s)) {
 		vm_run(vm);
+		if(vm->propagating_err != NULL)
+			vm_report_uncaught(vm); // script top: an uncaught error aborts this script only
 		ret = true;
 	}
 	return ret;
@@ -9877,6 +10188,8 @@ bool vm_load_run_native(vm_t* vm, const char* s) {
 
 	if(vm_load(vm, s)) {
 		vm_run(vm);
+		if(vm->propagating_err != NULL)
+			vm_report_uncaught(vm);
 		ret = true;
 	}
 

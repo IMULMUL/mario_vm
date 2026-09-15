@@ -673,6 +673,23 @@ typedef struct st_vm {
 	 * delivers it to the nearest try scope after the native returns, keeping the
 	 * value stack balanced (env pop / ret push protocol). */
 	var_t*              native_thrown;
+	/* Cooperative exception propagation across vm_run C frames. Every JS call
+	 * recurses into its own vm_run(), and vm_throw() used to unwind by rewriting
+	 * the single global vm->pc - only valid when the catch lives in the SAME
+	 * loop; a throw with no in-range catch reported-and-CONTINUED the interrupted
+	 * body (a Promise executor could still resolve after throwing), and a catch
+	 * in an outer frame made the nested loop execute the outer stream. Now a
+	 * throw no frame of the current run can catch stores the error here (owned
+	 * ref) and sets abort_run; each vm_run frame either catches it in-range
+	 * (scope index >= run_scope_base, the scope-stack depth at that frame's
+	 * entry) or restores its entry stack depth and returns, letting func_call /
+	 * call_m_func unwind their C frames, until a frame catches or the script
+	 * top reports it (vm_report_uncaught). run_scope_base/run_stack_base are
+	 * saved and restored by vm_run around every nested entry. */
+	var_t*              propagating_err;
+	bool                abort_run;
+	int32_t             run_scope_base;
+	int32_t             run_stack_base;
 	uint32_t            gen_depth;
 	var_t*              root;
 	var_t*              new_target; // ES6 `new.target`: the constructor of the in-progress `new`; consumed (bound into env, then cleared) by func_call
@@ -922,7 +939,12 @@ void        vm_terminate(vm_t* vm);
 
 var_t*      vm_new_class(vm_t* vm, const char* cls);
 var_t*      new_obj(vm_t* vm, const char* cls_name, int arg_num);
-void        vm_throw(vm_t* vm, const char* format, ...);
+void        vm_throw(vm_t* vm, const char *format, ...);
+/* Report (console-style) and clear an exception that propagated out of every
+ * vm_run frame without an in-range catch; also clears abort_run. Called by the
+ * script-top runners (vm_load_run / vm_load_run_native) and by callback pumps
+ * (timers / events) so an uncaught error in a callback is visible, not lost. */
+void        vm_report_uncaught(vm_t* vm);
 void        vm_throw_native(vm_t* vm, const char* format, ...);
 /* Throw a typed error (e.g. "TypeError"/"RangeError"): builds an instance whose
  * [[Prototype]] is that class's prototype (so `instanceof` and `.name` work),

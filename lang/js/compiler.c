@@ -2765,6 +2765,51 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
                 }
                 bc_gen_str(bc, INSTR_OPT_GET, name->cstr);
                 mstr_free(name);
+            } else if (l->tk == '(' || l->tk == '[') {
+                /* ES2020 optional call `base?.(args)` and optional index
+                 * `base?.[key]`. The base is on the stack. A NULLISH guard keeps
+                 * a non-nullish base and jumps into the call/index; a nullish
+                 * base is popped and the whole link yields undefined WITHOUT
+                 * evaluating the argument list or the key (spec short-circuit).
+                 * Layout: [base] NULLISH->body | UNDEF | JMP->end | body... | end.
+                 * Both paths leave exactly one value for the postfix loop. */
+                bool is_call = (l->tk == '(');
+                PC pc_guard = bc_reserve(bc); // NULLISH, patched to body
+                bc_gen(bc, INSTR_UNDEF);      // nullish-base result
+                PC pc_skip = bc_reserve(bc);  // JMP over the body, patched at end
+                PC pc_body = bc->cindex;      // non-nullish entry: base on stack
+                if (is_call) {
+                    /* Capture a receiver kept by a just-compiled `v[key]` BEFORE
+                     * arg compilation, as the plain `(` branch does. */
+                    int recv = g_arrat_recv;
+                    g_arrat_recv = 0;
+                    bool has_spread = false;
+                    int arg_num = call_func(l, bc, &has_spread);
+                    if (arg_num < 0) {
+                        return false;
+                    }
+                    if (has_spread) {
+                        bc_gen_str(bc, recv ? INSTR_CALLXO_SPREAD : INSTR_CALLX_SPREAD, "");
+                    } else {
+                        mstr_t* s = mstr_new("");
+                        gen_func_name("", arg_num, s);
+                        bc_gen_str(bc, recv ? INSTR_CALLXO : INSTR_CALLX, s->cstr);
+                        mstr_free(s);
+                    }
+                } else {
+                    if (!lex_chkread(l, '[')) {
+                        return false;
+                    }
+                    if (!base(l, bc)) {
+                        return false;
+                    }
+                    if (!lex_chkread(l, ']')) {
+                        return false;
+                    }
+                    bc_gen(bc, INSTR_ARRAY_AT);
+                }
+                bc_set_instr(bc, pc_skip, INSTR_JMP, ILLEGAL_PC);    // join point
+                bc_set_instr(bc, pc_guard, INSTR_NULLISH, pc_body); // non-nullish
             } else {
                 return false;
             }
