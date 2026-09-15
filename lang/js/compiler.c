@@ -1468,6 +1468,52 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         mstr_free(class_name);
         return false;
     }
+    /* `new A.b(args)` / `new A.b.c(args)`: a member expression as the
+     * constructor (webpack harmony imports call `new _mod__.navigation(...)`).
+     * Load the base, walk the chain with member reads so the constructor value
+     * ends up on the stack, then construct it NEWX-style. Without this the
+     * code below emitted `new A` and left `.b(args)` to parse as a method
+     * call on the fresh object - "can not find function 'b'" on w3.org. */
+    if (l->tk == '.') {
+        bc_gen_str(bc, INSTR_LOAD, class_name->cstr);
+        while (l->tk == '.') {
+            if (!lex_chkread(l, '.')) {
+                mstr_free(class_name);
+                return false;
+            }
+            if (l->tk != LEX_ID) {
+                mstr_free(class_name);
+                return false;
+            }
+            mstr_t* mem = mstr_new(l->tk_str->cstr);
+            if (!lex_chkread(l, LEX_ID)) {
+                mstr_free(mem);
+                mstr_free(class_name);
+                return false;
+            }
+            bc_gen_str(bc, INSTR_GET, mem->cstr);
+            mstr_free(mem);
+        }
+        int arg_num = 0;
+        bool has_spread = false;
+        if (l->tk == '(') {
+            arg_num = call_func(l, bc, &has_spread);
+            if (arg_num < 0) {
+                mstr_free(class_name);
+                return false;
+            }
+        }
+        if (has_spread) {
+            bc_gen_str(bc, INSTR_NEWX_SPREAD, "");
+        } else {
+            mstr_t* s = mstr_new("");
+            gen_func_name("", arg_num, s);
+            bc_gen_str(bc, INSTR_NEWX, s->cstr);
+            mstr_free(s);
+        }
+        mstr_free(class_name);
+        return true;
+    }
     if (l->tk == '(') {
         bool has_spread = false;
         int arg_num = call_func(l, bc, &has_spread);
@@ -3709,6 +3755,14 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
     /* condition anchor: fetch the next step, `__for_of_step = iter.next()`,
      * then break out when `step.done` is truthy. `continue` re-enters here. */
     PC cond_pc = bc->cindex;
+    /* ES6 loop bodies are blocks: every iteration gets a FRESH scope, so a
+     * body-level `const x` / `let x` re-binds instead of colliding with the
+     * previous iteration's binding (the loop scope itself lives for the whole
+     * loop; without a per-iteration block the second iteration throws
+     * "let 'x' has already existed"). The block is pushed at the TOP of the
+     * iteration so every exit path - fall-through, continue, break and the
+     * natural done-jump - leaves it through exactly one BLOCK_END. */
+    bc_gen(bc, INSTR_BLOCK);
     bc_gen_str(bc, INSTR_LOAD, "__for_of_step");
     bc_gen_str(bc, INSTR_LOAD, "__for_of_iter");
     bc_gen_str(bc, INSTR_CALLO, "next");
@@ -3717,7 +3771,12 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
     bc_gen_str(bc, INSTR_LOAD, "__for_of_step");
     bc_gen_str(bc, INSTR_GET, "done");
     bc_gen(bc, INSTR_NOT); // continue while !done
-    bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC);
+    /* done-jump: retargeted below (as a FORWARD NJMP) to the BLOCK_END
+     * trampoline, because it leaves from INSIDE the iteration block (unlike
+     * `break`, whose VM handler pops the block scopes itself before jumping).
+     * Emitted as NJMPB for now only to reserve the slot; NJMPB jumps backward
+     * and the trampoline lives ahead of it. */
+    PC pc_njmpb = bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC) - 1;
 
     // loop_var = __for_of_step.value
     if (loop_var) {
@@ -3747,11 +3806,24 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
         return false;
     }
 
-    bc_add_instr(bc, cond_pc, INSTR_JMPB, ILLEGAL_PC); // -> fetch next step
+    bc_gen(bc, INSTR_BLOCK_END);   /* fall-through pops the iteration block */
+    /* back edge -> cond_pc (pushes the next iteration's block) */
+    PC pc_back = bc_add_instr(bc, cond_pc, INSTR_JMPB, ILLEGAL_PC) - 1;
+
+    /* done trampoline: pop the iteration block, then leave. `break` needs no
+     * trampoline - handle_break pops every scope above the loop scope itself
+     * and lands straight on the loop's break slot. */
+    PC pc_brk_trap = bc->cindex;
+    bc_gen(bc, INSTR_BLOCK_END);
+    PC pc_exit_jmp = bc_reserve(bc);            /* -> LOOP_END, patched below */
 
     PC pc = bc_gen(bc, INSTR_LOOP_END);
-    bc_set_instr(bc, pc_break, INSTR_JMP, pc - 1); // end anchor;
-    bc_set_instr(bc, pc_condition, INSTR_JMP, cond_pc); // continue -> fetch next step
+    bc_set_instr(bc, pc_exit_jmp, INSTR_JMP, pc - 1);
+    bc_set_instr(bc, pc_njmpb, INSTR_NJMP, pc_brk_trap);  /* NJMP: forward jump */
+    bc_set_instr(bc, pc_break, INSTR_JMP, pc - 1);
+    /* continue: the VM handler already popped the iteration block, so land on
+     * the back edge (not on pc_bend's BLOCK_END, which would pop twice). */
+    bc_set_instr(bc, pc_condition, INSTR_JMP, pc_back);
 
     if (loop_var) {
         mstr_free(loop_var);

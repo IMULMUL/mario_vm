@@ -4617,7 +4617,14 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		vm->call_depth--;
 		if(returned) {
 			ret = vm_pop2(vm);
-			ret->refs--;
+			/* vm_pop2 returns NULL on an underflowed value stack - which is what a
+			 * deeply recursive runaway leaves behind: a nested frame hits the call
+			 * depth guard and vm_terminate() clears the stack, yet this ancestor
+			 * frame still sees returned==true and pops an empty slot. Guard the
+			 * ref-drop so it falls through to the `ret == NULL` recovery below
+			 * (yields undefined) instead of dereferencing NULL. */
+			if(ret != NULL)
+				ret->refs--;
 		}
 		/* Contain any operands the body leaked BELOW the return value: truncate the
 		 * value stack back to the frame baseline (env left on top), exactly like
@@ -5821,7 +5828,12 @@ static inline void handle_jmpb(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 
 static inline void handle_njmp(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	var_t* v = vm_pop2(vm);
-	if(v->type == V_UNDEF || v->value == NULL || *(int*)(v->value) == 0) {
+	/* `if`/loop conditions must use the real JS ToBoolean. The old raw
+	 * `*(int*)v->value == 0` int-slot test read the first word of an object
+	 * struct, so every object / array / function tested FALSY and the guarded
+	 * block was skipped (e.g. `if (el) {...}`, `if (PRESETS[p]) {...}`).
+	 * var_truthy() matches `!`, `&&`, `||` and `??`, which already use it. */
+	if(!var_truthy(v)) {
 		if(instr == INSTR_NJMP) 
 			vm->pc = vm->pc + offset - 1;
 		else
