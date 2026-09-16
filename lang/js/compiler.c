@@ -5460,8 +5460,22 @@ bool stmt_switch(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, LEX_R_SWITCH)) return false;
     if (!lex_chkread(l, '(')) return false;
 
-    bc_gen_str(bc, INSTR_SAFE_VAR, "__sw_val");
-    bc_gen_str(bc, INSTR_LOAD, "__sw_val");
+    /* The discriminant temp must be unique per switch statement: an inner switch
+     * compiled inside a case body would otherwise overwrite the outer temp and
+     * the outer dispatch would then compare against the wrong value.
+     *
+     * It is declared with INSTR_VAR, not INSTR_SAFE_VAR: the temp is emitted
+     * outside the switch scope, so a switch inside a loop re-runs the
+     * declaration on every iteration and SAFE_VAR's redeclaration guard aborts
+     * the whole script with "let '__sw_val_N' has already existed". `var`
+     * semantics (idempotent, function-scoped) are what a compiler-internal temp
+     * needs, and the ASIGN below refreshes it before every dispatch. */
+    static uint32_t sw_seq = 0;
+    char sw_tmp[32];
+    snprintf(sw_tmp, sizeof(sw_tmp), "__sw_val_%u", sw_seq++);
+
+    bc_gen_str(bc, INSTR_VAR, sw_tmp);
+    bc_gen_str(bc, INSTR_LOAD, sw_tmp);
     if (!expr_seq(l, bc)) return false;   // discriminant
     if (!lex_chkread(l, ')')) return false;
     bc_gen(bc, INSTR_ASIGN);
@@ -5497,7 +5511,7 @@ bool stmt_switch(lex_t* l, bytecode_t* bc) {
             if (!lex_chkread(l, LEX_R_CASE)) { ok = false; break; }
             lex_skip_empty(l);
             test_start[n_cases] = bc->cindex;
-            bc_gen_str(bc, INSTR_LOAD, "__sw_val");
+            bc_gen_str(bc, INSTR_LOAD, sw_tmp);
             if (!base(l, bc)) { ok = false; break; }      // case expr, stops at ':'
             bc_gen(bc, INSTR_TEQ);
             njmp_anchor[n_cases] = bc_reserve(bc);        // NJMP -> next test
@@ -5522,9 +5536,18 @@ bool stmt_switch(lex_t* l, bytecode_t* bc) {
 
     PC dispatch_end = bc->cindex;
     PC default_anchor = ILLEGAL_PC;
+    PC no_match_anchor = ILLEGAL_PC;
     if (ok && has_default) default_anchor = bc_reserve(bc); // JMP -> default body
+    /* Without a default clause nothing may sit at dispatch_end: pass 2 emits
+     * body_0 right there, so a discriminant that matches no case would fall
+     * straight into the first body. Reserve a slot that is patched to JMP
+     * SWITCH_END once pc_end is known. */
+    else if (ok) no_match_anchor = bc_reserve(bc);          // JMP -> SWITCH_END
     for (int i = 0; ok && i < n_cases; i++) {
-        PC tgt = (i + 1 < n_cases) ? test_start[i + 1] : dispatch_end;
+        PC tgt;
+        if (i + 1 < n_cases)          tgt = test_start[i + 1];
+        else if (has_default)         tgt = dispatch_end;
+        else                          tgt = no_match_anchor;
         bc_set_instr(bc, njmp_anchor[i], INSTR_NJMP, tgt);
     }
 
@@ -5565,6 +5588,9 @@ bool stmt_switch(lex_t* l, bytecode_t* bc) {
     if (has_default && default_anchor != ILLEGAL_PC) {
         PC dtgt = (default_body_pos != ILLEGAL_PC) ? default_body_pos : pc_end;
         bc_set_instr(bc, default_anchor, INSTR_JMP, dtgt);
+    }
+    else if (no_match_anchor != ILLEGAL_PC) {
+        bc_set_instr(bc, no_match_anchor, INSTR_JMP, pc_end);
     }
     return true;
 }

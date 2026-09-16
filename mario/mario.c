@@ -4503,11 +4503,25 @@ static var_t* var_new_func(vm_t* vm, func_t* func) {
 	var->value = func;
 	if(func != NULL)
 		func->owner_var = var; //gc anchor: root this func_t via its owning var (see gc_mark is_func walk)
-	var_t* proto = var_get_prototype(vm->builtin_vars.var_Object);
-	if(proto == NULL)
-		proto = var_new_obj_no_proto(vm, NULL, NULL);
+	var_t* obj_proto = var_get_prototype(vm->builtin_vars.var_Object);
+	if(obj_proto == NULL)
+		obj_proto = var_new_obj_no_proto(vm, NULL, NULL);
+	/* Every function gets its OWN distinct `prototype` object (parented to
+	 * Object.prototype), mirroring what vm_new_class already does for classes.
+	 * Previously the single shared builtin Object.prototype was installed as the
+	 * "prototype" member of every function, so `f.prototype` WAS Object.prototype.
+	 * The standard prototype-OOP idiom `F.prototype.method = ...` (and core-js's
+	 * fetch polyfill doing `Headers.prototype.append = ...`, `Response.prototype
+	 * .json = ...`, ...) therefore mutated Object.prototype for EVERY object:
+	 * enumerable members leaked into every `for..in`, `({}).append` became a
+	 * function, and core-js's TypedArray feature test (`for(g in uv)...ud=!1`)
+	 * tripped over those leaked keys, collapsing %TypedArray%.prototype onto
+	 * Object.prototype and installing a self-recursive byteLength getter there.
+	 * This member still doubles as the instance prototype for `new f()` (do_new
+	 * reads var_get_prototype(func)), which now correctly points at f's own
+	 * prototype rather than the shared one. */
+	var_t* proto = var_new_obj(vm, obj_proto, NULL, NULL);
 	var_set_prototype(var, proto);
-	//var_add(proto, CONSTRUCTOR, var);
 	return var;
 }
 
@@ -4564,6 +4578,39 @@ static var_t* find_func(vm_t* vm, var_t* obj, const char* fname) {
 static var_t* gen_create(vm_t* vm, var_t* func_var, var_t* env);
 
 static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
+	/* TEMP taobao diag: ring buffer of recent func_call entries. */
+	{
+		static struct { unsigned vpc; unsigned fpc; void* fv; void* obj; unsigned otype; int argc; } fc_ring[64];
+		static unsigned fc_ring_i = 0;
+		static unsigned fc_ring_n = 0;
+		{
+			unsigned i = fc_ring_i % 64u;
+			fc_ring[i].vpc = (unsigned)vm->pc;
+			func_t* ff = (func_var != NULL) ? var_get_func(func_var) : NULL;
+			fc_ring[i].fpc = (ff != NULL) ? (unsigned)ff->pc : 0u;
+			fc_ring[i].fv = (void*)func_var;
+			fc_ring[i].obj = (void*)obj;
+			fc_ring[i].otype = (obj != NULL) ? (unsigned)obj->type : 999u;
+			fc_ring[i].argc = arg_num;
+			fc_ring_i++;
+			if(fc_ring_n < 64u) fc_ring_n++;
+		}
+		if(getenv("MARIO_FCRING") != NULL && (vm->call_depth >= 40 || vm->stack_top >= 180)) {
+			unsigned k;
+			for(k = 0; k < fc_ring_n; ++k) {
+				unsigned i = (fc_ring_i - fc_ring_n + k) % 64u;
+				fprintf(stderr, "[fcring] %u vpc=%u fpc=%u fv=%p obj=%p(t%u) argc=%d\n",
+					k, fc_ring[i].vpc, fc_ring[i].fpc, fc_ring[i].fv,
+					fc_ring[i].obj, fc_ring[i].otype, fc_ring[i].argc);
+			}
+			fc_ring_n = 0;
+			if(getenv("MARIO_FCRINGBC") != NULL) {
+				void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+				bc_dump_window(&vm->bc, 121514, 8);
+				bc_dump_window(&vm->bc, 83799, 12);
+			}
+		}
+	}
 	/* Proxy apply/construct: a callable proxy has no func_t, so route it before the
 	 * ordinary path builds an env. Collect the arg_num args the caller already pushed
 	 * (stack order -> natural), then drive the apply trap - or the construct trap when
@@ -4632,7 +4679,8 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 	for(i=(int32_t)func->args.size-1; i>=0; i--) {
 		const char* arg_name = (const char*)array_get(&func->args, i);
 		var_t* v = NULL;
-		if(i >= arg_num) {
+		bool passed = (i < arg_num);
+		if(!passed) {
 			v = var_new(vm);
 			var_ref(v);
 		}
@@ -4640,7 +4688,16 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 			v = vm_pop2(vm);	
 		}	
 		if(v != NULL) {
-			var_array_add(args, v);
+			/* Only actually-passed arguments belong in the `arguments` object. A
+			 * declared-but-omitted parameter must NOT pad it: doing so made
+			 * arguments.length report max(declared_params, passed_args), which
+			 * broke core-js's `arguments.length < 2` guards (e.g. getBuiltIn's
+			 * tU(name) took the 2-arg branch and returned undefined for WeakMap,
+			 * surfacing later as "there is no class: 'xR'"). The env binding below
+			 * still receives undefined for the omitted parameter, exactly matching
+			 * JS semantics. */
+			if(passed)
+				var_array_add(args, v);
 			/* env can be recycled out from under this frame: get_from_free() may hand
 			 * back a var whose address is still sitting in a stale value-stack slot (a
 			 * var freed while stacked). A vm_pop2()/var_unref() of that slot during the
@@ -6392,6 +6449,23 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool r
 	if(!loaded) {
 		const char* s = bc_getstr(&vm->bc, offset);
 		node = vm_load_node(vm, s, false);
+		/* TEMP taobao diag: compare the LOAD resolution against a plain scope walk. */
+		if(getenv("MARIO_LOADDF") != NULL && strcmp(s, getenv("MARIO_LOADDF")) == 0) {
+			node_t* alt = vm_find_in_scopes(vm, s);
+			var_t* sv = vm_get_scope_var(vm);
+			node_t* own = (sv != NULL) ? var_find_member(sv, s) : NULL;
+			fprintf(stderr, "[loaddbg] LOAD '%s' pc=%u stack_top=%d/%d node=%p var=%p(t%u f%u) | scopes=%p var=%p(t%u) | scopemember=%p var=%p(t%u)\n",
+				s, (unsigned)vm->pc, (int)vm->stack_top, (int)VM_STACK_MAX, (void*)node,
+				(void*)(node != NULL ? node->var : NULL),
+				(unsigned)(node != NULL && node->var != NULL ? node->var->type : 999u),
+				(unsigned)(node != NULL && node->var != NULL ? node->var->is_func : 0u),
+				(void*)alt, (void*)(alt != NULL ? alt->var : NULL),
+				(unsigned)(alt != NULL && alt->var != NULL ? alt->var->type : 999u),
+				(void*)own, (void*)(own != NULL ? own->var : NULL),
+				(unsigned)(own != NULL && own->var != NULL ? own->var->type : 999u));
+			if(node != NULL && node->var != NULL && node->var->type == V_STRING)
+				fprintf(stderr, "[loaddbg]   resolved string=[%s]\n", var_get_str(node->var));
+		}
 		if(node == NULL) {
 			if(safe) {
 				/* `typeof undeclared` is "undefined", never a ReferenceError,
@@ -6434,7 +6508,7 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool r
 	if(node == NULL || node->var == NULL)
 		return;
 
-	if(vm->gen_depth == 0 && vm_get_loop_scope(vm) != NULL) //only cache in loop scope (never in a generator: suspension outlives the cached nodes).
+	if(vm->gen_depth == 0 && vm_get_loop_scope(vm) != NULL && getenv("MARIO_NO_NCACHE") == NULL) //only cache in loop scope (never in a generator: suspension outlives the cached nodes).
 		load_ncache(vm, node, vm->pc-1);
 }
 
@@ -7738,6 +7812,29 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	}
 
 	if(func != NULL) {
+		/* TEMP taobao diag: dump the operand stack a named CALL is about to consume. */
+		if(getenv("MARIO_CALLARGS") != NULL && vm->pc == (PC)atoi(getenv("MARIO_CALLARGS"))) {
+			fprintf(stderr, "[calldbg2] CALL '%s' argc=%d pc=%u obj=%p(t%u) func=%p(t%u f%u) stack_top=%d/%d scope_top=%d call_depth=%d\n",
+				name->cstr, arg_num, (unsigned)vm->pc, (void*)obj,
+				(unsigned)(obj != NULL ? obj->type : 999u), (void*)func,
+				(unsigned)func->type, (unsigned)func->is_func,
+				(int)vm->stack_top, (int)VM_STACK_MAX,
+				(int)vm->scope_stack_top, (int)vm->call_depth);
+			for(int ai = 1; ai <= arg_num + 2; ++ai) {
+				int idx = vm->stack_top - ai;
+				if(idx < 0) break;
+				void* raw = vm->stack[idx];
+				int mg = (raw != NULL) ? (int)(*(int8_t*)raw) : -1;
+				/* NON-destructive peek: vm_stack_pick() removes the slot it picks. */
+				var_t* av = NULL;
+				if(raw != NULL) av = (mg == 1) ? ((node_t*)raw)->var : (var_t*)raw;
+				fprintf(stderr, "[calldbg2]   stack[-%d] idx=%d raw=%p magic=%d -> %p t%u f%u str=[%s]\n",
+					ai, idx, raw, mg, (void*)av,
+					(unsigned)(av != NULL ? av->type : 999u),
+					(unsigned)(av != NULL ? av->is_func : 0u),
+					(av != NULL && av->type == V_STRING) ? var_get_str(av) : "-");
+			}
+		}
 		func_call(vm, obj, func, arg_num);
 	}
 	else {
@@ -9536,39 +9633,96 @@ static bool mario_is_extensible(var_t* obj) {
 	return !(nx != NULL && var_get_bool(nx));
 }
 
+/* An accessor property installed from a descriptor object forwards to the
+ * caller-supplied get/set function. The forwarded-to function is kept as a
+ * hidden member of the wrapper (never tagged in place - see
+ * mario_define_default), and the wrapper's func->data is the self-pointer the
+ * trampoline reads it back from, valid for as long as the wrapper itself is
+ * reachable (same contract as native_Function_bind's bound function). */
+#define ACCESSOR_FN_KEY "@@acc_fn"
+
+static var_t* native_accessor_trampoline(vm_t* vm, var_t* env, void* data) {
+	var_t* self = (var_t*)data;
+	var_t* fn = (self != NULL) ? var_find_own_member_var(self, ACCESSOR_FN_KEY) : NULL;
+	var_t* thisArg = get_obj(env, THIS);
+	uint32_t n = get_func_args_num(env);
+	var_t* args = var_new_array(vm);
+	for(uint32_t i = 0; i < n; i++) {
+		var_t* a = get_func_arg(env, i);
+		var_array_add(args, (a != NULL) ? a : var_new(vm));
+	}
+	var_t* res = mario_apply_var(vm, fn, thisArg, args);
+	var_unref(args);
+	return res;
+}
+
+/* Mint the private accessor var for `fn` (refs==0 baseline, owned by the caller's
+ * var_add). Returns NULL when the wrapper cannot be built. */
+static var_t* make_accessor_wrapper(vm_t* vm, var_t* fn, int regular) {
+	var_t* w = var_new_native_func(vm, native_accessor_trampoline, NULL);
+	if(w == NULL)
+		return NULL;
+	func_t* f = var_get_func(w);
+	if(f == NULL) {
+		var_unref(w);
+		return NULL;
+	}
+	f->regular = regular;
+	f->data = w;
+	node_t* tn = var_add(w, ACCESSOR_FN_KEY, fn);
+	if(tn != NULL) { tn->invisable = 1; tn->be_unenumerable = 1; }
+	return w;
+}
+
 /* Default [[DefineOwnProperty]] on a plain target, mirroring native_Object. */
 static bool mario_define_default(vm_t* vm, var_t* obj, var_t* key, var_t* desc) {
-	(void)vm;
 	if(obj == NULL)
 		return false;
 	char numbuf[32];
 	const char* ks = proxy_key_cstr(key, numbuf, sizeof(numbuf));
 
-	/* ES6 accessor descriptor: `{get:f}` / `{set:f}` / both. Represent it exactly
-	 * like an object-literal accessor (see merge_accessor): the getter's func_t is
-	 * tagged FUNC_GETTER and becomes the primary member var; when a setter is
-	 * present too it is tagged FUNC_SETTER and hangs off the getter as the hidden
-	 * FUNC_SETTER_KEY member, so do_get/do_set dispatch through the same path as a
-	 * `{get f(){}}` literal. The previous value-only implementation installed
-	 * `undefined` for a `{get:f}` descriptor, which broke webpack's ESM export
-	 * getters (`Object.defineProperty(exports, key, {enumerable:true, get: fn})`)
-	 * and surfaced downstream as cascading "value is not a function!" errors. */
+	/* ES6 accessor descriptor: `{get:f}` / `{set:f}` / both. The property is laid
+	 * out exactly like an object-literal accessor (see merge_accessor): the
+	 * primary member var carries func_t.regular == FUNC_GETTER and the setter
+	 * hangs off it as the hidden FUNC_SETTER_KEY member, so do_get/do_set dispatch
+	 * through the same path as a `{get f(){}}` literal.
+	 *
+	 * The descriptor's functions are PRE-EXISTING values the caller keeps using as
+	 * ordinary callables - core-js does
+	 *   Object.defineProperty(RegExpPrototype, "flags", {get: regexpFlags})
+	 * and then calls `regexpFlags` by name from its patched exec. Tagging those
+	 * func_t in place turned the caller's own binding into an accessor, so every
+	 * later `LOAD regexpFlags` took the accessor branch of handle_load_impl and
+	 * invoked it as a getter, pushing its return value (a string) instead of the
+	 * function - which then surfaced far away as "target is not callable". Wrap
+	 * each one in a private trampoline var that owns the accessor kind and leaves
+	 * the original function untouched. */
 	var_t* getter = (desc != NULL) ? var_find_own_member_var(desc, "get") : NULL;
 	var_t* setter = (desc != NULL) ? var_find_own_member_var(desc, "set") : NULL;
 	bool has_get = (getter != NULL && getter->is_func);
 	bool has_set = (setter != NULL && setter->is_func);
 	if(has_get || has_set) {
-		if(has_get) {
-			func_t* gf = var_get_func(getter);
-			if(gf != NULL) gf->regular = FUNC_GETTER;
+		if(getenv("MARIO_ACCDBG") != NULL && ks != NULL && strcmp(ks, "byteLength") == 0) {
+			var_t* op = var_get_prototype(vm->builtin_vars.var_Object);
+			fprintf(stderr, "[accdbg] install byteLength on obj=%p Object.prototype=%p same=%d objtype=%u\n",
+				(void*)obj, (void*)op, (obj==op)?1:0, (obj!=NULL)?(unsigned)obj->type:0u);
+			node_t* i8n = vm_load_node(vm, "Int8Array", false);
+			var_t* i8 = (i8n != NULL) ? i8n->var : NULL;
+			var_t* i8p = (i8 != NULL) ? var_get_prototype(i8) : NULL;
+			var_t* i8pp = (i8p != NULL) ? var_get_prototype(i8p) : NULL;
+			fprintf(stderr, "[accdbg]   Int8Array=%p Int8Array.prototype=%p getProto(that)=%p (==obj?%d) (==OP?%d)\n",
+				(void*)i8, (void*)i8p, (void*)i8pp, (i8pp==obj)?1:0, (i8pp==op)?1:0);
 		}
-		if(has_set) {
-			func_t* sf = var_get_func(setter);
-			if(sf != NULL) sf->regular = FUNC_SETTER;
+		var_t* gw = has_get ? make_accessor_wrapper(vm, getter, FUNC_GETTER) : NULL;
+		var_t* sw = has_set ? make_accessor_wrapper(vm, setter, FUNC_SETTER) : NULL;
+		if((has_get && gw == NULL) || (has_set && sw == NULL)) {
+			if(gw != NULL) var_unref(gw);
+			if(sw != NULL) var_unref(sw);
+			return false;
 		}
-		var_t* primary = has_get ? getter : setter;
-		if(has_get && has_set) {
-			node_t* sn = var_add(getter, FUNC_SETTER_KEY, setter);
+		var_t* primary = (gw != NULL) ? gw : sw;
+		if(gw != NULL && sw != NULL) {
+			node_t* sn = var_add(gw, FUNC_SETTER_KEY, sw);
 			if(sn != NULL) { sn->invisable = 1; sn->be_unenumerable = 1; }
 		}
 		node_t* node = var_add(obj, ks, primary);
@@ -9798,21 +9952,156 @@ var_t* mario_gopd_var(vm_t* vm, var_t* obj, var_t* key) {
 	return mario_gopd_default(vm, obj, key);                 // refs=0
 }
 
+/* TEMP taobao diag: nested-apply trail. */
+#define APPLY_TRAIL_MAX 32
+typedef struct {
+	void* func; unsigned ftype; unsigned ffunc;
+	void* thisArg; unsigned ttype; unsigned tfunc;
+	unsigned depth; unsigned pc; const char* tag;
+} apply_trail_ent;
+static apply_trail_ent apply_trail[APPLY_TRAIL_MAX];
+static int apply_depth = 0;
+
+typedef struct { var_t* target; int hop; int hits; } diag_scan_ctx;
+static void diag_scan_cb(const char* key, void* value, void* user_data) {
+	diag_scan_ctx* cx = (diag_scan_ctx*)user_data;
+	node_t* nd = (node_t*)value;
+	if(nd != NULL && nd->var == cx->target) {
+		fprintf(stderr, "[mario-diag]     name '%s' in scope hop=%d holds it (type=%u is_func=%u)\n",
+			key, cx->hop, (unsigned)nd->var->type, (unsigned)nd->var->is_func);
+		cx->hits++;
+	}
+}
+
 var_t* mario_apply_var(vm_t* vm, var_t* func, var_t* thisArg, var_t* argsNatural) {
 	if(func == NULL || !var_is_callable(func)) {
+		/* TEMP taobao diag: scope chain + pc of the non-callable apply. */
+		{
+			scope_t* sc = vm_get_scope(vm);
+			int hop = 0;
+			fprintf(stderr, "[mario-diag] apply NOT callable pc=%u tag=%s func=%p stack_top=%d/%d scope_top=%d\n",
+				(unsigned)vm->pc, vm->dbg_tag != NULL ? vm->dbg_tag : "-", (void*)func,
+				(int)vm->stack_top, (int)VM_STACK_MAX, (int)vm->scope_stack_top);
+			if(func != NULL) {
+				fprintf(stderr, "[mario-diag]   func type=%u is_func=%u is_class=%u refs=%u members=%u str=[%s]\n",
+					(unsigned)func->type, (unsigned)func->is_func, (unsigned)func->is_class,
+					(unsigned)func->refs, (unsigned)hash_map_size(&func->children),
+					(func->type == V_STRING) ? var_get_str(func) : "-");
+				{
+					var_t* ctor = var_find_own_member_var(func, "constructor");
+					if(ctor != NULL) fprintf(stderr, "[mario-diag]     func ctor type=%u\n", (unsigned)ctor->type);
+					var_t* proto = var_get_prototype(func);
+					fprintf(stderr, "[mario-diag]     func proto=%p\n", (void*)proto);
+					if(proto != NULL) {
+						var_t* pc = var_find_own_member_var(proto, "constructor");
+						fprintf(stderr, "[mario-diag]     proto ctor type=%u is_func=%u\n",
+							(unsigned)(pc != NULL ? pc->type : 999u),
+							(unsigned)(pc != NULL ? pc->is_func : 0u));
+					}
+				}
+				static const char* probe_keys[] = {
+					"@@bind_target", "@@bind_this", "@@bind_args", "@@fname", "@@class",
+					"prototype", "name", "length", "source", "flags", "global"
+				};
+				unsigned pk;
+				for(pk = 0; pk < sizeof(probe_keys)/sizeof(probe_keys[0]); ++pk) {
+					var_t* mv = var_find_own_member_var(func, probe_keys[pk]);
+					if(mv != NULL)
+						fprintf(stderr, "[mario-diag]     has '%s' type=%u is_func=%u\n",
+							probe_keys[pk], (unsigned)mv->type, (unsigned)mv->is_func);
+				}
+			}
+			if(thisArg != NULL)
+				fprintf(stderr, "[mario-diag]   thisArg type=%u is_func=%u\n",
+					(unsigned)thisArg->type, (unsigned)thisArg->is_func);
+			{
+				int d;
+				for(d = apply_depth - 6; d <= apply_depth; ++d) {
+					if(d < 0) continue;
+					apply_trail_ent* e = &apply_trail[d % APPLY_TRAIL_MAX];
+					if(e->depth != (unsigned)d) continue;
+					fprintf(stderr, "[mario-trail] depth=%d pc=%u tag=%s func=%p(t%u f%u) this=%p(t%u f%u)\n",
+						d, e->pc, e->tag != NULL ? e->tag : "-", e->func, e->ftype, e->ffunc,
+						e->thisArg, e->ttype, e->tfunc);
+				}
+			}
+			while(sc != NULL && hop++ < 8) {
+				const char* nm = "";
+				if(sc->func != NULL) {
+					var_t* nv = sc->func_var != NULL ? var_find_own_member_var(sc->func_var, "@@fname") : NULL;
+					if(nv != NULL && nv->type == V_STRING) nm = var_get_str(nv);
+					fprintf(stderr, "  scope[%d] func pc=%u name=%s\n", hop,
+						(unsigned)sc->func->pc, nm);
+				} else {
+					fprintf(stderr, "  scope[%d] non-func\n", hop);
+				}
+				sc = sc->prev;
+			}
+			if(getenv("MARIO_APPLYWIN")) {
+				void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+				bc_dump_window(&vm->bc, vm->pc, 24);
+				/* Which identifier did the failing CALL resolve to, and what is it
+				 * holding? Names carry an "$<arity>" suffix in the string table. */
+				int back;
+				for(back = 1; back <= 4 && vm->pc >= (PC)back; ++back) {
+					PC ins = vm->bc.code_buf[vm->pc - back];
+					opr_code_t instr = (opr_code_t)OP(ins);
+					uint32_t off = ins & OFF_MASK;
+					if(instr != INSTR_CALL && instr != INSTR_LOAD && instr != INSTR_GET)
+						continue;
+					if(off == OFF_MASK)
+						continue;
+					const char* nm = bc_getstr(&vm->bc, off);
+					char key[128];
+					snprintf(key, sizeof(key), "%s", nm);
+					char* dollar = strchr(key, '$');
+					if(dollar != NULL) *dollar = '\0';
+					node_t* nd = vm_find_in_scopes(vm, key);
+					fprintf(stderr, "[mario-diag]   id '%s' (from %s) -> %s type=%u var=%p is_func=%u\n",
+						key, instr == INSTR_CALL ? "CALL" : (instr == INSTR_LOAD ? "LOAD" : "GET"),
+						(nd != NULL && nd->var != NULL) ? "found" : "NOT-FOUND",
+						(unsigned)((nd != NULL && nd->var != NULL) ? nd->var->type : 999u),
+						(void*)((nd != NULL) ? nd->var : NULL),
+						(unsigned)((nd != NULL && nd->var != NULL) ? nd->var->is_func : 0u));
+				}
+			}
+			/* Which binding (if any) in the live scope chain holds this very var? */
+			if(func != NULL) {
+				scope_t* s2 = vm_get_scope(vm);
+				diag_scan_ctx cx; cx.target = func; cx.hop = 0; cx.hits = 0;
+				while(s2 != NULL && cx.hop < 8) {
+					cx.hop++;
+					if(s2->var != NULL) hash_map_iterate(&s2->var->children, diag_scan_cb, &cx);
+					s2 = s2->prev;
+				}
+				if(cx.hits == 0)
+					fprintf(stderr, "[mario-diag]     no scope binding holds this var\n");
+			}
+		}
 		vm_throw_type_native(vm, "TypeError", "target is not callable");
 		return var_new(vm);
 	}
 	if(var_is_proxy(func))
 		return proxy_apply(vm, func, thisArg, argsNatural);  // refs=0
-	var_t* r = call_with_args(vm, thisArg, func, argsNatural);
-	/* call_m_func hands back the stack ref OWNED, except when the callee returned
-	 * its own receiver (push/sort/reverse/...): that path already dropped the
-	 * stack ref and the value is borrowed. Decrementing again here underflowed
-	 * the receiver (e.g. `Array.prototype.push.apply(o.phases, ..)` freed the
-	 * member var, which the allocator then recycled for a string temp). */
-	if(r != NULL && r != thisArg && r->refs > 0) r->refs--;
-	return (r != NULL) ? r : var_new(vm);
+	{
+		apply_trail_ent* e = &apply_trail[apply_depth % APPLY_TRAIL_MAX];
+		e->func = (void*)func; e->ftype = func->type; e->ffunc = func->is_func;
+		e->thisArg = (void*)thisArg;
+		e->ttype = (thisArg != NULL) ? thisArg->type : 999u;
+		e->tfunc = (thisArg != NULL) ? thisArg->is_func : 0u;
+		e->depth = (unsigned)apply_depth; e->pc = vm->pc; e->tag = vm->dbg_tag;
+		apply_depth++;
+		var_t* rr = call_with_args(vm, thisArg, func, argsNatural);
+		apply_depth--;
+		var_t* r = rr;
+		/* call_m_func hands back the stack ref OWNED, except when the callee returned
+		 * its own receiver (push/sort/reverse/...): that path already dropped the
+		 * stack ref and the value is borrowed. Decrementing again here underflowed
+		 * the receiver (e.g. `Array.prototype.push.apply(o.phases, ..)` freed the
+		 * member var, which the allocator then recycled for a string temp). */
+		if(r != NULL && r != thisArg && r->refs > 0) r->refs--;
+		return (r != NULL) ? r : var_new(vm);
+	}
 }
 
 var_t* mario_construct_var(vm_t* vm, var_t* ctor, var_t* argsNatural, var_t* newTarget) {

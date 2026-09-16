@@ -251,8 +251,12 @@ var_t* native_StringSlice(vm_t* vm, var_t* env, void* data) {
 
 	// Get endIndex parameter (optional)
 	int endIndex = len;
-	var_t* endIndexVar = var_find_own_member_var(get_obj(env, THIS), "endIndex");
-	if (endIndexVar != NULL) {
+	/* The argument lives on `env`, never on the receiver: reading it off `this`
+	 * hid every optional endIndex, so slice(8,-1) kept the last character instead
+	 * of dropping it (core-js's classofRaw then yields "Function]" and its whole
+	 * feature-detection layer collapses). */
+	var_t* endIndexVar = get_obj(env, "endIndex");
+	if (endIndexVar != NULL && endIndexVar->type != V_UNDEF && endIndexVar->type != V_NULL) {
 		endIndex = var_get_int(endIndexVar);
 		if (endIndex < 0) {
 			// If negative, count from end
@@ -290,8 +294,8 @@ var_t* native_StringIndexOf(vm_t* vm, var_t* env, void* data) {
 
 	// Get fromIndex parameter (optional)
 	int fromIndex = 0;
-	var_t* fromIndexVar = var_find_own_member_var(get_obj(env, THIS), "fromIndex");
-	if (fromIndexVar != NULL) {
+	var_t* fromIndexVar = get_obj(env, "fromIndex");
+	if (fromIndexVar != NULL && fromIndexVar->type != V_UNDEF && fromIndexVar->type != V_NULL) {
 		fromIndex = var_get_int(fromIndexVar);
 		if (fromIndex < 0) {
 			fromIndex = 0;
@@ -347,8 +351,8 @@ var_t* native_StringSplit(vm_t* vm, var_t* env, void* data) {
 
 	// Get limit parameter (optional)
 	int limit = -1; // -1 means no limit
-	var_t* limitVar = var_find_own_member_var(get_obj(env, THIS), "limit");
-	if (limitVar != NULL) {
+	var_t* limitVar = get_obj(env, "limit");
+	if (limitVar != NULL && limitVar->type != V_UNDEF && limitVar->type != V_NULL) {
 		limit = var_get_int(limitVar);
 		if (limit <= 0) {
 			limit = -1;
@@ -895,8 +899,8 @@ var_t* native_StringStartsWith(vm_t* vm, var_t* env, void* data) {
 	int len = (int)strlen(s);
 	int slen = (int)strlen(search);
 	int pos = 0;
-	var_t* pv = var_find_own_member_var(get_obj(env, THIS), "position");
-	if(pv != NULL) pos = var_get_int(pv);
+	var_t* pv = get_obj(env, "position");
+	if(pv != NULL && pv->type != V_UNDEF && pv->type != V_NULL) pos = var_get_int(pv);
 	if(pos < 0) pos = 0;
 	if(pos > len) pos = len;
 	if(slen == 0) return var_new_bool(vm, true);
@@ -911,8 +915,8 @@ var_t* native_StringEndsWith(vm_t* vm, var_t* env, void* data) {
 	int len = (int)strlen(s);
 	int slen = (int)strlen(search);
 	int end = len;
-	var_t* ev = var_find_own_member_var(get_obj(env, THIS), "endPosition");
-	if(ev != NULL) end = var_get_int(ev);
+	var_t* ev = get_obj(env, "endPosition");
+	if(ev != NULL && ev->type != V_UNDEF && ev->type != V_NULL) end = var_get_int(ev);
 	if(end < 0) end = 0;
 	if(end > len) end = len;
 	if(slen == 0) return var_new_bool(vm, true);
@@ -927,8 +931,8 @@ var_t* native_StringIncludes(vm_t* vm, var_t* env, void* data) {
 	int len = (int)strlen(s);
 	int slen = (int)strlen(search);
 	int pos = 0;
-	var_t* pv = var_find_own_member_var(get_obj(env, THIS), "position");
-	if(pv != NULL) pos = var_get_int(pv);
+	var_t* pv = get_obj(env, "position");
+	if(pv != NULL && pv->type != V_UNDEF && pv->type != V_NULL) pos = var_get_int(pv);
 	if(pos < 0) pos = 0;
 	if(pos > len) pos = len;
 	if(slen == 0) return var_new_bool(vm, true);
@@ -1123,7 +1127,7 @@ var_t* native_StringNormalize(vm_t* vm, var_t* env, void* data) {
 	const char* s = get_str(env, THIS);
 	/* Optional form argument; default (and the tested path) is NFC. */
 	const char* form = "NFC";
-	var_t* fv = var_find_own_member_var(get_obj(env, THIS), "form");
+	var_t* fv = get_obj(env, "form");
 	if(fv != NULL && fv->type == V_STRING) form = var_get_str(fv);
 	bool decompose = (strcmp(form, "NFD") == 0 || strcmp(form, "NFKD") == 0);
 

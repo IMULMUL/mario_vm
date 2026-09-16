@@ -138,9 +138,143 @@ var_t* native_Number_toFixed(vm_t* vm, var_t* env, void* data) {
 	return var_new_str(vm, buf);
 }
 
+/* ---- exact decimal expansion, shared by toExponential / toPrecision ------
+ * Neither can be delegated to "%.*e": printf() rounds half-to-even while JS
+ * rounds a tie AWAY from zero (ES2024 21.1.3.3 step 5 picks the larger n, so
+ * (25).toExponential(0) is "3e+1", not libc's "2e+01"), and JS spells the
+ * exponent without libc's zero padding ("e+0", "e-11", not "e+00", "e-11").
+ * Both therefore expand the double to its exact decimal digits (a binary64
+ * needs at most 767 significant digits, so 772 is always enough) and round
+ * that digit string half-up. */
+
+#define JS_NUM_DEC_DIGITS 772
+
+typedef struct {
+	int  sign;                              /* 1 for a negative value */
+	int  exp;                               /* value = 0.<digits> * 10^(exp+1) */
+	char digits[JS_NUM_DEC_DIGITS + 4];      /* NUL-terminated significant digits */
+} js_dec_t;
+
+static void js_dec_expand(double d, js_dec_t* out) {
+	char buf[JS_NUM_DEC_DIGITS + 40];
+	out->sign = 0;
+	out->exp = 0;
+	memset(out->digits, '0', JS_NUM_DEC_DIGITS + 2);
+	out->digits[JS_NUM_DEC_DIGITS + 1] = '\0';
+	if(d < 0) {
+		out->sign = 1;
+		d = -d;
+	}
+	snprintf(buf, sizeof(buf), "%.*e", JS_NUM_DEC_DIGITS, d);
+	char* ep = strchr(buf, 'e');
+	if(ep == NULL)
+		return;
+	*ep = '\0';
+	out->exp = atoi(ep + 1);
+	int n = 0;
+	for(char* p = buf; *p != '\0' && n <= JS_NUM_DEC_DIGITS; ++p) {
+		if(*p >= '0' && *p <= '9')
+			out->digits[n++] = *p;
+	}
+	out->digits[n] = '\0';
+}
+
+/* Keep `keep` significant digits, rounding half-up (ties away from zero). The
+ * result is always at least `keep` digits long, zero padded when the expansion
+ * was shorter; a carry out of the top digit rewrites it as 1000... and bumps the
+ * exponent, exactly like the spec's "n has more than f+1 digits" case. */
+static void js_dec_round(js_dec_t* v, int keep) {
+	if(keep < 1) keep = 1;
+	if(keep > JS_NUM_DEC_DIGITS) keep = JS_NUM_DEC_DIGITS;
+	int len = (int)strlen(v->digits);
+	if(len < keep) {
+		memset(v->digits + len, '0', (size_t)(keep - len));
+		v->digits[keep] = '\0';
+		return;
+	}
+	if(len == keep)
+		return;
+	int up = (v->digits[keep] >= '5');
+	v->digits[keep] = '\0';
+	if(!up)
+		return;
+	int i = keep - 1;
+	while(i >= 0 && v->digits[i] == '9') {
+		v->digits[i] = '0';
+		i--;
+	}
+	if(i >= 0) {
+		v->digits[i]++;
+	} else {
+		v->digits[0] = '1';
+		for(int k = 1; k <= keep; ++k)
+			v->digits[k] = '0';
+		v->digits[keep + 1] = '\0';
+		v->exp += 1;
+	}
+}
+
+/* Shortest expansion that parses back to the same double (used when
+ * toExponential() is called without fractionDigits). */
+static int js_dec_shortest(double d) {
+	char buf[64];
+	for(int k = 1; k <= 17; ++k) {
+		snprintf(buf, sizeof(buf), "%.*e", k - 1, d);
+		if(strtod(buf, NULL) == d)
+			return k;
+	}
+	return 17;
+}
+
+/* "<sign>d[.ddd]e±x" with `keep` significant digits. */
+static void js_dec_fmt_exp(const js_dec_t* v, int keep, char* out, size_t outsz) {
+	char mant[JS_NUM_DEC_DIGITS + 4];
+	int n = 0;
+	mant[n++] = v->digits[0];
+	if(keep > 1) {
+		mant[n++] = '.';
+		for(int i = 1; i < keep && i <= JS_NUM_DEC_DIGITS; ++i)
+			mant[n++] = v->digits[i];
+	}
+	mant[n] = '\0';
+	snprintf(out, outsz, "%s%se%+d", v->sign ? "-" : "", mant, v->exp);
+}
+
+/* Number.prototype.toExponential(fractionDigits): exponential form with
+ * `fractionDigits` digits after the point, or the shortest round-tripping
+ * expansion when the argument is omitted. NaN/Infinity render as their JS
+ * strings; out-of-range digits are clamped like toFixed() does. */
+var_t* native_Number_toExponential(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* v = get_obj(env, THIS);
+	double d = var_get_float64(v);
+	if(isnan(d))
+		return var_new_str(vm, "NaN");
+	if(isinf(d))
+		return var_new_str(vm, d < 0 ? "-Infinity" : "Infinity");
+
+	var_t* f = get_obj(env, "fractionDigits");
+	int keep;
+	if(f == NULL || f->type == V_UNDEF || f->type == V_NULL)
+		keep = js_dec_shortest(d);
+	else {
+		keep = var_get_int(f) + 1;
+		if(keep < 1) keep = 1;
+		if(keep > 101) keep = 101;
+	}
+
+	js_dec_t dec;
+	js_dec_expand(d, &dec);
+	js_dec_round(&dec, keep);
+	char buf[JS_NUM_DEC_DIGITS + 64];
+	js_dec_fmt_exp(&dec, keep, buf, sizeof(buf));
+	return var_new_str(vm, buf);
+}
+
 /* Number.prototype.toPrecision(precision): `precision` significant digits, in
- * fixed or exponential form as %g decides. With no argument it falls back to the
- * plain number->string form. precision is clamped to [1,100]. */
+ * fixed or exponential form as the spec's exponent test decides. With no
+ * argument it falls back to the plain number->string form. precision is clamped
+ * to [1,100]. */
 var_t* native_Number_toPrecision(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* v = get_obj(env, THIS);
@@ -153,16 +287,48 @@ var_t* native_Number_toPrecision(vm_t* vm, var_t* env, void* data) {
 		return r;
 	}
 	double d = var_get_float64(v);
+	if(isnan(d))
+		return var_new_str(vm, "NaN");
+	if(isinf(d))
+		return var_new_str(vm, d < 0 ? "-Infinity" : "Infinity");
+
 	int prec = var_get_int(p);
 	if(prec < 1) prec = 1;
 	if(prec > 100) prec = 100;
-	char buf[360];
-	if(isnan(d))
-		snprintf(buf, sizeof(buf), "NaN");
-	else if(isinf(d))
-		snprintf(buf, sizeof(buf), "%s", d < 0 ? "-Infinity" : "Infinity");
-	else
-		snprintf(buf, sizeof(buf), "%.*g", prec, d);
+
+	js_dec_t dec;
+	js_dec_expand(d, &dec);
+	js_dec_round(&dec, prec);
+
+	char buf[JS_NUM_DEC_DIGITS + 64];
+	if(dec.exp < -6 || dec.exp >= prec) {
+		js_dec_fmt_exp(&dec, prec, buf, sizeof(buf));
+		return var_new_str(vm, buf);
+	}
+
+	/* Fixed form: exp+1 digits before the point, the rest after it (none, and no
+	 * point at all, when the digits run out exactly at the point). */
+	int n = 0;
+	if(dec.sign)
+		buf[n++] = '-';
+	if(dec.exp >= 0) {
+		int ip = dec.exp + 1;
+		for(int i = 0; i < ip && i < prec; ++i)
+			buf[n++] = dec.digits[i];
+		if(prec > ip) {
+			buf[n++] = '.';
+			for(int i = ip; i < prec; ++i)
+				buf[n++] = dec.digits[i];
+		}
+	} else {
+		buf[n++] = '0';
+		buf[n++] = '.';
+		for(int i = 0; i < -dec.exp - 1; ++i)
+			buf[n++] = '0';
+		for(int i = 0; i < prec; ++i)
+			buf[n++] = dec.digits[i];
+	}
+	buf[n] = '\0';
 	return var_new_str(vm, buf);
 }
 
@@ -372,6 +538,7 @@ void reg_native_Number(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_NUMBER);
 	vm_reg_native(vm, cls, "toString(radix)", native_Number_toString, NULL); 
 	vm_reg_native(vm, cls, "toFixed(digits)", native_Number_toFixed, NULL);
+	vm_reg_native(vm, cls, "toExponential(fractionDigits)", native_Number_toExponential, NULL);
 	vm_reg_native(vm, cls, "toPrecision(precision)", native_Number_toPrecision, NULL);
 	vm_reg_native(vm, cls, "valueOf()", native_Number_valueOf, NULL);
 	vm_reg_native(vm, cls, "constructor(value)", native_Number_constructor, NULL); 

@@ -46,9 +46,15 @@ var_t* native_Array_toString(vm_t* vm, var_t* env, void* data) {
 }
 
 var_t* native_Array_join(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
+	(void)data;
 	var_t* arr = get_obj(env, THIS);
-	const char* j = get_str(env, "c");
+	/* ES2015 22.1.3.12: an omitted or undefined separator is ",", not "".
+	 * Minified bundles call join() with no argument constantly, so dropping the
+	 * comma silently corrupts every query string / class list / template they
+	 * build this way. */
+	var_t* c = get_obj(env, "c");
+	const char* j = (c == NULL || c->type == V_UNDEF || c->type == V_NULL) ? "," : get_str(env, "c");
+	(void)vm;
 	mstr_t* ret = mstr_new("");
 
 	mstr_t* str = mstr_new("");

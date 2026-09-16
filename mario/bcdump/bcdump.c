@@ -194,6 +194,47 @@ static PC bc_get_inmstr_str(bytecode_t* bc, PC i, mstr_t* ret) {
 	return i;
 }
 
+/* TEMP taobao diag: disassemble a window of instructions around `center`.
+ * Decoding starts at pc 0 so instruction boundaries stay correct, but only the
+ * last `radius` lines before (and after) the center are kept, which makes it
+ * usable on a multi-hundred-KB bundle where bc_dump() would print megabytes. */
+void bc_dump_window(bytecode_t* bc, PC center, PC radius) {
+	if(bc == NULL || bc->code_buf == NULL || radius == 0)
+		return;
+	uint32_t cap = radius * 2 + 4;
+	char** ring = (char**)calloc(cap, sizeof(char*));
+	uint32_t* ring_pc = (uint32_t*)calloc(cap, sizeof(uint32_t));
+	if(ring == NULL || ring_pc == NULL) { free(ring); free(ring_pc); return; }
+
+	mstr_t* s = mstr_new("");
+	PC i = 0, head = 0, count = 0;
+	while(i < bc->cindex) {
+		PC start = i;
+		mstr_reset(s);
+		i = bc_get_inmstr_str(bc, i, s);
+		i++;
+		if(start + radius >= center && start <= center + radius) {
+			uint32_t slot = head % cap;
+			free(ring[slot]);
+			ring[slot] = strdup(s->cstr);
+			ring_pc[slot] = start;
+			head++; count++;
+		} else if(start > center + radius) {
+			break;
+		}
+	}
+	uint32_t n = count < cap ? count : cap;
+	uint32_t k;
+	for(k = 0; k < n; ++k) {
+		uint32_t slot = (head - n + k) % cap;
+		fprintf(stderr, "[bcwin]%s%s\n", ring[slot] ? ring[slot] : "",
+				ring_pc[slot] == center ? "   <<< PC" : (ring_pc[slot] < center ? "  ." : ""));
+	}
+	for(k = 0; k < cap; ++k) free(ring[k]);
+	free(ring); free(ring_pc);
+	mstr_free(s);
+}
+
 mstr_t* bc_dump(bytecode_t* bc) {
 	mstr_t* ret = mstr_new("");
     if(ret == NULL)

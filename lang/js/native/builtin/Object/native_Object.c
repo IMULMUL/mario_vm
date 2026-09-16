@@ -27,7 +27,13 @@ var_t* native_Object_getPrototypeOf(vm_t* vm, var_t* env, void* data) {
 	var_t* obj = get_obj(env, "obj");
 	if(var_is_proxy(obj))
 		return proxy_get_prototype(vm, obj);   // getPrototypeOf trap (owned/NULL)
-	return var_get_prototype(obj);
+	var_t* res = var_get_prototype(obj);
+	if(getenv("MARIO_GPODBG") != NULL) {
+		var_t* op = var_get_prototype(vm->builtin_vars.var_Object);
+		fprintf(stderr, "[gpodbg] getPrototypeOf(obj=%p t%u) -> %p  (OP=%p res==OP?%d)\n",
+			(void*)obj, (obj!=NULL)?(unsigned)obj->type:0u, (void*)res, (void*)op, (res==op)?1:0);
+	}
+	return res;
 }
 
 var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
@@ -509,6 +515,9 @@ var_t* native_Object_setPrototypeOf(vm_t* vm, var_t* env, void* data) {
 	}
 	if(obj != NULL && proto != NULL)
 		var_set_prototype(obj, proto);
+	if(getenv("MARIO_SPODBG") != NULL) {
+		fprintf(stderr, "[spodbg] setPrototypeOf(obj=%p proto=%p)\n", (void*)obj, (void*)proto);
+	}
 	return obj != NULL ? obj : var_new(vm);
 }
 

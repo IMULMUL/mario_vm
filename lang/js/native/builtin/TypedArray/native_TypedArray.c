@@ -950,6 +950,20 @@ static void reg_ta_proto(vm_t* vm, var_t* cls) {
 }
 
 void reg_native_TypedArray(vm_t* vm) {
+	/* A single shared %TypedArray%.prototype inserted between every concrete
+	 * prototype (Int8Array.prototype, ...) and Object.prototype, so that
+	 * Object.getPrototypeOf(Int8Array.prototype) yields this abstract prototype
+	 * rather than Object.prototype (the spec layout). core-js's
+	 * array-buffer-views module derives TypedArrayPrototype as exactly that
+	 * getPrototypeOf result and installs the buffer/byteOffset/byteLength/length
+	 * accessors on it; when it resolved to Object.prototype (the old behaviour,
+	 * since vm_new_class/do_extends parents each concrete prototype straight onto
+	 * Object.prototype) every plain `{}` inherited a byteLength getter whose body
+	 * re-reads internalState[this]["byteLength"] on a fresh `{}` - an infinite
+	 * recursion that aborts the whole polyfill. ta_proto starts at refs 0 and is
+	 * adopted/ref'd by each var_set_prototype below, so it stays alive. */
+	var_t* ta_proto = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
+
 	for(int et = 0; et < TA_ETYPE_COUNT; et++) {
 		const char* name = ta_types[et].name;
 		var_t* cls = vm_new_class(vm, name);
@@ -961,6 +975,12 @@ void reg_native_TypedArray(vm_t* vm) {
 		vm_reg_var(vm, cls, "BYTES_PER_ELEMENT", var_new_int(vm, (int)ta_sizes[et]), true);
 		vm_reg_var(vm, cls, SYMKEY_TOSTRINGTAG, var_new_str(vm, name), true);
 		reg_ta_proto(vm, cls);
+		/* Re-parent this concrete prototype onto the shared %TypedArray%.prototype.
+		 * The concrete method surface stays on cls.prototype (closer in the chain),
+		 * so instance behaviour is unchanged; only the abstract parent differs. */
+		var_t* cls_proto = var_get_prototype(cls);
+		if(cls_proto != NULL && ta_proto != NULL)
+			var_set_prototype(cls_proto, ta_proto);
 	}
 }
 
