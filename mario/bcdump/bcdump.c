@@ -49,6 +49,8 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_CALLX_SPREAD : return "CALLX_SPREAD";
 		case INSTR_TAG_RAW      : return "TAG_RAW";
 		case INSTR_GETW         : return "GETW";
+				case INSTR_WANCHOR      : return "WANCHOR";
+				case INSTR_WTARGET      : return "WTARGET";
 		case INSTR_NOT          : return "NOT";
 		case INSTR_MULTI        : return "MULTI";
 		case INSTR_DIV          : return "DIV";

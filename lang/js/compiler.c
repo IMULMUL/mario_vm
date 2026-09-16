@@ -529,6 +529,19 @@ void compile_error_pos(lex_t* l, int pos) {
 
     lex_get_pos(l, &line, &col, pos);
     mario_printf("compile error at (line: %d, col: %d)\n", line, col);
+    if (getenv("MARIO_ERRDUMP") && l && l->data) {
+        int at = (pos >= 0) ? pos : l->data_pos;
+        int from = at - 300; if (from < 0) from = 0;
+        int to = at + 120;
+        fprintf(stderr, "[ERRDUMP] @%d ctx=[", at);
+        for (int i = from; i < to && l->data[i]; i++) {
+            char c = l->data[i];
+            if (c == '\n') fputc('\\', stderr), fputc('n', stderr);
+            else fputc(c, stderr);
+            if (i == at) fputs(">>", stderr);
+        }
+        fprintf(stderr, "]\n");
+    }
 }
 
 bool lex_chkread(lex_t* lex, uint32_t expected_tk);
@@ -3362,10 +3375,21 @@ bool base(lex_t* l, bytecode_t* bc) {
                                op == LEX_ANDEQUAL || op == LEX_OREQUAL ||
                                op == LEX_XOREQUAL || op == LEX_LSHIFTEQUAL ||
                                op == LEX_RSHIFTEQUAL || op == LEX_RSHIFTUNSIGNEQUAL);
+        bool deferred_wtarget = false;
+        const char* wtarget_name = NULL;
         if (bc->cindex > 0) {
             PC last = bc->code_buf[bc->cindex - 1];
             if ((op == '=' || arith_compound) && OP(last) == INSTR_GET) {
-                bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
+                /* Deferred member write target: WANCHOR parks the base under a
+                 * sentinel while the RHS runs, and WTARGET resolves the target
+                 * afterwards (inserting it below the RHS value, where GETW would
+                 * have left it). Resolving BEFORE the RHS - the old GETW rewrite -
+                 * left the target node inside the RHS's operand window, so a
+                 * fused member call in the RHS (`a.b = c.bind(null, a.b.bind(a))`,
+                 * the webpack runtime tail) mis-picked it as its receiver. */
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_WANCHOR, OFF(last));
+                deferred_wtarget = true;
+                wtarget_name = bc_getstr(bc, OFF(last));
             } else if (OP(last) == INSTR_ARRAY_AT) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
             } else if ((op == '=' || arith_compound) && OP(last) == INSTR_LOAD) {
@@ -3377,6 +3401,9 @@ bool base(lex_t* l, bytecode_t* bc) {
         }
         if (!base(l, bc)) {
             return false;
+        }
+        if (deferred_wtarget) {
+            bc_gen_str(bc, INSTR_WTARGET, wtarget_name);
         }
         // sort out initialiser
         if (op == '=') {
@@ -5349,10 +5376,50 @@ static bool skip_regex_allowed(uint32_t prev) {
         default: return true;
     }
 }
+/* Skip an entire template literal at the character level (no code emitted).
+ * Assumes l->tk == '`': the opening backtick has already been consumed by the
+ * lexer, so l->curr_ch points at the first content character. On return the
+ * closing backtick is consumed and the next normal token has been read.
+ * `${...}` substitutions (which may nest strings/regex/templates) are stepped
+ * over by skip_template_subst, and backslash escapes by two chars, so the
+ * content is never mistaken for the surrounding token stream. */
+static bool skip_template_literal(lex_t* l) {
+    while (true) {
+        char c = l->curr_ch;
+        if (c == 0) return false;            // unterminated template literal
+        if (c == '`') {                       // closing backtick
+            lex_get_nextch(l);
+            break;
+        }
+        if (c == '$' && l->next_ch == '{') {  // embedded expression
+            skip_template_subst(l);
+            continue;
+        }
+        if (c == '\\') {                       // escape sequence
+            lex_get_nextch(l);
+            if (l->curr_ch) lex_get_nextch(l);
+            continue;
+        }
+        lex_get_nextch(l);
+    }
+    lex_get_next_token(l);  // resume the normal token stream after the template
+    return true;
+}
 /* Advance one token while skipping code, treating '/' as a regex literal when
  * the context allows it. Otherwise the generic lexer reads an embedded '//' as
  * a line comment and swallows the rest of a minified single-line file. */
 static bool skip_advance(lex_t* l, uint32_t* prev) {
+    /* A backtick starts a template literal: consume the WHOLE template at the
+     * character level. The generic lexer only emits '`' as a single char token
+     * and would then re-read the template CONTENT as ordinary tokens, so a
+     * leading '/' (e.g. `/${x}`, extremely common in Next.js route helpers)
+     * would be mis-scanned as a regex and swallow the rest of the minified
+     * line - desyncing the two-pass switch compiler and failing the script. */
+    if (l->tk == '`') {
+        if (!skip_template_literal(l)) return false;
+        *prev = LEX_STR;   // a template is a value: a following '/' is division
+        return true;
+    }
     if ((l->tk == '/' || l->tk == LEX_DIVEQUAL) && skip_regex_allowed(*prev)) {
         mstr_t* pat = mstr_new(""); mstr_t* flags = mstr_new("");
         bool ok = lex_scan_regex(l, pat, flags);

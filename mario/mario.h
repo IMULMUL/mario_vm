@@ -337,8 +337,10 @@ typedef struct st_bytecode {
 #define INSTR_LOADW        0x094 // LOADW $n : like LOAD, but never invokes an accessor getter - the compiler retargets the LOAD of a bare-name assignment target so the raw binding node reaches ASIGN / compound-math write-back
 #define INSTR_FIELDN       0x095 // FIELDN name : pop an initializer function, register it as an instance field of the class under definition (runs per `new` with this=instance)
 #define INSTR_STATICN      0x096 // STATICN name : pop a value, define it as a static member of the class under definition (ES2022 `static x = e`)
+#define INSTR_WANCHOR      0x097 // WANCHOR name : replace the base lvalue with a @@wanchor sentinel holding it; pairs with INSTR_WTARGET (deferred member write target, `a.b = rhs`)
+#define INSTR_WTARGET      0x098 // WTARGET name : resolve the write target on the base under the nearest @@wanchor, replacing the anchor with the [obj,]node slot(s) beneath the RHS value
 
-#define INSTR_MAX          0x097 // Maximum instruction opcode value
+#define INSTR_MAX          0x099 // Maximum instruction opcode value
 
 
 PC          bc_gen(bytecode_t* bc, opr_code_t instr);
@@ -380,6 +382,10 @@ extern const char* _mario_lang;
 
 #define THIS "this"
 #define PROTOTYPE "prototype"
+/* A callable's [[Prototype]] is stored separately from its `.prototype`
+ * own-property (which doubles as the instance prototype read by `new`). See
+ * var_set_callable_proto(). Hidden/invisible so it never leaks to JS. */
+#define FPROTO "@@fproto"
 #define SUPER "super"
 #define CONSTRUCTOR "constructor"
 
@@ -429,6 +435,8 @@ extern const char* _mario_lang;
 
 #define TA_ETYPE         "@@etype"   // hidden own member: the TA_* element-type code (V_INT)
 #define TA_SLOT          "@@taslot"  // synthetic write-target node name (see INSTR_ARRAY_AT_W)
+#define WANCHOR          "@@wanchor" // sentinel node name holding the base of a deferred member write target (see INSTR_WANCHOR/INSTR_WTARGET)
+#define WANCHOR_OBJ      "@@wanchorobj" // hidden member on the @@wanchor sentinel's var: the ref'd receiver base
 #define TA_SLOT_TA       "@@ta"      // hidden member on the @@taslot node's var: the ref'd TypedArray
 
 /* Proxy exotic object (Phase 5): an ordinary V_OBJECT with @@exotic="proxy" plus
@@ -575,13 +583,17 @@ typedef bool (*compiler_func_t)(bytecode_t *bc, const char* input);
  * temporaries. vm_push() silently drops a value once stack_top reaches this cap
  * (while still taking a ref), which desyncs the stack and makes a later vm_pop()
  * dereference garbage - so this must stay comfortably above the deepest call
- * chain the recursion guard below allows. */
-#define VM_STACK_MAX    256
+ * chain the recursion guard below allows. 4096 slots = ~32KB on the heap
+ * (vm_t is malloc'd): room for a 1024-deep call chain plus several operand
+ * temporaries per level, which is what bundled React/webpack code actually
+ * reaches (256 tripped the RangeError guard mid-render on rokid.com). */
+#define VM_STACK_MAX    4096
 
 /* Cap on nested script func_call frames. Two independent limits bound recursion:
  *  - the native thread stack: each level costs ~0.6-0.7 KB (func_call + vm_run),
- *    so an unbounded runaway recursion would blow the (often 512 KB) engine
- *    thread stack and crash the whole process with a Bus error;
+ *    so an unbounded runaway recursion would blow the engine thread stack and
+ *    crash the whole process with a Bus error (the engine thread is spawned
+ *    with a 16 MB stack, so a 1024-deep chain costs ~0.7 MB - safe);
  *  - the VM's fixed value/scope stacks (VM_STACK_MAX / VM_SCOPE_STACK_MAX), which
  *    corrupt silently if overflowed.
  * func_call() raises a catchable RangeError ("Maximum call stack size exceeded",
@@ -589,7 +601,7 @@ typedef bool (*compiler_func_t)(bytecode_t *bc, const char* input);
  * stack nears its capacity, so runaway recursion unwinds cleanly instead of
  * crashing. Override with -DMARIO_MAX_CALL_DEPTH for a differently sized stack. */
 #ifndef MARIO_MAX_CALL_DEPTH
-#define MARIO_MAX_CALL_DEPTH    128
+#define MARIO_MAX_CALL_DEPTH    1024
 #endif
 /* Head-room kept free on the fixed stacks so the RangeError delivery path
  * (vm_push(err) + scope unwinding) still has slots to work with when the guard
@@ -626,7 +638,9 @@ typedef struct st_scope {
 	//continue and break anchor for loop(while/for)
 } scope_t;
 
-#define VM_SCOPE_STACK_MAX    128
+/* One scope per nested call/block frame; must outlive VM_STACK_MAX's slot-per-
+ * level budget by the same factor so neither guard trips first on deep chains. */
+#define VM_SCOPE_STACK_MAX    1024
 
 /* Hard bound on walking a function's captured lexical chain (closure.var /
  * closure.func, climbed via "@@lex"). That chain is meant to be strictly
@@ -831,6 +845,11 @@ func_t*     var_get_func(var_t* var);
 var_t*      var_new_native_func(vm_t* vm, native_func_t native, void* data);
 var_t*      var_get_prototype(var_t* var);
 void        var_set_prototype(var_t* var, var_t* proto);
+/* Object.setPrototypeOf on a function/class: record the [[Prototype]] in the
+ * hidden FPROTO member so the callable's `.prototype` (its instance prototype,
+ * read by `new`) is preserved. var_get_callable_proto returns it or NULL. */
+void        var_set_callable_proto(var_t* var, var_t* proto);
+var_t*      var_get_callable_proto(var_t* var);
 bool        var_instanceof(var_t* var, var_t* proto);
 node_t*     var_find_member(var_t* obj, const char* name);
 var_t*      var_find_member_var(var_t* obj, const char* name);

@@ -4,6 +4,10 @@
 #include <stdarg.h>
 #include <math.h>
 #include <errno.h>
+#if defined(__APPLE__) || defined(__linux__)
+#include <execinfo.h>   /* TEMP DIAGNOSTIC: backtrace() for the wild-var-pointer probe */
+#include <unistd.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -1640,9 +1644,15 @@ static bool try_var_cache(vm_t* vm, PC* ins, var_t* v) {
 
     if((*ins) & INSTR_OPT_CACHE) {
         int index = var_cache(vm, v); 
-        if(index >= 0) 
+        if(index >= 0) {
             *ins = INS(INSTR_CACHE, index);
-        return true;
+            return true;
+        }
+        /* Cache full: report failure so the caller keeps the literal payload
+         * intact. Returning true here without rewriting the opcode made the
+         * INT64/FLOAT64/STR handlers NIL their payload words, corrupting the
+         * constant to 0/"" on every later execution. */
+        return false;
     }
 
     *ins = (*ins) | INSTR_OPT_CACHE;
@@ -1720,39 +1730,18 @@ static void load_ncache_invalidate_var(vm_t* vm, var_t* var) {
 }
 
 static void load_ncache(vm_t* vm, node_t* node, PC instr_pc) {
-	if(vm->load_ncache.size == 0 || node == NULL)
-		return;
-
-	PC* code = vm->bc.code_buf;
-	if(node->ncache_instr != 0) {
-    	uint32_t i = (node->ncache_instr & OFF_MASK);
-        load_ncache_t* l = &vm->load_ncache.cache[i];	
-		if(l->node != node || l->old_instr_pcs == NULL)
-			return;
-
-		code[instr_pc] = node->ncache_instr;
-		PC* pc = (PC*)mario_malloc(sizeof(PC));
-		*pc = instr_pc;
-		array_add(l->old_instr_pcs, (void*)pc);
-		return;
-	}
-
-	uint32_t i;
-    for(i=0; i<vm->load_ncache.size; ++i) {
-        load_ncache_t* l = &vm->load_ncache.cache[i];	
-        if(l->node == NULL) {
-			node->ncache_instr = INS(INSTR_NCACHE, i);
-			l->old_instr_pcs = array_new();
-			l->node = node;
-
-			PC* pc = (PC*)mario_malloc(sizeof(PC));
-			*pc = instr_pc;
-			array_add(l->old_instr_pcs, (void*)pc);
-			l->old_instr = code[instr_pc];
-			code[instr_pc] = node->ncache_instr;
-			break;
-        }
-    }
+	/* DISABLED: the self-modified INSTR_NCACHE pins one resolved node into the
+	 * instruction forever. Any binding that is not literally the same var_t for
+	 * the whole page life (function parameters/locals, block and closure
+	 * bindings, names shadowed per-invocation) turns into a dead slot replaying
+	 * a previous call's value: core-js' typed-array wrapper re-read a stale first
+	 * argument and recursed until the stack guard fired, and getterFor closures
+	 * compared stale captured brands. Restricting the cache to global-root names
+	 * still left shadowing/timing hazards plus an intermittent segfault, so the
+	 * optimization is turned off entirely in favour of a correct fresh lookup.
+	 * Re-enable only with a per-scope invalidation scheme. */
+	(void)vm; (void)node; (void)instr_pc;
+	return;
 }
 
 /**======var functions======*/
@@ -1798,8 +1787,42 @@ node_t* node_new(vm_t* vm, const char* name, var_t* var) {
 	return node;
 }
 
+/* TEMP DIAGNOSTIC + GUARD (taobao crash root-causing): a var or node pointer with
+ * any bit at/above 2^48 set is never a valid mario heap pointer - macOS and Linux
+ * arm64 user-space allocations all fit below 2^48 (observed heap ptrs are
+ * ~0x1xxxxxxxx). The recurring wild value 0x2000000000000 (== 1<<49) is stored
+ * into a live node var field or value-stack slot by an upstream bug;
+ * dereferencing it (var_empty reads var->status) faults at that address.
+ * AddressSanitizer confirmed the holding node is a VALID allocation (no
+ * use-after-free or overflow), so this is a wild VALUE, not a dangling pointer.
+ * Detect it without touching the memory: treat as empty (safe degradation) and,
+ * under MARIO_WILDDBG, dump a native backtrace so the storing site can be
+ * located. Remove with the rest of the temp diagnostics. */
+static int s_wild_dbg = -1;
+static inline bool mario_ptr_wild(const void* p) {
+	return p != NULL && ((uintptr_t)p >> 48) != 0;
+}
+static void mario_wild_report(const char* where, const void* p) {
+	if(s_wild_dbg < 0)
+		s_wild_dbg = (getenv("MARIO_WILDDBG") != NULL) ? 1 : 0;
+	if(!s_wild_dbg)
+		return;
+	fprintf(stderr, "[WILDPTR] %s wild=%p\n", where, p);
+#if defined(__APPLE__) || defined(__linux__)
+	void* bt[48];
+	int n = backtrace(bt, 48);
+	backtrace_symbols_fd(bt, n, STDERR_FILENO);
+#endif
+}
+
 static inline bool var_empty(var_t* var) {
-	if(var == NULL || var->status <= V_ST_GC_FREE)
+	if(var == NULL)
+		return true;
+	if(mario_ptr_wild(var)) {
+		mario_wild_report("var_empty", var);
+		return true;
+	}
+	if(var->status <= V_ST_GC_FREE)
 		return true;
 	return false;
 }
@@ -1836,6 +1859,12 @@ inline var_t* node_replace(node_t* node, var_t* v) {
 }
 
 inline void var_remove_all(var_t* var) {
+	if(getenv("MARIO_APDBG") != NULL && var != NULL && var->vm != NULL) {
+		vm_t* vm = var->vm;
+		if(var == vm->builtin_vars.var_Array || var == var_get_prototype(vm->builtin_vars.var_Array))
+			fprintf(stderr, "[APDBG] var_remove_all var=%p(isCtor=%d) pc=%u\n",
+				(void*)var, (var==vm->builtin_vars.var_Array)?1:0, (unsigned)vm->pc);
+	}
 	/*free children*/
 	hash_map_clean(&var->children, mario_free, (free_func_t)node_free);
 }
@@ -1848,8 +1877,53 @@ static inline node_t* var_find_raw(var_t* var, const char*name) {
 	return (node_t*)hash_map_get(&var->children, name);
 }
 
+/* TEMP diag: report the integrity of a var's children hash map WITHOUT
+ * dereferencing any entry->key (a freed key is exactly what crashes
+ * hash_map_get's strcmp). Prints declared size, capacity, the real linked-entry
+ * count, and the raw key POINTER of every entry in the bucket that `probe` hashes
+ * into. A size != count, or a key pointer that is a tiny/garbage value, pinpoints
+ * the corruption. Gated by mario_scopedbg_arm + MARIO_SCOPEDBG. */
+static void children_integrity_report(var_t* var, const char* probe) {
+	if(var == NULL) return;
+	hash_map_t* m = &var->children;
+	uint32_t count = 0, badkeys = 0;
+	for(uint32_t b = 0; b < m->capacity; ++b) {
+		hash_entry_t* e = m->buckets ? m->buckets[b] : NULL;
+		int guard = 0;
+		while(e != NULL && guard++ < 100000) {
+			count++;
+			uintptr_t kp = (uintptr_t)e->key;
+			if(kp < 0x1000u) badkeys++;
+			e = e->next;
+		}
+	}
+	uint32_t pb = (m->capacity ? (hash_string(probe) % m->capacity) : 0);
+	if(badkeys == 0 && count == m->size && m->buckets != NULL)
+		return;   /* healthy: stay silent to keep the trace small */
+	fprintf(stderr, "[mapchk] var=%p probe='%s' size=%u cap=%u count=%u badkeys=%u buckets=%p bucket[%u]:",
+		(void*)var, probe, (unsigned)m->size, (unsigned)m->capacity, (unsigned)count,
+		(unsigned)badkeys, (void*)m->buckets, (unsigned)pb);
+	if(m->buckets) {
+		hash_entry_t* e = m->buckets[pb];
+		int guard = 0;
+		while(e != NULL && guard++ < 64) {
+			fprintf(stderr, " e=%p key=%p val=%p", (void*)e, (void*)e->key, (void*)e->value);
+			e = e->next;
+		}
+	}
+	fprintf(stderr, "\n");
+}
+
 node_t* var_add(var_t* var, const char* name, var_t* add) {
 	node_t* node = NULL;
+
+	if(getenv("MARIO_APDBG") != NULL && name != NULL && name[0] == 'p' &&
+	   strcmp(name, "prototype") == 0 && var != NULL && var->vm != NULL &&
+	   (var->is_class || var->is_func)) {
+		fprintf(stderr, "[APDBG] var_add 'prototype' var=%p(is_Array=%d is_class=%d) add=%p pc=%u\n",
+			(void*)var, (var==var->vm->builtin_vars.var_Array)?1:0, (int)var->is_class,
+			(void*)add, (unsigned)var->vm->pc);
+	}
 
 	if(name[0] != 0) 
 		node = var_find_raw(var, name);
@@ -2063,6 +2137,12 @@ bool var_typedarray_set_at(vm_t* vm, var_t* ta, int64_t idx, var_t* val) {
 bool var_delete_own_member(var_t* obj, const char* name) {
 	if(obj == NULL || name == NULL)
 		return true;
+	if(getenv("MARIO_APDBG") != NULL && obj->vm != NULL) {
+		vm_t* vm = obj->vm;
+		if(obj == vm->builtin_vars.var_Array || obj == var_get_prototype(vm->builtin_vars.var_Array))
+			fprintf(stderr, "[APDBG] var_delete_own_member obj=%p(isCtor=%d) name=%s pc=%u\n",
+				(void*)obj, (obj==vm->builtin_vars.var_Array)?1:0, name, (unsigned)vm->pc);
+	}
 	node_t* node = (node_t*)hash_map_remove(&obj->children, name);
 	if(node != NULL)
 		node_free(node);
@@ -2591,6 +2671,19 @@ static inline void gc_mark_scopes(vm_t* vm, bool mark) {
 	}
 }
 
+/* Refcount teardown recurses through the object graph (var_free -> var_clean ->
+ * var_remove_all -> node_free -> var_unref -> var_free). Deeply chained
+ * structures (React's fiber/alternate tree, long prototype or linked chains)
+ * make that recursion as deep as the graph and overflow the C stack (observed
+ * as a SIGSEGV inside var_remove_all on taobao once MessageChannel let React 18
+ * actually mount). Past VAR_FREE_MAX_DEPTH the nested teardown is queued here
+ * and drained iteratively by the outermost frame instead of recursing. */
+#define VAR_FREE_MAX_DEPTH 96
+#define VAR_FREE_PEND_MAX  8192
+static int     s_var_free_depth = 0;
+static var_t*  s_var_free_pend[VAR_FREE_PEND_MAX];
+static int     s_var_free_pend_n = 0;
+
 void var_free(void* p) {
 	var_t* var = (var_t*)p;
 	if(var_empty(var))
@@ -2601,6 +2694,13 @@ void var_free(void* p) {
 	 * recycled memory, not a live var. */
 	if(vm == NULL)
 		return;
+
+	if(s_var_free_depth >= VAR_FREE_MAX_DEPTH) {
+		if(s_var_free_pend_n < VAR_FREE_PEND_MAX)
+			s_var_free_pend[s_var_free_pend_n++] = var;
+		return;
+	}
+	s_var_free_depth++;
 
 	if(var->is_func) {
 		func_t* func = var_get_func(var);
@@ -2629,7 +2729,7 @@ void var_free(void* p) {
 				var_unref(closure);
 			//the release above may have torn this var down completely.
 			if(var_empty(var))
-				return;
+				goto vfree_out;
 		}
 	}
 
@@ -2661,11 +2761,20 @@ void var_free(void* p) {
 	else {
 		add_to_free(var);
 	}
+vfree_out:
+	s_var_free_depth--;
+	if(s_var_free_depth == 0) {
+		while(s_var_free_pend_n > 0) {
+			var_t* v = s_var_free_pend[--s_var_free_pend_n];
+			var_free(v);
+		}
+	}
 }
 
 inline var_t* var_ref(var_t* var) {
 	if(var == NULL)
 		return NULL;
+	if(mario_ptr_wild(var)) { mario_wild_report("var_ref", var); return var; }
 	/* Same recycled-heap sentinel as var_unref: never touch a var with no VM. */
 	if(var->vm == NULL)
 		return var;
@@ -2776,6 +2885,8 @@ static inline void gc_free_free_vars(vm_t* vm, uint32_t buffer_num) {
 }
 
 static inline void gc(vm_t* vm, bool force) {
+	if(getenv("MARIO_NOGC") != NULL && !force) /* DIAG (temp): test GC-frees-live-var hypothesis */
+		return;
 	if(vm->gc.is_doing_gc)
 		return;
 	if(!force && vm->gc.gc_defer > 0) //a C frame holds bare var pointers right now
@@ -3115,10 +3226,41 @@ var_t* var_get_prototype(var_t* var) {
 void var_set_prototype(var_t* var, var_t* proto) {
 	if(var == NULL || proto == NULL)
 		return;
+	if(getenv("MARIO_APDBG") != NULL && var->vm != NULL) {
+		vm_t* vm = var->vm;
+		if(var == vm->builtin_vars.var_Array ||
+		   var == var_get_prototype(vm->builtin_vars.var_Array)) {
+			fprintf(stderr, "[APDBG] var_set_prototype var=%p(is_Array_ctor=%d) newproto=%p pc=%u\n",
+				(void*)var, (var==vm->builtin_vars.var_Array)?1:0, (void*)proto, (unsigned)vm->pc);
+		}
+	}
 	node_t* ret = var_add(var, PROTOTYPE, proto);
 	ret->invisable = 1;
 	//ret->be_inherited = 1;
 	ret->be_unenumerable = 1;
+}
+
+/* Object.setPrototypeOf(func_or_class, proto): mario conflates a callable's
+ * `.prototype` own-property (its instance prototype, read by `new`) with its
+ * [[Prototype]]. Writing PROTOTYPE here would empty e.g. Array.prototype when
+ * core-js reparents a builtin constructor, wiping every instance method. Store
+ * the intended [[Prototype]] in the hidden FPROTO member instead; it is consulted
+ * only for the callable's OWN inherited-member (static) lookup. */
+void var_set_callable_proto(var_t* var, var_t* proto) {
+	if(var == NULL || proto == NULL)
+		return;
+	node_t* n = var_add(var, FPROTO, proto);
+	if(n != NULL) {
+		n->invisable = 1;
+		n->be_unenumerable = 1;
+	}
+}
+
+var_t* var_get_callable_proto(var_t* var) {
+	if(var == NULL)
+		return NULL;
+	node_t* n = var_find_own_member(var, FPROTO);
+	return (n != NULL) ? n->var : NULL;
 }
 
 inline var_t* var_new(vm_t* vm) {
@@ -3733,6 +3875,7 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 inline void vm_push(vm_t* vm, var_t* var) {  
 	if(var == NULL)
 		return;
+	if(mario_ptr_wild(var)) { mario_wild_report("vm_push", var); return; }
 	var_ref(var);
 	if(vm->stack_top < VM_STACK_MAX) {
 		vm->stack[vm->stack_top++] = var; 
@@ -3740,6 +3883,8 @@ inline void vm_push(vm_t* vm, var_t* var) {
 }
 
 inline void vm_push_node(vm_t* vm, node_t* node) {
+	if(mario_ptr_wild(node)) { mario_wild_report("vm_push_node.node", node); return; }
+	if(mario_ptr_wild(node->var)) { mario_wild_report("vm_push_node.node_var", node->var); return; }
 	var_ref(node->var); 
 	if(vm->stack_top < VM_STACK_MAX)
 		vm->stack[vm->stack_top++] = node;
@@ -3751,6 +3896,11 @@ var_t* vm_pop2(vm_t* vm) {
 	void *p = NULL;
 	vm->stack_top--;
 	p = vm->stack[vm->stack_top];
+	if(p == NULL) {
+		/* A NULL slot means an earlier imbalance underflowed/mispushed; reading
+		 * its magic byte would SIGSEGV at addr 0 and kill the engine thread. */
+		return NULL;
+	}
 	int8_t magic = *(int8_t*)p;
 	var_t* v = NULL;
 	//var
@@ -3795,6 +3945,11 @@ bool vm_pop(vm_t* vm) {
 
 	vm->stack_top--;
 	void *p = vm->stack[vm->stack_top];
+	if(p == NULL) {
+		/* NULL slot from an earlier imbalance: skip the magic read (addr-0 fault)
+		 * and just drop the slot. */
+		return true;
+	}
 	int8_t magic = *(int8_t*)p;
 	var_t* v = NULL;
 	if(magic == 0) { //var
@@ -3929,6 +4084,11 @@ static void scope_free(void* p) {
 		return;
 	if(sc->var != NULL)
 		var_unref(sc->var);
+	/* Release the frame's root on the function object (set by func_call /
+	 * generator-resume). Without this the func_t can be freed by a synchronous
+	 * refcount drop while the frame is still live, dangling sc->func. */
+	if(sc->func_var != NULL)
+		var_unref(sc->func_var);
 	mario_free(sc);
 }
 /*#define vm_get_scope_var(vm, skipBlock) ({ \
@@ -3945,6 +4105,23 @@ static void scope_free(void* p) {
 */
 
 static void vm_push_scope(vm_t* vm, scope_t* sc) {
+	/* DIAG (temp): a leaking block scope fills the scope stack long before the
+	 * call-depth guard; dump the bytecode window around the push site once so
+	 * the loop that never reaches BLOCK_END can be identified. */
+	static int sc_crossed = 0;
+	if(!sc_crossed && vm->scope_stack_top == 600) {
+		sc_crossed = 1;
+		fprintf(stderr, "[scopedbg] scope stack crossing 600 at push pc=%u\n", (unsigned)vm->pc);
+		PC base = (vm->pc > 60) ? vm->pc - 60 : 0;
+		for(PC q = base; q < vm->pc + 60 && q < vm->bc.cindex; q++) {
+			PC iw = vm->bc.code_buf[q];
+			PC iop = OP(iw), ioff = iw & 0xFFFFF;
+			bool hs = (iop==0x03||iop==0x06||iop==0x09||iop==0x0e||iop==0x0f||
+			           iop==0x12||iop==0x13||iop==0x17||iop==0x47||iop==0x64||iop==0x94);
+			fprintf(stderr, "[scopedbg]   pc=%u op=%02x off=%u%s%s\n", (unsigned)q, (unsigned)iop, (unsigned)ioff,
+			        hs ? " str=" : "", hs ? bc_getstr(&vm->bc, ioff) : "");
+		}
+	}
 	scope_t* prev = NULL;
 	if(vm->scope_stack_top > 0) {
 		prev = vm->scope_stack[vm->scope_stack_top - 1];
@@ -3954,11 +4131,25 @@ static void vm_push_scope(vm_t* vm, scope_t* sc) {
 		vm->scope_stack_top++;
 		sc->prev = prev;
 	}
+	else {
+		/* Full scope stack: silently dropping the push would desync every
+		 * later BLOCK_END / SWITCH_END pop (they would pop the scope BELOW the
+		 * dropped one), so abort the run cleanly instead - same contract as the
+		 * func_call recursion guard. */
+		mario_printf("Uncaught RangeError: Maximum call stack size exceeded\n");
+		vm_terminate(vm);
+	}
 }
 
 static PC vm_pop_scope(vm_t* vm) {
 	if(vm->scope_stack_top <= 0)
 		return 0;
+	/* DIAG (temp): track one leaking switch site. */
+	{
+		scope_t* p = vm->scope_stack[vm->scope_stack_top - 1];
+		if(p != NULL && p->is_switch && p->pc == 32771)
+			fprintf(stderr, "[swdbg] POP  switch@32771 top=%d pc=%u\n", (int)vm->scope_stack_top, (unsigned)vm->pc);
+	}
 
 	PC pc = 0;
 	scope_t* sc = vm_get_scope(vm);
@@ -3983,7 +4174,16 @@ node_t* vm_find(vm_t* vm, const char* name) {
 }
 
 node_t* vm_find_in_class(var_t* var, const char* name) {
-	var_t* proto = var_get_prototype(var);
+	var_t* proto = NULL;
+	/* A callable whose [[Prototype]] was set explicitly (Object.setPrototypeOf)
+	 * resolves its OWN inherited (static) members through that hidden FPROTO link
+	 * first; its `.prototype` member stays the instance prototype for `new`. Only
+	 * callables that went through setPrototypeOf have FPROTO, so everything else
+	 * keeps the existing var_get_prototype() behaviour. */
+	if(var != NULL && (var->is_func || var->is_class))
+		proto = var_get_callable_proto(var);
+	if(proto == NULL)
+		proto = var_get_prototype(var);
 	/* A cyclic prototype chain (a class linked, directly or through a mixin,
 	 * as its own ancestor) would spin here forever; bound the walk so a
 	 * pathological chain degrades to a miss instead of freezing the engine. */
@@ -4032,13 +4232,81 @@ bool var_instanceof(var_t* var, var_t* proto) {
 	return false;
 }
 
+/* DIAG (temp): when resolving a watched name to a FUNCTION value, dump the
+ * scope chain + closure walk so we can see which frame supplies it. Gated on
+ * MARIO_FINDE=<name>; only fires for a function-typed result, so it is rare. */
+static void diag_find_func(vm_t* vm, const char* name, node_t* ret, const char* where) {
+	const char* want = getenv("MARIO_FINDE");
+	if(want == NULL || strcmp(name, want) != 0) return;
+	if(ret == NULL || ret->var == NULL || !ret->var->is_func) return;
+	fprintf(stderr, "[FINDE] '%s' -> FUNC via %s var=%p funcpc=%u\n",
+		name, where, (void*)ret->var,
+		(unsigned)(ret->var->value != NULL ? ((func_t*)ret->var->value)->pc : 0u));
+	scope_t* sc = vm_get_scope(vm);
+	int hop = 0;
+	while(sc != NULL && hop++ < 24) {
+		node_t* own = var_find_own_member(sc->var, name);
+		fprintf(stderr, "[FINDE]   scope[%d] is_func=%d is_with=%d var=%p funcbodypc=%u own_%s=%s\n",
+			hop-1, (int)sc->is_func, (int)sc->is_with, (void*)sc->var,
+			(unsigned)((sc->is_func && sc->func != NULL) ? sc->func->pc : 0u),
+			name, own ? "YES" : "no");
+		if(sc->is_func && sc->func != NULL) {
+			var_t* cl = sc->func->closure.var;
+			func_t* clf = sc->func->closure.func;
+			int cg = 0;
+			while(cl != NULL && cg++ < 12) {
+				node_t* co = var_find_own_member(cl, name);
+				fprintf(stderr, "[FINDE]     closure[%d] var=%p own_%s=%s\n", cg-1, (void*)cl, name, co ? "YES" : "no");
+				node_t* lex = var_find_own_member(cl, "@@lex");
+				if(lex != NULL && !var_empty(lex->var)) { cl = lex->var; continue; }
+				if(clf == NULL) break;
+				cl = clf->closure.var; clf = clf->closure.func;
+			}
+		}
+		sc = sc->prev;
+	}
+}
+
 /* Every closure-chain walk below is bounded by VM_CLOSURE_CHAIN_MAX (see
  * mario.h): a recycled closure.func can close the chain into a cycle, and this
  * walk runs inside one vm_run dispatch where the step-hook watchdog cannot see
  * it, so an unbounded loop would pin the engine thread forever. */
+/* TEMP diag: when nonzero, vm_find_in_scopes prints its scope/closure walk (gated
+ * further by MARIO_SCOPEDBG). js_dom_poll_timers arms it only around a timer
+ * callback dispatch so the (very hot) trace is confined to where the UAF crash
+ * reproduces. Remove with the other temporary diagnostics. */
+int mario_scopedbg_arm = 0;
+/* TEMP diag: last vm passed to vm_run, so the process-level SIGSEGV handler can
+ * dump the live scope/closure chain at the fault (see mario_report_scope_integrity).
+ * Remove with the other temporary diagnostics. */
+vm_t* mario_crash_vm = NULL;
 static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 	node_t* ret = NULL;
 	scope_t* sc = vm_get_scope(vm);
+	/* TEMP diag: dump the whole scope chain for one identifier (MARIO_CDBG=<name>). */
+	if(getenv("MARIO_CDBG") != NULL && strcmp(name, getenv("MARIO_CDBG")) == 0) {
+		scope_t* w = sc;
+		int h = 0;
+		fprintf(stderr, "[cdbg] find '%s' pc=%u\n", name, (unsigned)vm->pc);
+		while(w != NULL && h < 12) {
+			node_t* own = (!var_empty(w->var)) ? var_find_own_member(w->var, name) : NULL;
+			fprintf(stderr, "[cdbg]   [%d] sc=%p is_func=%d is_with=%d var=%p own=%s owntype=%u ownisfunc=%u\n",
+				h, (void*)w, w->is_func?1:0, w->is_with?1:0, (void*)w->var,
+				own != NULL ? "yes" : "no",
+				(own && own->var) ? (unsigned)own->var->type : 99u,
+				(own && own->var) ? (unsigned)own->var->is_func : 0u);
+			w = w->prev;
+			h++;
+		}
+	}
+	if(mario_scopedbg_arm && getenv("MARIO_SCOPEDBG") != NULL) {
+		fprintf(stderr, "[scopedbg] find '%s' sc=%p is_func=%d var=%p(st%d) func=%p closure.var=%p closure.func=%p\n",
+			name, (void*)sc, (sc && sc->is_func)?1:0,
+			(void*)(sc?sc->var:NULL), (sc&&sc->var)?(int)sc->var->status:-1,
+			(void*)(sc?sc->func:NULL),
+			(void*)((sc&&sc->func)?sc->func->closure.var:NULL),
+			(void*)((sc&&sc->func)?sc->func->closure.func:NULL));
+	}
 	if(sc != NULL && sc->is_func) {
 		/* The function's own call env (params, locals, `this`, `arguments`)
 		 * outranks every captured lexical env. With definition-time capture
@@ -4052,18 +4320,27 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 		 * the deferred walk in the scope-stack loop still find free vars. */
 		if(!var_empty(sc->var)) {
 			ret = var_find_own_member(sc->var, name);
-			if(ret != NULL)
+			if(ret != NULL) {
+				diag_find_func(vm, name, ret, "own-func-scope");
 				return ret;
+			}
 		}
 		var_t* closure = sc->func->closure.var;
 		func_t* closure_func = sc->func->closure.func;
 		int chain_guard = 0;
 		while(closure != NULL) {
+			if(mario_scopedbg_arm && getenv("MARIO_SCOPEDBG") != NULL)
+				fprintf(stderr, "[scopedbg]   chain[%d] closure=%p(st%d) closure_func=%p owner=%p cf.closure.var=%p\n",
+					chain_guard, (void*)closure, (int)closure->status, (void*)closure_func,
+					(void*)(closure_func?closure_func->owner_var:NULL),
+					(void*)(closure_func?closure_func->closure.var:NULL));
 			if(++chain_guard > VM_CLOSURE_CHAIN_MAX)
 				break;
 			ret = var_find_own_member(closure, name);	
-			if(ret != NULL)
+			if(ret != NULL) {
+				diag_find_func(vm, name, ret, "func-closure-chain");
 				return ret;
+			}
 			
 			/* A block-captured closure (handle_func) links each block var to its
 			 * lexical parent via the hidden "@@lex" member; climb it before falling
@@ -4082,24 +4359,39 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 	
 	bool closure_done = (sc != NULL && sc->is_func); /* already walked above */
 	int scope_guard = 0;
+	/* An ambient `this` object's members are NOT part of the JS identifier scope
+	 * chain: a bare name must resolve to a lexical binding (own scope var, a
+	 * captured closure, a with-object) or finally the global object, never to
+	 * `this.<name>`. Historically this walk probed each frame's `this` inline and
+	 * returned the first hit, which let a method's receiver shadow a real free
+	 * variable: e.g. webpack's `d.O(a)` runs with `this===d`, so a bare `e` inside
+	 * its flush loop resolved to the sibling `d.e` chunk-loader instead of the
+	 * enclosing IIFE's deferred-chunk array `e`, breaking `e.splice`. Defer the
+	 * `this`-member hit and only use it as a fallback when NO lexical binding is
+	 * found anywhere in the chain, so a genuine closure/own var always wins. */
+	node_t* this_hit = NULL;
 	while(sc != NULL) {
 		if(++scope_guard > VM_SCOPE_STACK_MAX)
 			break;
+		if(mario_scopedbg_arm && getenv("MARIO_SCOPEDBG") != NULL) {
+			fprintf(stderr, "[scopedbg]   ss[%d] sc=%p is_func=%d is_with=%d var=%p(st%d) func=%p\n",
+				scope_guard, (void*)sc, sc->is_func?1:0, sc->is_with?1:0,
+				(void*)sc->var, (sc->var)?(int)sc->var->status:-1, (void*)sc->func);
+		}
 		if(!var_empty(sc->var)) {
 			/* with-object scope: resolve through the member chain (prototype
 			 * included), because native hosts (Math, document) carry their
 			 * methods on the prototype and may have no own members at all. */
 			ret = sc->is_with ? var_find_member(sc->var, name)
 			                  : var_find_own_member(sc->var, name);
-			if(ret != NULL)
+			if(ret != NULL) {
+				diag_find_func(vm, name, ret, "scope-stack-own");
 				return ret;
-			if(!sc->is_with) {
+			}
+			if(!sc->is_with && this_hit == NULL) {
 				var_t* obj = get_obj(sc->var, THIS);
-				if(obj != NULL) {
-					ret = var_find_member(obj, name);
-					if(ret != NULL)
-						return ret;
-				}
+				if(obj != NULL)
+					this_hit = var_find_member(obj, name);
 			}
 		}
 		/* Nested block / object-literal scopes are not is_func, so their captured
@@ -4113,11 +4405,18 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 			func_t* closure_func = (sc->func != NULL) ? sc->func->closure.func : NULL;
 			int chain_guard = 0;
 			while(closure != NULL) {
+				if(mario_scopedbg_arm && getenv("MARIO_SCOPEDBG") != NULL)
+					fprintf(stderr, "[scopedbg]   ssclosure[%d] closure=%p(st%d) closure_func=%p owner=%p cf.closure.var=%p\n",
+						chain_guard, (void*)closure, (int)closure->status, (void*)closure_func,
+						(void*)(closure_func?closure_func->owner_var:NULL),
+						(void*)(closure_func?closure_func->closure.var:NULL));
 				if(++chain_guard > VM_CLOSURE_CHAIN_MAX)
 					break;
 				ret = var_find_own_member(closure, name);
-				if(ret != NULL)
+				if(ret != NULL) {
+					diag_find_func(vm, name, ret, "scope-stack-closure");
 					return ret;
+				}
 				node_t* lex = var_find_own_member(closure, "@@lex");
 				if(lex != NULL && !var_empty(lex->var)) {
 					closure = lex->var;
@@ -4132,7 +4431,83 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 		sc = sc->prev;
 	}
 
-	return var_find_own_member(vm->root, name);
+	/* No lexical binding anywhere in the chain: fall back to the innermost frame's
+	 * ambient `this` member (kept for host/embedded patterns that rely on it), then
+	 * the global object. */
+	if(this_hit != NULL) {
+		diag_find_func(vm, name, this_hit, "scope-stack-THIS-fallback");
+		return this_hit;
+	}
+
+	ret = var_find_own_member(vm->root, name);
+	diag_find_func(vm, name, ret, "ROOT-global");
+	return ret;
+}
+
+/* TEMP diag: called from the process SIGSEGV handler. Walks the live scope stack
+ * and each frame's captured closure chain, and for every var prints a one-line
+ * children-map health summary (declared size, real linked-entry count, and how
+ * many entries have a key pointer below 0x1000 - i.e. freed/recycled). Never
+ * dereferences a key, so it survives the very corruption that faulted. The line
+ * with badkeys>0 or size!=count is the corrupt var. Remove with the other
+ * temporary diagnostics. */
+static void crash_summarize_var(const char* tag, var_t* var) {
+	if(var == NULL) { fprintf(stderr, "[crashdump] %s var=NULL\n", tag); return; }
+	fprintf(stderr, "[crashdump] %s var=%p st=%d\n", tag, (void*)var, (int)var->status);
+	hash_map_t* m = &var->children;
+	uint32_t count = 0, badkeys = 0;
+	if(m->buckets != NULL) {
+		for(uint32_t b = 0; b < m->capacity; ++b) {
+			hash_entry_t* e = m->buckets[b];
+			int guard = 0;
+			while(e != NULL && guard++ < 100000) {
+				count++;
+				if((uintptr_t)e->key < 0x1000u) badkeys++;
+				e = e->next;
+			}
+		}
+	}
+	fprintf(stderr, "[crashdump] %s var=%p st=%d size=%u cap=%u count=%u badkeys=%u buckets=%p\n",
+		tag, (void*)var, (int)var->status, (unsigned)m->size, (unsigned)m->capacity,
+		(unsigned)count, (unsigned)badkeys, (void*)m->buckets);
+}
+
+void mario_report_scope_integrity(void) {
+	vm_t* vm = mario_crash_vm;
+	if(vm == NULL) { fprintf(stderr, "[crashdump] no vm\n"); return; }
+	fprintf(stderr, "[crashdump] vm=%p scope_top=%d stack_top=%d call_depth=%d pc=%u\n",
+		(void*)vm, (int)vm->scope_stack_top, (int)vm->stack_top, (int)vm->call_depth, (unsigned)vm->pc);
+	crash_summarize_var("root", vm->root);
+	int n = vm->scope_stack_top;
+	if(n > 64) n = 64;
+	for(int i = n - 1; i >= 0; --i) {
+		scope_t* sc = vm->scope_stack[i];
+		if(sc == NULL) continue;
+		char tag[64];
+		snprintf(tag, sizeof(tag), "scope[%d](func=%d)", i, sc->is_func?1:0);
+		crash_summarize_var(tag, sc->var);
+		if(sc->is_func && sc->func != NULL) {
+			func_t* f0 = sc->func;
+			void* cvp = (void*)f0->closure.var;
+			void* cfp = (void*)f0->closure.func;
+			fprintf(stderr, "[crashdump] scope[%d] func=%p closure.var=%p closure.func=%p cfref=%p\n",
+				i, (void*)f0, cvp, cfp, (void*)f0->closure_func_ref);
+			var_t* cl = f0->closure.var;
+			func_t* cf = f0->closure.func;
+			int g = 0;
+			while(cl != NULL && g++ < VM_CLOSURE_CHAIN_MAX) {
+				if((uintptr_t)cl < 0x10000u) { fprintf(stderr, "[crashdump]   BAD cl=%p\n", (void*)cl); break; }
+				snprintf(tag, sizeof(tag), "scope[%d].closure[%d]", i, g-1);
+				crash_summarize_var(tag, cl);
+				if(cf == NULL) break;
+				if((uintptr_t)cf < 0x10000u) { fprintf(stderr, "[crashdump]   BAD cf=%p (dangling closure.func)\n", (void*)cf); break; }
+				fprintf(stderr, "[crashdump]   next cf=%p cf.closure.var=%p cf.closure.func=%p\n",
+					(void*)cf, (void*)cf->closure.var, (void*)cf->closure.func);
+				cl = cf->closure.var;
+				cf = cf->closure.func;
+			}
+		}
+	}
 }
 
 static inline scope_t* vm_get_try_catch_scope(vm_t* vm) {
@@ -4179,6 +4554,17 @@ static inline scope_t* vm_get_strict_scope(vm_t* vm) {
 	while(sc != NULL) {
 		if(sc->is_strict)
 			return sc;
+		/* Strict mode is a property of a function's OWN code, never of its caller:
+		 * a sloppy function invoked from strict code stays sloppy (ES: the strict
+		 * flag is fixed by the function's source, and a call boundary resets it).
+		 * Stop the walk at the innermost function frame so an enclosing strict
+		 * caller cannot make this frame strict - otherwise webpack's "use strict"
+		 * runtime (script_12) calling a sloppy chunk-runtime function that does
+		 * `_N_E = e.O()` wrongly threw "'_N_E' undefined!" instead of creating the
+		 * implicit global. Block scopes (is_func==0) still defer to their own
+		 * enclosing function because we only break once is_func is seen. */
+		if(sc->is_func)
+			break;
 		sc = sc->prev;
 	}
 	return NULL;
@@ -4219,6 +4605,51 @@ static void vm_propagate(vm_t* vm, var_t* err) {
 		var_to_str(err, ds);
 		if(getenv("MARIO_DIAGX"))
 			mario_printf("[DIAGX] propagate err=%s scope_top=%d base=%d\n", ds->cstr, vm->scope_stack_top, vm->run_scope_base);
+		const char* want = getenv("MARIO_THROWMSG");
+		if(want != NULL) {
+			char matchbuf[512] = {0};
+			if(ds->cstr != NULL) snprintf(matchbuf, sizeof(matchbuf)-1, "%s", ds->cstr);
+			var_t* mv = var_find_member_var(err, "message");
+			if(mv != NULL) {
+				mstr_t* ms = mstr_new("");
+				var_to_str(mv, ms);
+				if(ms->cstr != NULL) {
+					size_t cl = strlen(matchbuf);
+					snprintf(matchbuf+cl, sizeof(matchbuf)-cl-1, "|%s", ms->cstr);
+				}
+				mstr_free(ms);
+			}
+			if(strstr(matchbuf, want) != NULL) {
+				fprintf(stderr, "[THROWDBG] throwing: %s  (pc=%u)\n", matchbuf, (unsigned)vm->pc);
+				scope_t* sc = vm_get_scope(vm);
+				int hop = 0;
+				while(sc != NULL && hop++ < 30) {
+					if(sc->is_func && sc->func != NULL) {
+						fprintf(stderr, "[THROWDBG]   func[%d] bodypc=%u\n", hop, (unsigned)sc->func->pc);
+						if(sc->var != NULL) {
+							const char* ln[5] = {"t","r","e","n","o"};
+							for(int li=0; li<5; li++) {
+								var_t* lv = var_find_own_member_var(sc->var, ln[li]);
+								if(lv == NULL) continue;
+								if(lv->is_array)
+									fprintf(stderr, "[THROWDBG]     local %s = ARRAY size=%u type=%d\n", ln[li], (unsigned)var_array_size(lv), (int)lv->type);
+								else if(lv->type == V_INT || lv->type == V_FLOAT)
+									fprintf(stderr, "[THROWDBG]     local %s = NUM %lld type=%d\n", ln[li], (long long)var_get_int64(lv), (int)lv->type);
+								else {
+									fprintf(stderr, "[THROWDBG]     local %s = type=%d is_array=%d\n", ln[li], (int)lv->type, (int)lv->is_array);
+									if(lv->type == V_OBJECT) {
+										var_t* tm = var_find_own_member_var(lv, "type");
+										if(tm != NULL && tm->type == V_STRING)
+											fprintf(stderr, "[THROWDBG]       .type = %s\n", var_get_str(tm));
+									}
+								}
+							}
+						}
+					}
+					sc = sc->prev;
+				}
+			}
+		}
 		mstr_free(ds);
 	}
 }
@@ -4572,6 +5003,34 @@ static var_t* find_func(vm_t* vm, var_t* obj, const char* fname) {
 	if(node != NULL && node->var != NULL && node->var->type == V_OBJECT) {
 		return node->var;
 	}
+	if(getenv("MARIO_FINDDBG") != NULL && strcmp(fname, getenv("MARIO_FINDDBG")) == 0) {
+		fprintf(stderr, "[FINDDBG] miss '%s' obj=%p type=%u is_array=%u node=%p",
+			fname, (void*)obj, obj?(unsigned)obj->type:99u, obj?(unsigned)obj->is_array:0u, (void*)node);
+		if(node != NULL)
+			fprintf(stderr, " nodevar=%p ntype=%u nisfunc=%u",
+				(void*)node->var, node->var?(unsigned)node->var->type:99u, node->var?(unsigned)node->var->is_func:0u);
+		fprintf(stderr, "\n");
+		if(obj != NULL) {
+			var_t* AP = vm->builtin_vars.var_Array != NULL ? var_get_prototype(vm->builtin_vars.var_Array) : NULL;
+			fprintf(stderr, "[FINDDBG]   builtin Array.prototype=%p\n", (void*)AP);
+			var_t* p = var_get_prototype(obj);
+			int h = 0;
+			while(p != NULL && h++ < 8) {
+				node_t* fn = var_find_own_member(p, fname);
+				fprintf(stderr, "[FINDDBG]   proto[%d]=%p is_array=%u ==AP?%d has_forEach=%d has_map=%d has_push=%d has_join=%d has_length=%d var=%p type=%u is_func=%u\n",
+					h, (void*)p, (unsigned)p->is_array, (p==AP)?1:0,
+					fn!=NULL?1:0,
+					var_find_own_member(p,"map")!=NULL?1:0,
+					var_find_own_member(p,"push")!=NULL?1:0,
+					var_find_own_member(p,"join")!=NULL?1:0,
+					var_find_own_member(p,"length")!=NULL?1:0,
+					(void*)(fn?fn->var:NULL), (fn&&fn->var)?(unsigned)fn->var->type:99u,
+					(fn&&fn->var)?(unsigned)fn->var->is_func:0u);
+				p = var_get_prototype(p);
+			}
+			if(p==NULL) fprintf(stderr, "[FINDDBG]   proto chain ended (hops=%d)\n", h);
+		}
+	}
 	return NULL;
 }
 
@@ -4608,6 +5067,28 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 				void bc_dump_window(bytecode_t* bc, PC center, PC radius);
 				bc_dump_window(&vm->bc, 121514, 8);
 				bc_dump_window(&vm->bc, 83799, 12);
+			}
+		}
+	}
+	if(getenv("MARIO_FPCDBG") != NULL) { /* DIAG (temp): dump entry args of one func pc */
+		func_t* pf = (func_var != NULL) ? var_get_func(func_var) : NULL;
+		if(pf != NULL && (PC)atoi(getenv("MARIO_FPCDBG")) == pf->pc) {
+			fprintf(stderr, "[fpcdbg] enter fpc=%u argc=%d vpc=%u obj=%p(t%u)\n",
+				(unsigned)pf->pc, arg_num, (unsigned)vm->pc,
+				(void*)obj, (unsigned)(obj != NULL ? obj->type : 999u));
+			for(int ai = arg_num - 1; ai >= 0; --ai) {
+				int idx = vm->stack_top - 1 - ai;
+				if(idx < 0) break;
+				void* raw = vm->stack[idx];
+				int mg = (raw != NULL) ? (int)(*(int8_t*)raw) : -1;
+				var_t* av = NULL;
+				if(raw != NULL) av = (mg == 1) ? ((node_t*)raw)->var : (var_t*)raw;
+				fprintf(stderr, "[fpcdbg]   arg[%d] t%u f%u arr%u num=%lld\n", arg_num - 1 - ai,
+					(unsigned)(av != NULL ? av->type : 999u),
+					(unsigned)(av != NULL ? av->is_func : 0u),
+					(unsigned)(av != NULL ? av->is_array : 0u),
+					(long long)((av != NULL && (av->type == V_INT || av->type == V_INT64 ||
+					             av->type == V_FLOAT || av->type == V_FLOAT64)) ? var_get_int64(av) : -1));
 			}
 		}
 	}
@@ -4786,10 +5267,24 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		char tagsfx[160] = {0};
 		if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
 		mario_printf("Uncaught RangeError: Maximum call stack size exceeded%s\n", tagsfx);
+		fprintf(stderr, "[depthdbg] GUARD trip: call_depth=%d stack_top=%d/%d scope_top=%d/%d pc=%u\n",
+			(int)vm->call_depth, (int)vm->stack_top, (int)VM_STACK_MAX,
+			(int)vm->scope_stack_top, (int)VM_SCOPE_STACK_MAX, (unsigned)vm->pc);
+		{ /* DIAG (temp): what kind of scopes leaked? */
+			scope_t* w = vm_get_scope(vm);
+			int h = 0;
+			while(w != NULL && h < 12) {
+				fprintf(stderr, "[depthdbg]   scope[%d] func=%d block=%d try=%d with=%d loop=%d label=%s pc=%u stack_top=%d\n",
+					h, (int)w->is_func, (int)w->is_block, (int)w->is_try, (int)w->is_with,
+					(int)w->is_loop, (w->label != NULL ? w->label : "-"), (unsigned)w->pc, (int)w->stack_top);
+				w = w->prev;
+				h++;
+			}
+		}
 		{ /* DIAG (temp): dump the top of the call chain so the recursion pair
 		   * (which func_pcs alternate) can be identified. */
 		        static int dbg_depth = -1;
-		        if(dbg_depth < 0) dbg_depth = (getenv("MARIO_THROWDBG") != NULL) ? 1 : 0;
+		        if(dbg_depth < 0) dbg_depth = 1;
 		        if(dbg_depth) {
 		                scope_t* dsc = vm_get_scope(vm);
 		                int dd = 0, ddp = 0;
@@ -4845,7 +5340,7 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		sc->pc = vm->pc;
 		sc->is_func = true;
 		sc->func = func;
-		sc->func_var = func_var; //root the function object so its func_t survives gc during the body
+		sc->func_var = var_ref(func_var); //root the function object so its func_t survives gc AND refcount drops during the body
 		sc->stack_top = vm->stack_top; //frame baseline (env already pushed): a throw truncates leaked operands down to here
 
 		vm_push_scope(vm, sc);
@@ -5550,6 +6045,8 @@ static inline void compare(vm_t* vm, opr_code_t op, var_t* v1, var_t* v2) {
 				case INSTR_NEQ: 
 				case INSTR_NTEQ:
 					i = (strcmp((const char*)v1->value, (const char*)v2->value) != 0);
+					if(i && getenv("MARIO_CMPDBG"))
+						fprintf(stderr, "[CMPDBG] str NEQ true: '%s' vs '%s'\n", (const char*)v1->value, (const char*)v2->value);
 					break;
 			}
 		}
@@ -5877,6 +6374,16 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 				fprintf(stderr, "  pc=%u op=%02x oph=%05x%s%s\n", i, op, oph, hs ? " str=" : "", hs ? bc_getstr(&vm->bc, oph) : "");
 			}
 		}
+		/* Stack balance: the compiler already pushed arg_num operands for this
+		 * `new`. Every other early-out (the dangling-binding guard below and the
+		 * no-constructor path further down) pops them before throwing; leaving
+		 * them here desyncs stack_top and a later opcode pops a freed/garbage
+		 * var -> SIGBUS. */
+		{
+			int k = arg_num;
+			while(k-- > 0)
+				vm_pop(vm);
+		}
 		vm_throw(vm, "there is no class: '%s'!", name);
 		return NULL;
 	}
@@ -6095,6 +6602,15 @@ var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
 				}
 			}
 		}
+		/* Stack balance: pop the arg_num operands the compiler pushed for this
+		 * `new` before throwing, matching the other early-out paths; otherwise
+		 * stack_top stays desynced after the error and a later opcode derefs a
+		 * freed var. */
+		{
+			int k = arg_num;
+			while(k-- > 0)
+				vm_pop(vm);
+		}
 		vm_throw(vm, "there is no class: '%s'!", name);
 		return NULL;
 	}
@@ -6135,6 +6651,38 @@ static int parse_func_name(const char* full, mstr_t* name) {
 static bool do_new(vm_t* vm, const char* full) {
 	mstr_t* name = mstr_new("");
 	int arg_num = parse_func_name(full, name);
+
+	if(getenv("MARIO_NEWDBG") != NULL) { /* DIAG (temp): scalar peek of named-NEW args */
+		scope_t* nsc = vm_get_scope(vm);
+		fprintf(stderr, "[newdbg] NEW '%s' argc=%d pc=%u caller_fpc=%u\n", name->cstr, arg_num,
+			(unsigned)(vm->pc > 0 ? vm->pc - 1 : 0),
+			(nsc != NULL && nsc->func != NULL) ? (unsigned)nsc->func->pc : 0u);
+		if(getenv("MARIO_NEWPC") != NULL &&
+		   (vm->pc > 0 ? vm->pc - 1 : 0) == (PC)atoi(getenv("MARIO_NEWPC"))) {
+			for(int32_t si = vm->scope_stack_top - 1; si >= 0 && si > vm->scope_stack_top - 10; --si) {
+				scope_t* ssc = vm->scope_stack[si];
+				fprintf(stderr, "[newdbg]   scope[%d] is_func=%d is_with=%d func_pc=%u var=%p\n", (int)si,
+					(ssc != NULL && ssc->is_func) ? 1 : 0,
+					(ssc != NULL && ssc->is_with) ? 1 : 0,
+					(ssc != NULL && ssc->func != NULL) ? (unsigned)ssc->func->pc : 0u,
+					(ssc != NULL) ? (void*)ssc->var : NULL);
+			}
+		}
+		for(int ai = 0; ai < arg_num; ++ai) {
+			int idx = vm->stack_top - 1 - ai;
+			if(idx < 0) break;
+			void* raw = vm->stack[idx];
+			int mg = (raw != NULL) ? (int)(*(int8_t*)raw) : -1;
+			var_t* av = NULL;
+			if(raw != NULL) av = (mg == 1) ? ((node_t*)raw)->var : (var_t*)raw;
+			fprintf(stderr, "[newdbg]   arg[-%d] t%u f%u arr%u num=%lld\n", ai,
+				(unsigned)(av != NULL ? av->type : 999u),
+				(unsigned)(av != NULL ? av->is_func : 0u),
+				(unsigned)(av != NULL ? av->is_array : 0u),
+				(long long)((av != NULL && (av->type == V_INT || av->type == V_INT64 ||
+				             av->type == V_FLOAT || av->type == V_FLOAT64)) ? var_get_int64(av) : -1));
+		}
+	}
 
 	/* ES6: an arrow function has no [[Construct]]; `new arrow()` is a catchable
 	 * TypeError. Detect it before building anything, drop the pushed args, and
@@ -6382,7 +6930,26 @@ static inline void handle_jmp(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 	vm->pc = vm->pc + offset - 1;
 }
 
+/* A loop's back edge always re-enters the innermost enclosing loop, so every
+ * block-ish scope opened inside the body (block / switch / with / label) must
+ * already be closed by the time control reaches it. The compiler's case-body
+ * join jumps can reach the back edge without running the matching BLOCK_END /
+ * SWITCH_END (React's commit work loop does exactly this: `switch` cases whose
+ * tail jumps to the loop head), which would leak one scope per iteration until
+ * the scope stack overflows. Restore the balance here: pop everything above
+ * the innermost loop scope, exactly like `continue` does, never crossing into
+ * the enclosing vm_run frame's scopes or a function frame. */
+static void vm_pop_scopes_to_loop(vm_t* vm) {
+	while(vm->scope_stack_top > vm->run_scope_base) {
+		scope_t* sc = vm_get_scope(vm);
+		if(sc == NULL || sc->is_func || sc->is_loop)
+			break;
+		vm_pop_scope(vm);
+	}
+}
+
 static inline void handle_jmpb(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	vm_pop_scopes_to_loop(vm);
 	vm->pc = vm->pc - offset - 1;
 }
 
@@ -6396,8 +6963,11 @@ static inline void handle_njmp(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	if(!var_truthy(v)) {
 		if(instr == INSTR_NJMP) 
 			vm->pc = vm->pc + offset - 1;
-		else
+		else {
+			/* Conditional back edge (NJMPB): same scope rebalancing as JMPB. */
+			vm_pop_scopes_to_loop(vm);
 			vm->pc = vm->pc - offset - 1;
+		}
 	}
 	var_unref(v);
 }
@@ -6479,7 +7049,14 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool r
 				vm_throw(vm, "'%s' undefined!", s);	
 				return;
 			}
-			var_t* var = vm_get_scope_var(vm);
+			/* Sloppy-mode assignment to an undeclared name (LOADW target) creates an
+			 * implicit GLOBAL, not a local in the innermost frame: `_N_E = e.O()` in a
+			 * webpack chunk-runtime must land on the global object (window._N_E) where
+			 * other chunks read it. Creating it on the frame's scope var dropped the
+			 * binding as soon as the call returned. Reads keep the lenient behaviour of
+			 * materialising the name in the current scope so a bare undeclared read
+			 * still yields undefined instead of throwing. */
+			var_t* var = raw ? vm->root : vm_get_scope_var(vm);
 			node = var_add(var, s, NULL);
 		}
 		/* Rvalue read of an accessor binding (e.g. `body` inside `with(document)`):
@@ -6573,6 +7150,9 @@ static inline void handle_block(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		 * NOT stop here (it belongs to an enclosing loop), hence a distinct flag. */
 		sc->is_switch = true;
 		sc->pc = vm->pc+1;
+		/* DIAG (temp): track one leaking switch site. */
+		if(sc->pc == 32771)
+			fprintf(stderr, "[swdbg] PUSH switch@32771 top=%d pc=%u\n", (int)vm->scope_stack_top + 1, (unsigned)vm->pc);
 	}
 	else if(instr == INSTR_LABEL) {
 		/* Labeled-statement scope (`outer: { ... }`): sc->pc is the break anchor
@@ -6612,6 +7192,9 @@ static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 			}
 		}
 		else if(sc->is_loop || sc->is_switch) {
+			/* DIAG (temp): track one leaking switch site. */
+			if(sc->is_switch && sc->pc == 32771)
+				fprintf(stderr, "[swdbg] BREAK stops at switch@32771 (no pop) top=%d pc=%u\n", (int)vm->scope_stack_top, (unsigned)vm->pc);
 			vm->pc = sc->pc;
 			break;
 		}
@@ -7266,6 +7849,15 @@ static inline void handle_const(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 				node->be_const = true;
 		}
 		else {
+			if(getenv("MARIO_LETDBG")) { /* DIAG (temp): locate the empty-name let/const */
+				fprintf(stderr, "[letdbg] name='%s' pc=%u instr=%u bc.cindex=%u mstr.size=%u\n",
+					s, (unsigned)vm->pc, (unsigned)ins, (unsigned)vm->bc.cindex, (unsigned)vm->bc.mstr_table.size);
+				for(PC q = (vm->pc > 12 ? vm->pc - 12 : 0); q < vm->pc + 3 && q < vm->bc.cindex; q++) {
+					PC iw = vm->bc.code_buf[q];
+					PC iop = OP(iw), ioff = iw & 0xFFFFF;
+					fprintf(stderr, "[letdbg]   pc=%u op=%02x off=%u str=%s\n", (unsigned)q, (unsigned)iop, (unsigned)ioff, bc_getstr(&vm->bc, ioff));
+				}
+			}
 			mario_debug("Error: let '%s' has already existed!\n", s);
 			vm_throw(vm, "let '%s' has already existed!", s);
 		}
@@ -7519,6 +8111,108 @@ static inline void handle_getw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	var_unref(v);
 }
 
+/* Short receiver descriptor for the "can not find function" diagnostic: kind
+ * plus up to four own member names, so a miss on a wrong or undefined receiver
+ * (a shadowed `document`, an unresolved module object) is identifiable from the
+ * log line alone without a debugger. Static buffer: the VM is single-threaded
+ * and the string is consumed by vm_throw's vsnprintf immediately. */
+static const char* call_miss_recv(var_t* obj) {
+	static char buf[192];
+	size_t n = 0;
+	if(obj == NULL) { snprintf(buf, sizeof buf, "null"); return buf; }
+	if(var_empty(obj)) { snprintf(buf, sizeof buf, "undefined"); return buf; }
+	if(obj->is_func) { snprintf(buf, sizeof buf, "function"); return buf; }
+	n = (size_t)snprintf(buf, sizeof buf, "object{");
+	if(obj->children.buckets != NULL) {
+		unsigned shown = 0;
+		for(uint32_t b = 0; b < obj->children.capacity && shown < 4; ++b) {
+			hash_entry_t* e = obj->children.buckets[b];
+			for(; e != NULL && shown < 4; e = e->next) {
+				if(e->key == NULL || e->key[0] == '@') continue;
+				if(n + 2 < sizeof buf)
+					n += (size_t)snprintf(buf + n, sizeof buf - n, "%s%s", (shown != 0) ? "," : "", e->key);
+				shown++;
+			}
+		}
+	}
+	if(n + 1 < sizeof buf)
+		snprintf(buf + n, sizeof buf - n, "}");
+	return buf;
+}
+
+/* Deferred member write target, phase 1 (`a.b = rhs`): pop the base lvalue and
+ * park it inside a @@wanchor sentinel node (the base is held by a hidden @@wobj
+ * member, mirroring wslot_push). GETW used to resolve the write target BEFORE
+ * the RHS ran: its [[Set]]-shadowing created an own empty member on the base,
+ * so a fused member call in the RHS that re-read the same property
+ * (`f.push = c.bind(null, f.push.bind(f))`, the webpack chunk-loading runtime
+ * tail) saw the freshly-shadowed undefined instead of the prototype method and
+ * mis-resolved ("can not find function 'bind'"). Deferring the target until
+ * INSTR_WTARGET (after the RHS) keeps the prototype member intact while the RHS
+ * runs and leaves a clean operand window for nested calls. */
+static inline void handle_wanchor(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* base = vm_pop2(vm); /* owned ref on the base value (like handle_getw) */
+	if(base == NULL) {
+		vm_push(vm, var_new(vm)); /* keep the stack balanced; WTARGET degrades */
+		return;
+	}
+	vm->gc.gc_defer++; /* sn/cur unrooted until vm_push_node */
+	var_t* cur = var_new(vm);   /* fresh placeholder; refs 0 */
+	var_ref(cur);               /* the sentinel node's own reference */
+	node_t* sn = (node_t*)mario_malloc(sizeof(node_t));
+	memset(sn, 0, sizeof(node_t));
+	sn->magic = 1;
+	sn->name = (char*)mario_malloc(strlen(WANCHOR)+1);
+	memcpy(sn->name, WANCHOR, strlen(WANCHOR)+1);
+	sn->var = cur;
+	node_t* on = var_add(cur, WANCHOR_OBJ, base); /* var_add refs base: keeps it alive across the RHS */
+	if(on != NULL) { on->invisable = 1; on->be_unenumerable = 1; }
+	vm_push_node(vm, sn);       /* adds the stack reference to cur */
+	vm->gc.gc_defer--;
+	var_unref(base);            /* release the popped ref; the hidden member holds base now */
+}
+
+/* Deferred member write target, phase 2: the RHS value is on top of the stack
+ * with the @@wanchor sentinel directly beneath it. Pop both, free the sentinel
+ * (releasing its hold on the base so do_get sees the base's TRUE refcount and
+ * routes a transient receiver through @@wslot exactly as GETW did), resolve the
+ * member with do_get(for_write), then push the RHS value back on top so ASIGN /
+ * compound-math keep their (value on top, target beneath) contract. */
+static inline void handle_wtarget(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	const char* s = bc_getstr(&vm->bc, offset);
+	var_t* rhs = vm_pop2(vm);      /* owned RHS value */
+	node_t* an = vm_pop2node(vm);  /* the @@wanchor sentinel (pop2node does not unref) */
+	var_t* base = NULL;
+	if(an != NULL && an->var != NULL)
+		base = var_find_own_member_var(an->var, WANCHOR_OBJ);
+	if(an == NULL || base == NULL) {
+		/* No usable anchor/base (compiler/runtime desync): degrade to a plain
+		 * value so ASIGN stays stack-balanced instead of mispopping. */
+		if(an != NULL) { var_unref(an->var); node_free(an); }
+		if(rhs != NULL) { vm_push(vm, rhs); var_unref(rhs); }
+		else vm_push(vm, var_new(vm));
+		return;
+	}
+	vm->gc.gc_defer++; /* rhs/base off-stack while the sentinel is freed and do_get runs */
+	var_ref(base);            /* own base like GETW's popped ref */
+	var_unref(an->var);       /* release the sentinel's stack ref on cur */
+	node_free(an);            /* frees cur -> drops @@wobj -> unrefs base; base refs now natural+1 */
+	int top0 = vm->stack_top;
+	do_get(vm, base, s, true); /* pushes the target node(s): [node] or [obj,node] for an accessor */
+	if(vm->stack_top == top0) {
+		/* n==0: do_get could not resolve a target (primitive/unresolvable base).
+		 * ASIGN still expects exactly one target slot beneath the value; without
+		 * a placeholder this frame pops 2 and pushes 1, underflowing the stack
+		 * and leaving a NULL slot that a later magic read derefs at addr 0. */
+		vm_push(vm, var_new(vm));
+	}
+	var_unref(base);          /* release my ref; the pushed target/wslot keeps base alive as needed */
+	vm_push(vm, (rhs != NULL) ? rhs : var_new(vm)); /* RHS value on top for ASIGN */
+	if(rhs != NULL)
+		var_unref(rhs);
+	vm->gc.gc_defer--;
+}
+
 /* ES2020 optional chaining `base?.member`. The base is on the stack: if it is
  * nullish the whole access collapses to undefined (replace the top), otherwise
  * it is a plain member fetch identical to INSTR_GET. Because each `?.` link
@@ -7605,6 +8299,28 @@ static inline void handle_newx(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	mstr_t* name = mstr_new("");
 	int arg_num = parse_func_name(s, name);
 	mstr_free(name);
+
+	if(getenv("MARIO_NEWDBG") != NULL) { /* DIAG (temp): scalar peek of ctor+args */
+		scope_t* nsc = vm_get_scope(vm);
+		fprintf(stderr, "[newdbg] NEWX argc=%d pc=%u caller_fpc=%u\n", arg_num,
+			(unsigned)(vm->pc > 0 ? vm->pc - 1 : 0),
+			(nsc != NULL && nsc->func != NULL) ? (unsigned)nsc->func->pc : 0u);
+		for(int ai = 0; ai <= arg_num; ++ai) {
+			int idx = vm->stack_top - 1 - ai;
+			if(idx < 0) break;
+			void* raw = vm->stack[idx];
+			int mg = (raw != NULL) ? (int)(*(int8_t*)raw) : -1;
+			var_t* av = NULL;
+			if(raw != NULL) av = (mg == 1) ? ((node_t*)raw)->var : (var_t*)raw;
+			fprintf(stderr, "[newdbg]   slot[-%d] %s t%u f%u num=%lld str=[%s]\n", ai,
+				(ai == arg_num) ? "ctor" : "arg ",
+				(unsigned)(av != NULL ? av->type : 999u),
+				(unsigned)(av != NULL ? av->is_func : 0u),
+				(long long)((av != NULL && (av->type == V_INT || av->type == V_INT64 ||
+				             av->type == V_FLOAT || av->type == V_FLOAT64)) ? var_get_int64(av) : -1),
+				(av != NULL && av->type == V_STRING) ? var_get_str(av) : "-");
+		}
+	}
 
 	var_t* ctor = vm_stack_pick(vm, arg_num + 1); /* removes the ctor slot */
 
@@ -7811,6 +8527,42 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 			func = NULL;
 	}
 
+	/* `obj.prop(args)` where `prop` is an accessor property: the fused CALL
+	 * resolved the member to the getter func itself. JS semantics read the
+	 * property FIRST (invoking the getter with this==obj to obtain the callee),
+	 * THEN call that callee with the args (again this==obj). The old path called
+	 * the getter directly WITH the call args, so the function the getter returned
+	 * was never invoked - webpack's interop helper `n(id)._(mod)` yielded the
+	 * wrapper function itself (whose `.default` is undefined) instead of its
+	 * result, surfacing later as "can not find function 'createContext'". */
+	if(func != NULL && var_is_accessor(func)) {
+		var_t* getter = var_accessor_getter(func);
+		if(getter != NULL) {
+			/* gc_defer keeps `callee` alive while it sits off-stack between the
+			 * getter's return and the second func_call. */
+			vm->gc.gc_defer++;
+			var_ref(getter);
+			func_call(vm, obj, getter, 0);   // pushes the getter's return value above the args
+			var_t* callee = vm_pop2(vm);     // borrow it back; owns the stack ref
+			var_unref(getter);
+			if(callee != NULL && (callee->is_func || var_is_callable(callee))) {
+				func_call(vm, obj, callee, arg_num); // consumes the args, pushes the result
+			}
+			else {
+				while(arg_num > 0) { vm_pop(vm); arg_num--; }
+				vm_push(vm, var_new(vm));
+				vm_throw(vm, "can not find function '%s'!", name->cstr);
+			}
+			if(callee != NULL)
+				var_unref(callee);
+			vm->gc.gc_defer--;
+			mstr_free(name);
+			if(unrefObj && obj != NULL)
+				var_unref(obj);
+			return;
+		}
+	}
+
 	if(func != NULL) {
 		/* TEMP taobao diag: dump the operand stack a named CALL is about to consume. */
 		if(getenv("MARIO_CALLARGS") != NULL && vm->pc == (PC)atoi(getenv("MARIO_CALLARGS"))) {
@@ -7846,18 +8598,18 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 				name->cstr, (void*)obj, obj ? (unsigned)obj->type : 99u,
 				obj ? (unsigned)obj->is_array : 0u, obj ? (unsigned)obj->is_func : 0u,
 				(obj != NULL && obj->vm != NULL) ? 1 : 0, obj ? (int)obj->refs : -1);
+			if(getenv("MARIO_PCDBG")) { /* bytecode context around the miss (any receiver type) */
+				for(PC i = (vm->pc > 20 ? vm->pc - 20 : 0); i <= vm->pc + 1; i++) {
+					PC insw = vm->bc.code_buf[i];
+					PC op = OP(insw), oph = insw & 0xFFFFF;
+					fprintf(stderr, "  pc=%u op=%02x oph=%05x%s%s\n", i, op, oph,
+						(op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64) ? " str=" : "",
+						(op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64) ? bc_getstr(&vm->bc, oph) : "");
+				}
+			}
 			if(obj != NULL && obj->type == V_STRING) {
 				const char* cs = var_get_str(obj);
 				fprintf(stderr, "[DIAGCNF]   str=%.60s\n", cs ? cs : "(null)");
-				if(getenv("MARIO_PCDBG")) {
-					for(PC i = (vm->pc > 16 ? vm->pc - 16 : 0); i <= vm->pc + 1; i++) {
-						PC insw = vm->bc.code_buf[i];
-						PC op = OP(insw), oph = insw & 0xFFFFF;
-						fprintf(stderr, "  pc=%u op=%02x oph=%05x%s%s\n", i, op, oph,
-							(op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64) ? " str=" : "", 
-							(op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64) ? bc_getstr(&vm->bc, oph) : "");
-					}
-				}
 			}
 			if(obj != NULL && obj->type == V_OBJECT) {
 				/* SAFE scalar-only dump: the receiver may be a recycled var (internal
@@ -7869,8 +8621,33 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 					obj->children.buckets != NULL ? 1 : 0,
 					(unsigned)obj->children.capacity);
 			}
+			if(obj != NULL && obj->is_func && obj->value != NULL) {
+				/* Scalar-only function identity (pc/arity/flags): NEVER deref args.items
+				 * or the bytecode here - a recycled func_t makes those dangling. */
+				func_t* rf = (func_t*)obj->value;
+				fprintf(stderr, "[DIAGCNF]   func pc=%u nargs=%u arrow=%d native=%d\n",
+					(unsigned)rf->pc, (unsigned)rf->args.size,
+					(int)rf->is_arrow, (rf->native != NULL) ? 1 : 0);
+			}
 		}
 		vm->gc.gc_defer++; //obj is a bare C pointer while the args are popped and the throw unwinds
+		/* TEMP diag: dump the operand stack a MISSED named CALL would have consumed. */
+		if(getenv("MARIO_MISSSTK") != NULL) {
+			fprintf(stderr, "[missstk] '%s' pc=%u arg_num=%d stack_top=%d\n", name->cstr, (unsigned)vm->pc, arg_num, (int)vm->stack_top);
+			for(int ai = 1; ai <= arg_num + 4; ++ai) {
+				int idx = vm->stack_top - ai;
+				if(idx < 0) break;
+				void* raw = vm->stack[idx];
+				int mg = (raw != NULL) ? (int)(*(int8_t*)raw) : -1;
+				var_t* av = NULL;
+				if(raw != NULL) av = (mg == 1) ? (((node_t*)raw)->var) : (var_t*)raw;
+				fprintf(stderr, "[missstk]   -%d raw=%p magic=%d var=%p type=%u is_func=%u is_array=%u\n",
+					ai, raw, mg, (void*)av,
+					(unsigned)(av != NULL ? av->type : 999u),
+					(unsigned)(av != NULL ? av->is_func : 0u),
+					(unsigned)(av != NULL ? av->is_array : 0u));
+			}
+		}
 		while(arg_num > 0) {
 			vm_pop(vm);
 			arg_num--;
@@ -7900,7 +8677,11 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 				}
 			}
 		}
-		vm_throw(vm, "can not find function '%s'!", name->cstr);
+		vm_throw(vm, "can not find function '%s' on %s!", name->cstr, call_miss_recv(obj));
+		if(getenv("MARIO_CNFBC") != NULL && strcmp(name->cstr, getenv("MARIO_CNFBC")) == 0) {
+			void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+			bc_dump_window(&vm->bc, vm->pc, 18);
+		}
 		vm->gc.gc_defer--;
 	}
 	mstr_free(name);
@@ -8433,7 +9214,7 @@ static var_t* gen_resume_body(vm_t* vm, gen_state_t* g, var_t* sent, int mode) {
 		sc->pc = caller_pc; //stale after this resume; every exit path below restores pc itself
 		sc->is_func = true;
 		sc->func = g->func;
-		sc->func_var = (g->func != NULL) ? g->func->owner_var : NULL; //root the generator body's func + lexical chain during the resume
+		sc->func_var = (g->func != NULL) ? var_ref(g->func->owner_var) : NULL; //root the generator body's func + lexical chain during the resume
 		sc->stack_top = vm->stack_top; //frame baseline for throw truncation
 		vm_push_scope(vm, sc);
 		vm->pc = g->func->pc;
@@ -9725,17 +10506,20 @@ static bool mario_define_default(vm_t* vm, var_t* obj, var_t* key, var_t* desc) 
 			node_t* sn = var_add(gw, FUNC_SETTER_KEY, sw);
 			if(sn != NULL) { sn->invisable = 1; sn->be_unenumerable = 1; }
 		}
+		bool acc_existed = (var_find_own_member(obj, ks) != NULL);
 		node_t* node = var_add(obj, ks, primary);
 		if(node == NULL)
 			return false;
 		var_t* e = var_find_own_member_var(desc, "enumerable");
 		if(e != NULL) node->be_unenumerable = !var_get_bool(e);
+		else if(!acc_existed) node->be_unenumerable = 1; /* spec: a NEW property's absent `enumerable` defaults to false */
 		var_t* c = var_find_own_member_var(desc, "configurable");
 		if(c != NULL) node->be_const = !var_get_bool(c);
 		return true;
 	}
 
 	var_t* val = (desc != NULL) ? var_find_own_member_var(desc, "value") : NULL;
+	bool data_existed = (var_find_own_member(obj, ks) != NULL);
 	node_t* node = var_add(obj, ks, val);
 	if(node == NULL)
 		return false;
@@ -9744,6 +10528,7 @@ static bool mario_define_default(vm_t* vm, var_t* obj, var_t* key, var_t* desc) 
 		if(w != NULL) node->be_const = !var_get_bool(w);
 		var_t* e = var_find_own_member_var(desc, "enumerable");
 		if(e != NULL) node->be_unenumerable = !var_get_bool(e);
+		else if(!data_existed) node->be_unenumerable = 1; /* spec: a NEW property's absent `enumerable` defaults to false */
 		var_t* c = var_find_own_member_var(desc, "configurable");
 		if(c != NULL) node->be_const = !var_get_bool(c);
 	}
@@ -9937,6 +10722,19 @@ bool mario_prevent_extensions_var(vm_t* vm, var_t* obj) {
 bool mario_define_property_var(vm_t* vm, var_t* obj, var_t* key, var_t* desc) {
 	if(obj == NULL)
 		return false;
+	if(getenv("MARIO_DPCALL") != NULL && obj == vm->builtin_vars.var_Array &&
+	   key != NULL && key->type == V_STRING && strcmp(var_get_str(key), "prototype") == 0) {
+		fprintf(stderr, "[DPCALL] defineProperty(Array,'prototype') value=%p(t=%u) caller chain:\n",
+			(void*)(desc?var_find_own_member_var(desc,"value"):NULL),
+			(unsigned)(desc&&var_find_own_member_var(desc,"value")?var_find_own_member_var(desc,"value")->type:99u));
+		scope_t* sc = vm_get_scope(vm);
+		int hop = 0;
+		while(sc != NULL && hop++ < 24) {
+			if(sc->is_func && sc->func != NULL)
+				fprintf(stderr, "[DPCALL]   func[%d] bodypc=%u\n", hop, (unsigned)sc->func->pc);
+			sc = sc->prev;
+		}
+	}
 	if(var_is_proxy(obj))
 		return proxy_define_property(vm, obj, key, desc);
 	return mario_define_default(vm, obj, key, desc);
@@ -10427,6 +11225,37 @@ static inline void handle_import_bind(vm_t* vm, PC ins, opr_code_t instr, uint32
 
 static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	vm_throw_truncate(vm); // the thrown value is on top; drop operands the interrupted expression leaked
+	{ /* DIAG (temp): a primitive (non-Error) throw is unusual - React's logCapturedError
+	   * surfaced `console.error(128)`, i.e. an integer was thrown and caught by a class
+	   * error boundary. Dump the throw site (pc) + func-entry pc stack for ANY non-object
+	   * thrown value so the source can be located. */
+		static int dbg_throwint = -1;
+		if(dbg_throwint < 0) dbg_throwint = (getenv("MARIO_THROWINT") != NULL) ? 1 : 0;
+		if(dbg_throwint) {
+			var_t* itv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
+			if(itv != NULL && itv->type != V_OBJECT && itv->type != V_NULL) {
+				fprintf(stderr, "[throwint] value=%d type=%u at ins=%u pc=%u\n",
+					(int)var_get_int(itv), (unsigned)itv->type, (unsigned)ins, (unsigned)vm->pc);
+				scope_t* isc = vm_get_scope(vm);
+				int id = 0;
+				while(isc != NULL && id < 24) {
+					if(isc->is_func && isc->func != NULL) {
+						const char* inm = NULL;
+						if(isc->func_var != NULL) {
+							var_t* inv = var_find_own_member_var(isc->func_var, "name");
+							if(inv == NULL || inv->type != V_STRING)
+								inv = var_find_own_member_var(isc->func_var, "@@fname");
+							if(inv != NULL && inv->type == V_STRING) inm = var_get_str(inv);
+						}
+						fprintf(stderr, "[throwint]   frame func_pc=%u name=%s\n",
+							(unsigned)isc->func->pc, inm != NULL ? inm : "?");
+					}
+					isc = isc->prev;
+					id++;
+				}
+			}
+		}
+	}
 	scope_t* try_sc = vm_find_inrange_try(vm);
 	if(try_sc == NULL) {
 		/* DIAG (temp): uncaught-throw forensics - dump the throw-site pc, the thrown
@@ -10493,6 +11322,18 @@ static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 
 static inline void handle_catch(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	const char* s = bc_getstr(&vm->bc, offset);
+	if(getenv("MARIO_CATCHDBG") != NULL) {
+		fprintf(stderr, "[catchdbg] param=%s pc=%u stack_top=%d run_stack_base=%d scope_top=%d run_scope_base=%d abort=%d\n",
+			s, (unsigned)vm->pc, vm->stack_top, vm->run_stack_base, vm->scope_stack_top, vm->run_scope_base, (int)vm->abort_run);
+		for(int32_t i = vm->stack_top - 1; i >= 0 && i >= vm->stack_top - 6; i--) {
+			void* p = vm->stack[i];
+			if(p == NULL) { fprintf(stderr, "[catchdbg]   slot[%d]=NULL\n", i); continue; }
+			unsigned char mb = *(unsigned char*)p;
+			void* f10 = *(void**)((char*)p + 0x10);
+			void* f18 = *(void**)((char*)p + 0x18);
+			fprintf(stderr, "[catchdbg]   slot[%d]=%p magic=%u off0x10=%p off0x18=%p\n", i, p, mb, f10, f18);
+		}
+	}
 	var_t* v = vm_pop2(vm);
 	if(v == NULL) {
 		return;
@@ -10544,6 +11385,8 @@ static void init_instr_table(void) {
 	instr_table[INSTR_LOAD_SAFE] = handle_load_safe;
 	instr_table[INSTR_GET] = handle_get;
 	instr_table[INSTR_GETW] = handle_getw;
+	instr_table[INSTR_WANCHOR] = handle_wanchor;
+	instr_table[INSTR_WTARGET] = handle_wtarget;
 	instr_table[INSTR_ASIGN] = handle_asign;
 
 	instr_table[INSTR_INT] = handle_int;
@@ -10704,6 +11547,7 @@ static void init_instr_table(void) {
 }
 
 bool vm_run(vm_t* vm) {
+	mario_crash_vm = vm;   /* TEMP diag: anchor for the crash-handler scope dump */
 	/* Initialize instruction table on first run */
 	if(!instr_table_initialized) {
 		init_instr_table();
@@ -10742,16 +11586,17 @@ bool vm_run(vm_t* vm) {
 				vm->pc = try_sc->pc;
 				continue;
 			}
-			/* Propagate: unwind this frame's leftover block scopes AND value-stack
-			 * operands back to the entry baselines, so the func_call / call_m_func C
-			 * frame above finds its own func scope on top and its env slot intact.
-			 * Leaving the body's block scopes here made func_call read vm->pc from a
-			 * block scope and pop only one scope, stranding sc+env on the scope stack
-			 * (scope-stack desync -> a later vm_get_scope var is freed -> UAF). */
-			while(vm->scope_stack_top > vm->run_scope_base)
-				vm_pop_scope(vm);
+			/* Propagate: unwind this frame's leftover value-stack operands FIRST,
+			 * then its block scopes, back to the entry baselines. Order matters:
+			 * stack slots can hold scope-binding NODES owned by those scopes
+			 * (vm_push_node refs only node->var, not the var that owns the node),
+			 * so popping the scopes first frees the nodes and the vm_pop() below
+			 * then dereferences freed memory -> SIGBUS. The catch branch above
+			 * already unwinds stack-before-scopes for exactly this reason. */
 			while(vm->stack_top > vm->run_stack_base)
 				vm_pop(vm);
+			while(vm->scope_stack_top > vm->run_scope_base)
+				vm_pop_scope(vm);
 			break;
 		}
 		/* Opportunistic gc safe point: between instructions the value stack and
@@ -10761,12 +11606,46 @@ bool vm_run(vm_t* vm) {
 			vm->gc.gc_pending = false;
 			gc(vm, false);
 		}
+		/* pc bounds: a bad jump target or desync must not read past the code
+		 * buffer (unmapped page -> SIGBUS/SIGSEGV). Combined with the opcode-range
+		 * guard below this turns any corrupt stream into a contained abort. */
+		if(vm->pc >= code_size) {
+			mario_debug("Error: pc %u out of bounds (size %u)\n",
+				(unsigned)vm->pc, (unsigned)code_size);
+			vm->terminated = true;
+			break;
+		}
 		register PC ins = code[vm->pc++];
 		register opr_code_t instr = OP(ins);
 		register uint32_t offset = OFF(ins);
 
+		/* Corrupt-stream guard. OP() is 8 bits (0..255) but instr_table only has
+		 * INSTR_MAX slots, so a garbage instruction word (pc run off the end of
+		 * the code buffer, or a stale word left by a mid-run realloc) would index
+		 * past the table and dispatch through a wild handler pointer - a jump to
+		 * an unmapped address (SIGSEGV at e.g. 0x2000000000000) instead of a
+		 * contained abort. Stop this run; the engine's jsVmExit books it as a cut
+		 * body exactly like a watchdog termination. */
+		if(instr >= INSTR_MAX) {
+			mario_debug("Error: invalid opcode %u at pc=%u\n",
+				(unsigned)instr, (unsigned)(vm->pc - 1));
+			vm->terminated = true;
+			break;
+		}
+
 		if(instr == INSTR_END) {
 			break;
+		}
+
+		if(getenv("MARIO_PCDUMP") != NULL) {
+			PC tgt = (PC)atoi(getenv("MARIO_PCDUMP"));
+			static int pdumped = 0;
+			if(!pdumped && (PC)(vm->pc - 1) == tgt) {
+				pdumped = 1;
+				void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+				fprintf(stderr, "[PCDUMP] window around pc=%u\n", (unsigned)tgt);
+				bc_dump_window(&vm->bc, tgt, 26);
+			}
 		}
 
 		/* Table-based instruction dispatch */

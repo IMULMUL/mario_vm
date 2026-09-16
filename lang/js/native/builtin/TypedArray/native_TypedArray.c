@@ -949,6 +949,25 @@ static void reg_ta_proto(vm_t* vm, var_t* cls) {
 	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_TypedArray_iterator, NULL);
 }
 
+/* Build a fresh TypedArray of element type `et` over a NEW ArrayBuffer holding a
+ * copy of bytes[0..len). Used by TextEncoder.encode (et==TA_UINT8) and any other
+ * native that must hand script a byte view. Returns refs=0; the caller adopts it
+ * as a return value (or roots it) before further allocation. */
+var_t* native_TypedArray_from_bytes(vm_t* vm, int et, const uint8_t* bytes, int64_t len) {
+	if(len < 0)
+		len = 0;
+	vm->gc.gc_defer++;
+	var_t* ta = ta_make(vm, et);
+	var_t* buffer = native_ArrayBuffer_new(vm, (uint32_t)len);
+	var_ref(buffer);
+	if(bytes != NULL && len > 0 && buffer->value != NULL)
+		memcpy(buffer->value, bytes, (size_t)len);
+	ta_setup(vm, ta, et, buffer, 0, len);
+	var_unref(buffer);
+	vm->gc.gc_defer--;
+	return ta;
+}
+
 void reg_native_TypedArray(vm_t* vm) {
 	/* A single shared %TypedArray%.prototype inserted between every concrete
 	 * prototype (Int8Array.prototype, ...) and Object.prototype, so that

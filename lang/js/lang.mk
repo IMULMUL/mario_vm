@@ -31,6 +31,8 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH_BUILTIN)/SharedArrayBuffer/native_SharedArrayBuffer.o \
 	$(NATIVES_PATH_BUILTIN)/Atomics/native_Atomics.o \
 	$(NATIVES_PATH_BUILTIN)/RegExp/native_RegExp.o \
+	$(NATIVES_PATH_BUILTIN)/TextEncoder/native_TextEncoder.o \
+	$(NATIVES_PATH_BUILTIN)/Stream/native_Stream.o \
 	\
 	$(NATIVES_PATH)/natives.o  \
 	$(NATIVES_PATH)/JSON/JSON.o \

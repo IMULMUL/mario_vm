@@ -4,6 +4,8 @@ extern "C" {
 
 #include "native_Map.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define CLS_MAP "Map"
 
@@ -168,6 +170,8 @@ var_t* native_Map_get(vm_t* vm, var_t* env, void* data) {
     map_data* md = get_map(this_v);
     var_t* key = get_obj(env, "key");
     int32_t idx = map_find(md, key);
+    if (getenv("MARIO_WMDBG"))
+        fprintf(stderr, "[WMDBG] GET map=%p key=%p md=%p size=%u idx=%d\n", (void*)this_v, (void*)key, (void*)md, md?md->size:0, idx);
     if (idx < 0) return NULL; /* undefined */
     return md->vals[idx];     /* borrowed; func_call adds the stack ref */
 }
@@ -309,6 +313,8 @@ var_t* native_WeakMap_set(vm_t* vm, var_t* env, void* data) {
         vm_throw_native(vm, "Invalid value used as weak map key");
         return NULL;
     }
+    if (getenv("MARIO_WMDBG"))
+        fprintf(stderr, "[WMDBG] SET map=%p key=%p val=%p md=%p size=%u\n", (void*)this_v, (void*)key, (void*)get_obj(env,"value"), (void*)md, md?md->size:0);
     map_set_impl(this_v, md, key, get_obj(env, "value"));
     return this_v;
 }

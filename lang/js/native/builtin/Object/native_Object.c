@@ -22,12 +22,36 @@ var_t* native_Object_create(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* A callable's [[Prototype]] link: setPrototypeOf stores it in the hidden FPROTO
+ * member (mario conflates `.prototype` - the INSTANCE prototype read by `new` -
+ * with [[Prototype]]), and absent that a function's parent is Function.prototype,
+ * never its own `.prototype`. Reading PROTOTYPE here made isPrototypeOf /
+ * getPrototypeOf walk the instance-prototype chain, so core-js's reparented
+ * typed-array constructors failed its `is not a typed array constructor` check. */
+static var_t* obj_proto_link(vm_t* vm, var_t* v) {
+	if(v == NULL)
+		return NULL;
+	if(v->is_func || v->is_class) {
+		var_t* fp = var_get_callable_proto(v);
+		if(fp != NULL)
+			return fp;
+		var_t* fproto = var_get_prototype(vm->builtin_vars.var_Function); // Function.prototype
+		/* Function.prototype is itself callable but its parent is Object.prototype;
+		 * returning fproto for it would close a one-node cycle and hang every
+		 * prototype-chain walk. */
+		if(v == fproto)
+			return var_get_prototype(vm->builtin_vars.var_Object);
+		return fproto;
+	}
+	return var_get_prototype(v);
+}
+
 var_t* native_Object_getPrototypeOf(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_obj(env, "obj");
 	if(var_is_proxy(obj))
 		return proxy_get_prototype(vm, obj);   // getPrototypeOf trap (owned/NULL)
-	var_t* res = var_get_prototype(obj);
+	var_t* res = obj_proto_link(vm, obj);
 	if(getenv("MARIO_GPODBG") != NULL) {
 		var_t* op = var_get_prototype(vm->builtin_vars.var_Object);
 		fprintf(stderr, "[gpodbg] getPrototypeOf(obj=%p t%u) -> %p  (OP=%p res==OP?%d)\n",
@@ -39,7 +63,29 @@ var_t* native_Object_getPrototypeOf(vm_t* vm, var_t* env, void* data) {
 var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_obj(env, THIS);
-	const char* name = get_str(env, "name");
+	/* Under Function.prototype.call the key arrives positionally, so read arg0
+	 * first and only fall back to the named binding for direct calls. */
+	var_t* keyv = get_func_arg(env, 0);
+	if(keyv == NULL)
+		keyv = get_obj(env, "name");
+	const char* name = NULL;
+	if(keyv != NULL) {
+		/* A symbol key is stored under its "@@S:..." string; a symbol var is not a
+		 * string, so resolve the marker or hasOwnProperty(symbol) is always false -
+		 * which broke core-js's hasOwn-based internal-state brand checks. */
+		if(var_is_symbol(keyv))
+			name = var_symbol_key(keyv);
+		else if(keyv->type == V_STRING)
+			name = var_get_str(keyv);
+	}
+	if(name == NULL && keyv != NULL) {
+		mstr_t* ks = mstr_new("");
+		var_to_str(keyv, ks);
+		node_t* n = var_find_own_member(obj, ks->cstr);
+		bool hit = (n != NULL && n->be_inherited == 0 && n->invisable == 0);
+		mstr_free(ks);
+		return var_new_bool(vm, hit);
+	}
 	node_t* n = var_find_own_member(obj, name);
 	return var_new_bool(vm, (n != NULL && n->be_inherited == 0 && n->invisable == 0));
 }
@@ -159,6 +205,29 @@ var_t* native_enum_keys(vm_t* vm, var_t* env, void* data) {
 		var_properties_num(vm, obj, keys, true);
 		vm->gc.gc_defer--;
 	}
+	if(getenv("MARIO_ENUMDBG") != NULL && keys != NULL) {
+		uint32_t kn = var_array_size(keys);
+		int leak = 0;
+		for(uint32_t z = 0; z < kn; z++) {
+			var_t* kv = var_array_get_var(keys, (int32_t)z);
+			if(kv != NULL && kv->type == V_STRING) {
+				const char* ks = var_get_str(kv);
+				if(ks && (strcmp(ks, "prototype") == 0 || strcmp(ks, "__proto__") == 0)) leak = 1;
+			}
+		}
+		if(leak) {
+			fprintf(stderr, "[ENUMDBG] __enum_keys obj=%p type=%u is_array=%u is_func=%u is_class=%u proto=%p -> keys:",
+				(void*)obj, obj?(unsigned)obj->type:99u, obj?(unsigned)obj->is_array:0u,
+				obj?(unsigned)obj->is_func:0u, obj?(unsigned)obj->is_class:0u,
+				(void*)(obj?var_get_prototype(obj):NULL));
+			for(uint32_t z = 0; z < kn; z++) {
+				var_t* kv = var_array_get_var(keys, (int32_t)z);
+				const char* ks = (kv && kv->type==V_STRING) ? var_get_str(kv) : "?";
+				fprintf(stderr, " [%s]", ks?ks:"?");
+			}
+			fprintf(stderr, "  pc=%u\n", (unsigned)vm->pc);
+		}
+	}
 	return keys;
 }
 
@@ -173,6 +242,15 @@ var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
 	 * version only read `value`, so `{get:f}` installed nothing. */
 	var_t* keyv = (name != NULL) ? name : var_new_str(vm, get_str(env, "name"));
 	if(keyv != name) var_ref(keyv);                       // own the fallback string across the call
+	if(getenv("MARIO_DPDBG") != NULL && obj != NULL &&
+	   (obj == vm->builtin_vars.var_Array || obj == var_get_prototype(vm->builtin_vars.var_Array))) {
+		const char* ks = (keyv != NULL && keyv->type == V_STRING) ? var_get_str(keyv) : "?";
+		var_t* val = (descriptor != NULL) ? var_find_own_member_var(descriptor, "value") : NULL;
+		var_t* getv = (descriptor != NULL) ? var_find_own_member_var(descriptor, "get") : NULL;
+		fprintf(stderr, "[DPDBG] defineProperty obj=%p(isCtor=%d) key=%s desc=%p value=%p(t=%u is_func=%u) get=%p pc=%u\n",
+			(void*)obj, (obj==vm->builtin_vars.var_Array)?1:0, ks?ks:"?", (void*)descriptor,
+			(void*)val, val?(unsigned)val->type:99u, val?(unsigned)val->is_func:0u, (void*)getv, (unsigned)vm->pc);
+	}
 	mario_define_property_var(vm, obj, keyv, descriptor);
 	if(keyv != name) var_unref(keyv);
 	return obj;                                           // spec: returns the target (was NULL, breaking chaining)
@@ -455,7 +533,10 @@ var_t* native_Object_getOwnPropertySymbols(vm_t* vm, var_t* env, void* data) {
 var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_func_arg(env, 0);
+	var_t* keyv = get_func_arg(env, 1);
 	const char* name = get_func_arg_str(env, 1);
+	if(name == NULL && var_is_symbol(keyv))
+		name = var_symbol_key(keyv);
 	if(obj == NULL)
 		return var_new(vm);
 	if(var_is_proxy(obj)) {
@@ -466,6 +547,24 @@ var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) 
 		return (d != NULL) ? d : var_new(vm);
 	}
 	node_t* n = var_find_own_member(obj, name);
+	/* An array's `length` is a virtual own property (the elements live in the
+	 * nested _ARRAY_ store), so var_find_own_member finds no node for it and the
+	 * generic path below returned `undefined`. Synthesize the spec descriptor
+	 * {value, writable:true, enumerable:false, configurable:false}: core-js's
+	 * setArrayLength reads getOwnPropertyDescriptor(O,"length").writable and
+	 * throws "Cannot set read only .length" unless it is exactly true. A string's
+	 * length is the same shape but non-writable/non-configurable. */
+	if(name != NULL && strcmp(name, "length") == 0 &&
+	   (obj->is_array || obj->type == V_STRING)) {
+		uint32_t len = obj->is_array ? var_array_size(obj)
+		                             : (uint32_t)strlen(var_get_str(obj) != NULL ? var_get_str(obj) : "");
+		var_t* d = new_plain_obj(vm);
+		var_add(d, "value", var_new_int(vm, (int)len));
+		var_add(d, "writable", var_new_bool(vm, obj->is_array));
+		var_add(d, "enumerable", var_new_bool(vm, false));
+		var_add(d, "configurable", var_new_bool(vm, false));
+		return d;
+	}
 	if(n == NULL || n->be_inherited)
 		return var_new(vm);
 	var_t* d = new_plain_obj(vm);
@@ -513,10 +612,25 @@ var_t* native_Object_setPrototypeOf(vm_t* vm, var_t* env, void* data) {
 		proxy_set_prototype(vm, obj, proto);   // setPrototypeOf trap
 		return obj;
 	}
-	if(obj != NULL && proto != NULL)
-		var_set_prototype(obj, proto);
+	if(obj != NULL && proto != NULL) {
+		if(obj->is_func || obj->is_class)
+			/* Reparenting a constructor must NOT overwrite its `.prototype`
+			 * own-property (the instance prototype read by `new`); mario shares
+			 * that member with [[Prototype]], so route it to the hidden FPROTO
+			 * link. core-js calls setPrototypeOf on builtin constructors and the
+			 * old path emptied Array.prototype, wiping every array method. */
+			var_set_callable_proto(obj, proto);
+		else
+			var_set_prototype(obj, proto);
+	}
 	if(getenv("MARIO_SPODBG") != NULL) {
-		fprintf(stderr, "[spodbg] setPrototypeOf(obj=%p proto=%p)\n", (void*)obj, (void*)proto);
+		const char* nm = "?";
+		if(obj != NULL) {
+			var_t* nv = var_find_own_member_var(obj, "name");
+			if(nv != NULL && nv->type == V_STRING) { const char* s = var_get_str(nv); if(s) nm = s; }
+		}
+		fprintf(stderr, "[spodbg] setPrototypeOf(obj=%p is_class=%d name=%s proto=%p)\n",
+			(void*)obj, obj?(int)obj->is_class:-1, nm, (void*)proto);
 	}
 	return obj != NULL ? obj : var_new(vm);
 }
@@ -717,11 +831,11 @@ var_t* native_Object_proto_isPrototypeOf(vm_t* vm, var_t* env, void* data) {
         (void)data;
         var_t* self = get_obj(env, THIS);
         var_t* v = get_obj(env, "v");
-        var_t* p = var_get_prototype(v);
+        var_t* p = obj_proto_link(vm, v);
         while(p != NULL) {
                 if(p == self)
                         return var_new_bool(vm, true);
-                p = var_get_prototype(p);
+                p = obj_proto_link(vm, p);
         }
         return var_new_bool(vm, false);
 }

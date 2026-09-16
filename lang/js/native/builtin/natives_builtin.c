@@ -21,6 +21,8 @@
 #include "SharedArrayBuffer/native_SharedArrayBuffer.h"
 #include "Atomics/native_Atomics.h"
 #include "RegExp/native_RegExp.h"
+#include "TextEncoder/native_TextEncoder.h"
+#include "Stream/native_Stream.h"
 
 #ifdef __cplusplus /* __cplusplus */
 extern "C" {
@@ -49,6 +51,8 @@ void reg_builtin_natives(vm_t* vm) {
 	reg_native_SharedArrayBuffer(vm);
 	reg_native_Atomics(vm);
 	reg_native_RegExp(vm);
+	reg_native_TextEncoder(vm);
+	reg_native_Stream(vm);
 }
 
 #ifdef __cplusplus /* __cplusplus */
