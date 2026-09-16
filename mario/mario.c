@@ -1827,18 +1827,52 @@ static inline bool var_empty(var_t* var) {
 	return false;
 }
 
+/* TEMP DIAGNOSTIC (taobao): production bundles swallow their own exceptions in
+ * try/catch and report them to a remote monitor, so a fatal bootstrap error is
+ * invisible. With MARIO_THROWALL set, log EVERY throw (caught or not) with its
+ * message and the throwing pc so the swallowed failure can be read off stderr.
+ * Remove with the other temp probes. */
+static int s_throw_all = -1;
+static void mario_throw_trace(vm_t* vm, const char* kind, const char* message) {
+	if(s_throw_all < 0)
+		s_throw_all = (getenv("MARIO_THROWALL") != NULL) ? 1 : 0;
+	if(!s_throw_all)
+		return;
+	char tagsfx[160] = {0};
+	if(vm->dbg_tag != NULL)
+		snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
+	fprintf(stderr, "[THROWALL] %s pc=%u msg=%s%s\n", kind, (unsigned)vm->pc,
+		message != NULL ? message : "(null)", tagsfx);
+	{ /* caller chain: func-entry pcs up the scope stack, so a swallowed
+	   * polyfill throw can be mapped back to the app frame that invoked it. */
+		scope_t* sc = (vm->scope_stack_top > 0) ? vm->scope_stack[vm->scope_stack_top - 1] : NULL;
+		int hop = 0;
+		while(sc != NULL && hop++ < 12) {
+			if(sc->is_func && sc->func != NULL)
+				fprintf(stderr, "[THROWALL]   frame[%d] entrypc=%u\n", hop, (unsigned)sc->func->pc);
+			sc = sc->prev;
+		}
+	}
+}
+
 void node_free(void* p) {
 	node_t* node = (node_t*)p;
 	if(node == NULL)
 		return;
-	
-	if(node->var != NULL && node->var->vm != NULL) {
-		load_ncache_invalidate(node->var->vm, node);
-	}
-
-
-	if(!var_empty(node->var) && node->var->vm != NULL) {
-		var_unref(node->var);
+	/* TEMP GUARD (taobao crash): a child slot can hold a wild node pointer, and
+	 * node->var can hold the wild value 0x2..3<<48; reading node->var->vm below
+	 * faulted inside var_remove_all's teardown walk. Skip the deref but still
+	 * release the node's own allocations. */
+	if(mario_ptr_wild(node)) { mario_wild_report("node_free.node", node); return; }
+	if(!mario_ptr_wild(node->var)) {
+		if(node->var != NULL && node->var->vm != NULL) {
+			load_ncache_invalidate(node->var->vm, node);
+		}
+		if(!var_empty(node->var) && node->var->vm != NULL) {
+			var_unref(node->var);
+		}
+	} else {
+		mario_wild_report("node_free.node_var", node->var);
 	}
 	mario_free(node->name);
 	mario_free(node);
@@ -4676,6 +4710,7 @@ void vm_throw(vm_t* vm, const char *format, ...) {
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
 
+	mario_throw_trace(vm, "vm_throw", message);
 	var_t* err = var_new_obj(vm, vm->builtin_vars.var_Error, NULL, NULL);
 	var_t* msg = var_find_member_var(err, "message");
 	if(msg != NULL)
@@ -4776,6 +4811,7 @@ void vm_throw_type(vm_t* vm, const char* type_name, const char* format, ...) {
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
 
+	mario_throw_trace(vm, type_name, message);
 	var_t* err = vm_make_type_error(vm, type_name, message);
 	vm_push(vm, err);
 
@@ -6199,6 +6235,17 @@ static int mstr_utf16_length(const char* s) {
  * node so handle_asign can invoke the setter; a read invokes the getter and
  * pushes its result. */
 void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
+	/* TEMP DIAGNOSTIC (taobao): a member fetch whose base is undefined/null is
+	 * the exact site behind "undefined is not an object"; log the property name
+	 * (MARIO_GETUNDEF) so the failing expression can be identified. */
+	if(v != NULL && (v->type == V_UNDEF || v->type == V_NULL)) {
+		static int s_getundef = -1;
+		if(s_getundef < 0) s_getundef = (getenv("MARIO_GETUNDEF") != NULL) ? 1 : 0;
+		if(s_getundef)
+			fprintf(stderr, "[GETUNDEF] %s.%s pc=%u%s%s\n",
+				(v->type == V_NULL) ? "null" : "undef", name, (unsigned)vm->pc,
+				vm->dbg_tag != NULL ? "  [" : "", vm->dbg_tag != NULL ? vm->dbg_tag : "");
+	}
 	/* Proxy intercept: `p.name` routes the get trap (read) or pushes a @@proxyslot
 	 * write-target (assignment). One hash miss for every non-proxy, so the plain
 	 * path below is untouched. */
@@ -11225,6 +11272,13 @@ static inline void handle_import_bind(vm_t* vm, PC ins, opr_code_t instr, uint32
 
 static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	vm_throw_truncate(vm); // the thrown value is on top; drop operands the interrupted expression leaked
+	{ /* TEMP DIAGNOSTIC: log the JS `throw <value>` payload (caught or not). */
+		mstr_t* tts = mstr_new("");
+		var_t* ttv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
+		if(ttv != NULL) var_to_str(ttv, tts);
+		mario_throw_trace(vm, "throw", tts->cstr);
+		mstr_free(tts);
+	}
 	{ /* DIAG (temp): a primitive (non-Error) throw is unusual - React's logCapturedError
 	   * surfaced `console.error(128)`, i.e. an integer was thrown and caught by a class
 	   * error boundary. Dump the throw site (pc) + func-entry pc stack for ANY non-object
@@ -11233,9 +11287,17 @@ static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		if(dbg_throwint < 0) dbg_throwint = (getenv("MARIO_THROWINT") != NULL) ? 1 : 0;
 		if(dbg_throwint) {
 			var_t* itv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
-			if(itv != NULL && itv->type != V_OBJECT && itv->type != V_NULL) {
-				fprintf(stderr, "[throwint] value=%d type=%u at ins=%u pc=%u\n",
-					(int)var_get_int(itv), (unsigned)itv->type, (unsigned)ins, (unsigned)vm->pc);
+			if(itv != NULL) {
+				const char* onm = "";
+				const char* omg = "";
+				if(itv->type == V_OBJECT) {
+					var_t* onv = var_find_own_member_var(itv, "name");
+					if(onv != NULL && onv->type == V_STRING) onm = var_get_str(onv);
+					var_t* omv = var_find_own_member_var(itv, "message");
+					if(omv != NULL && omv->type == V_STRING) omg = var_get_str(omv);
+				}
+				fprintf(stderr, "[throwint] value=%d type=%u objname=%s msg=%s at ins=%u pc=%u\n",
+					(int)var_get_int(itv), (unsigned)itv->type, onm, omg, (unsigned)ins, (unsigned)vm->pc);
 				scope_t* isc = vm_get_scope(vm);
 				int id = 0;
 				while(isc != NULL && id < 24) {

@@ -4,6 +4,7 @@ extern "C" {
 
 #include "native_Stream.h"
 #include <string.h>
+#include <stdio.h>
 
 /* ====== ReadableStream (WHATWG Streams, minimal-but-functional) ======
  * Enough of the surface for app bundles (Next.js RSC / fetch bodies) to build a
@@ -44,15 +45,38 @@ static uint32_t rs_len(var_t* arr) {
 	return (arr != NULL) ? var_array_size(arr) : 0u;
 }
 
-/* Pop the front element, returning an OWNED var (NULL when empty). */
+/* Pop the front element, returning an OWNED var (NULL when empty).
+ * var_array_del removes a key WITHOUT re-indexing the survivors (mario arrays
+ * are index-keyed maps; Array.prototype.shift compensates by rebuilding), so a
+ * bare del(0) would leave index 0 empty while the next chunk still sits at key
+ * "1" - every later read() would then miss index 0 and report done:false with
+ * an undefined chunk forever (an infinite reader.read().then() pump). Rebuild
+ * the queue densely, exactly like native_Array_shift does. */
 static var_t* rs_shift(var_t* arr) {
 	if(arr == NULL || var_array_size(arr) == 0)
 		return NULL;
+	uint32_t sz = var_array_size(arr);
 	var_t* v = var_array_get_var(arr, 0);
 	if(v == NULL)
 		return NULL;
-	var_ref(v);
-	var_array_del(arr, 0);
+	var_ref(v);   /* the owned reference we hand back */
+	vm_t* vm = arr->vm;
+	vm->gc.gc_defer++;
+	var_t* rest = var_new_array(vm);
+	uint32_t i;
+	for(i = 1; i < sz; ++i) {
+		var_t* e = var_array_get_var(arr, (int32_t)i);
+		if(e != NULL) var_array_add(rest, e);
+	}
+	for(i = 0; i < sz; ++i)
+		var_array_del(arr, (int32_t)i);
+	uint32_t rs = var_array_size(rest);
+	for(i = 0; i < rs; ++i) {
+		var_t* e = var_array_get_var(rest, (int32_t)i);
+		if(e != NULL) var_array_add(arr, e);
+	}
+	var_unref(rest);
+	vm->gc.gc_defer--;
 	return v;
 }
 
@@ -189,6 +213,8 @@ static var_t* rs_ctl_close(vm_t* vm, var_t* env, void* data) {
 	var_t* stream = get_obj(ctl, RS_STREAM);
 	if(stream == NULL) return NULL;
 	rs_hidden(stream, RS_CLOSED, var_new_bool(vm, true));
+	if(getenv("MARIO_RSDBG") != NULL)
+		fprintf(stderr, "[rsdbg] close stream=%p\n", (void*)stream);
 	rs_drain_pending(vm, stream, NULL, true, false);
 	return NULL;
 }
@@ -225,6 +251,14 @@ static var_t* rs_reader_read(vm_t* vm, var_t* env, void* data) {
 	var_t* stream = get_obj(reader, RS_STREAM);
 	if(stream == NULL)
 		return rs_promise_settle(vm, "reject", var_new_str(vm, "TypeError: reader has no stream"));
+	{ /* DIAG (temp): why does read() never report done? */
+		if(getenv("MARIO_RSDBG") != NULL) {
+			var_t* dq = get_obj(stream, RS_QUEUE);
+			var_t* dc = get_obj(stream, RS_CLOSED);
+			fprintf(stderr, "[rsdbg] read qlen=%u closed=%d cerr=%p\n",
+				(unsigned)rs_len(dq), (dc != NULL ? (int)var_get_bool(dc) : -1), (void*)dc);
+		}
+	}
 
 	var_t* err = get_obj(stream, RS_ERR);
 	if(err != NULL && err->type != V_UNDEF)
