@@ -796,9 +796,11 @@ var_t* native_Array_copyWithin(vm_t* vm, var_t* env, void* data) {
 	return arr;
 }
 
-/* entries()/keys()/values() return a plain snapshot array so that the common
- * `[...arr.entries()]` spread (and deepEq) work through the array iterator;
- * this mirrors native_Map_entries/native_Set_values. */
+/* entries()/keys()/values() return snapshot ITERATORS (next() +
+ * [Symbol.iterator] returning self) per spec - core-js's iterator detection
+ * (`"next" in [].keys()`, `iter[Symbol.iterator]() === iter`) gates the whole
+ * polyfill install on this. `[...arr.entries()]` spreads drive the iterator
+ * through vm_get_iterator, which resolves the self-returning @@iterator. */
 var_t* native_Array_entries(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* arr = get_obj(env, THIS);
@@ -814,7 +816,7 @@ var_t* native_Array_entries(vm_t* vm, var_t* env, void* data) {
 		var_array_add(ret, pair); // ret owns the only ref to pair
 	}
 	vm->gc.gc_defer--;
-	return ret;
+	return vm_new_array_iterator(vm, ret); /* iterator adopts the snapshot */
 }
 
 var_t* native_Array_keys(vm_t* vm, var_t* env, void* data) {
@@ -827,7 +829,7 @@ var_t* native_Array_keys(vm_t* vm, var_t* env, void* data) {
 	for(i=0; i<sz; ++i)
 		var_array_add(ret, var_new_int(vm, (int)i));
 	vm->gc.gc_defer--;
-	return ret;
+	return vm_new_array_iterator(vm, ret); /* iterator adopts the snapshot */
 }
 
 var_t* native_Array_values(vm_t* vm, var_t* env, void* data) {
@@ -843,7 +845,7 @@ var_t* native_Array_values(vm_t* vm, var_t* env, void* data) {
 	}
 	vm->gc.gc_defer--;
 	var_instance_from(ret, arr);
-	return ret;
+	return vm_new_array_iterator(vm, ret); /* iterator adopts the snapshot */
 }
 
 var_t* native_Array_flat(vm_t* vm, var_t* env, void* data) {

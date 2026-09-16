@@ -25,9 +25,14 @@ static var_t* get_registry(vm_t* vm); /* defined below */
 
 static var_t* make_symbol(vm_t* vm, var_t* proto, const char* key, const char* desc) {
     var_t* sym = var_new_obj(vm, proto, NULL, NULL);
-    var_t* d = var_new_str(vm, desc ? desc : "");
-    node_t* dn = var_add(sym, "description", d);
-    if (dn != NULL) dn->be_unenumerable = 1;
+    /* Only carry an own "description" member when a description was given:
+     * the prototype accessor reports undefined otherwise (spec), which
+     * core-js's `Symbol().description === undefined` detection relies on. */
+    if (desc != NULL && desc[0] != 0) {
+        var_t* d = var_new_str(vm, desc);
+        node_t* dn = var_add(sym, "description", d);
+        if (dn != NULL) dn->be_unenumerable = 1;
+    }
     var_t* k = var_new_str(vm, key);
     node_t* kn = var_add(sym, SYM_MARKER, k);
     if (kn != NULL) { kn->be_unenumerable = 1; kn->invisable = 1; }
@@ -111,17 +116,72 @@ var_t* native_Symbol_keyFor(vm_t* vm, var_t* env, void* data) {
     return NULL; /* undefined */
 }
 
+/* `Symbol.prototype.valueOf()`: the symbol itself (spec). core-js uncurries it
+ * (`tx(od.valueOf)`) for its wrapped description/toString machinery, so it must
+ * exist and accept symbol receivers. */
+var_t* native_Symbol_valueOf(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)data;
+    return get_obj(env, THIS);   /* borrowed, like the jsnative returns */
+}
+
+/* `get Symbol.prototype.description` (ES2019): the symbol's own description
+ * string. Installed as a real accessor so core-js's detection (`"description"
+ * in Symbol.prototype` and `Symbol().description === undefined`) sees native
+ * support and skips its internal-state-based polyfill - whose getterFor throws
+ * 'Incompatible receiver, Symbol required' on mario's native symbols. */
+var_t* native_Symbol_get_description(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = get_obj(env, THIS);
+    var_t* d = (self != NULL) ? var_find_own_member_var(self, "description") : NULL;
+    /* Spec: a symbol created without a description reports undefined, NOT "". */
+    if (d == NULL || d->type != V_STRING)
+        return var_new(vm);
+    return var_new_str(vm, var_get_str(d));
+}
+
+/* `Symbol.prototype[Symbol.toPrimitive](hint)`: the symbol itself. Its mere
+ * presence makes core-js's es.symbol.to-primitive skip its polyfill (which
+ * would route every ToPrimitive(symbol) through the throwing internal-state
+ * check). vm_to_primitive rejects an object result and falls back to the
+ * toString path, which yields "Symbol(desc)" - close enough for site code. */
+var_t* native_Symbol_toPrimitive(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)data;
+    return get_obj(env, THIS);   /* borrowed */
+}
+
 void reg_native_Symbol(vm_t* vm) {
     /* Internal class provides the shared prototype for symbol instances. */
     var_t* cls = vm_new_class(vm, "_Symbol_");
     vm_reg_native(vm, cls, "toString()", native_Symbol_toString, NULL);
+    vm_reg_native(vm, cls, "valueOf()", native_Symbol_valueOf, NULL);
     var_t* proto = var_get_prototype(cls);
+
+    /* `get description` accessor (see native_Symbol_get_description). */
+    {
+        node_t* dn = vm_reg_native_on(vm, proto, "description()", native_Symbol_get_description, NULL);
+        if (dn != NULL && dn->var != NULL) {
+            func_t* gf = var_get_func(dn->var);
+            if (gf != NULL) gf->regular = FUNC_GETTER;
+        }
+    }
+    /* `[Symbol.toPrimitive]` - the member key is the well-known symbol's map key. */
+    {
+        node_t* tn = vm_reg_native_on(vm, proto, SYMKEY_TOPRIMITIVE "(hint)", native_Symbol_toPrimitive, NULL);
+        if (tn != NULL) { tn->be_unenumerable = 1; tn->invisable = 1; }
+    }
 
     /* Global callable Symbol(desc); capture its var so well-known symbols and
      * the registry can hang off it as own members. */
     node_t* symnode = vm_reg_native(vm, NULL, "Symbol(desc)", native_Symbol_call, proto);
     var_t* symfn = (symnode != NULL) ? symnode->var : NULL;
     if (symfn == NULL) return;
+
+    /* `Symbol.prototype` = the shared _Symbol_ prototype: `x instanceof Symbol`
+     * compares the ctor's "prototype" member against the value's proto chain
+     * (functions otherwise get Object.prototype there), and core-js reads
+     * Symbol.prototype directly. call/apply/bind keep working through the
+     * is_func fallbacks in find_func/do_get. */
+    var_set_prototype(symfn, proto);
 
     /* registry backing Symbol.for()/keyFor(); rooted via the Symbol function. */
     var_t* registry = var_new_obj_no_proto(vm, NULL, NULL);

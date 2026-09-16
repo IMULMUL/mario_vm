@@ -4,6 +4,7 @@ extern "C" {
 
 #include "native_Function.h"
 #include <string.h>
+#include <stdio.h>
 
 #define CLS_FUNCTION "Function"
 
@@ -137,12 +138,45 @@ var_t* native_Function_bind(vm_t* vm, var_t* env, void* data) {
 	return bound;   // refs==0 baseline; func_call adopts it
 }
 
+/* Function.prototype.toString(): natives render with the "[native code]"
+ * marker (core-js's inspectSource keys off it to trust builtins and skip
+ * polyfilling them); script functions keep their declared name with a
+ * bytecode placeholder body - mario compiles to bytecode and does not retain
+ * source text. The name comes from the own "name" member when a library set
+ * one, else the hidden @@fname recorded at native registration. */
+var_t* native_Function_toString(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* self = get_obj(env, THIS);
+	/* Class values are callable in a real engine (is_class), so accept them:
+	 * core-js's inspectSource/stringifying paths probe classes through here. */
+	if(self == NULL || (!self->is_func && !self->is_class)) {
+		vm_throw_type_native(vm, "TypeError", "Function.prototype.toString requires that 'this' be a Function");
+		return var_new(vm);
+	}
+	func_t* f = var_get_func(self);
+	const char* nm = "";
+	var_t* nv = var_find_own_member_var(self, "name");
+	if(nv != NULL && nv->type == V_STRING)
+		nm = var_get_str(nv);
+	else {
+		nv = var_find_own_member_var(self, "@@fname");
+		if(nv != NULL && nv->type == V_STRING)
+			nm = var_get_str(nv);
+	}
+	bool is_native = (f != NULL && f->native != NULL);
+	char buf[256];
+	snprintf(buf, sizeof(buf), "function %s() { %s }", nm,
+		is_native ? "[native code]" : "[bytecode]");
+	return var_new_str(vm, buf);
+}
+
 void reg_native_Function(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_FUNCTION);
 	vm->builtin_vars.var_Function = cls;
 	vm_reg_native(vm, cls, "call(thisArg)", native_Function_call, NULL);
 	vm_reg_native(vm, cls, "apply(thisArg, args)", native_Function_apply, NULL);
 	vm_reg_native(vm, cls, "bind(thisArg)", native_Function_bind, NULL);
+	vm_reg_native(vm, cls, "toString()", native_Function_toString, NULL);
 	vm_reg_var(vm, cls, SYMKEY_TOSTRINGTAG, var_new_str(vm, "Function"), true);
 }
 

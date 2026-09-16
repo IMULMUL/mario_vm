@@ -26,6 +26,7 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_ARRAY        : return "ARR";
 		case INSTR_ARRAY_END    : return "ARRE";
 		case INSTR_LOAD         : return "LOAD";
+		case INSTR_LOADW        : return "LOADW";
 		case INSTR_LOAD_SAFE    : return "LOADS";
 		case INSTR_STORE        : return "STORE";
 		case INSTR_JMP          : return "JMP";

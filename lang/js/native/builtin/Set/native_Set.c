@@ -197,7 +197,9 @@ var_t* native_Set_values(vm_t* vm, var_t* env, void* data) {
     var_t* arr = var_new_array(vm);
     for (uint32_t i = 0; i < sd->size; ++i)
         var_array_add(arr, sd->items[i]);
-    return arr;
+    /* Spec: values()/keys() return Set ITERATORS (next() + [Symbol.iterator]),
+     * not arrays - core-js's NATIVE_SET detection calls iter.next() directly. */
+    return vm_new_array_iterator(vm, arr); /* iterator adopts the snapshot */
 }
 
 var_t* native_Set_entries(vm_t* vm, var_t* env, void* data) {
@@ -211,14 +213,22 @@ var_t* native_Set_entries(vm_t* vm, var_t* env, void* data) {
         var_array_add(pair, sd->items[i]);
         var_array_add(arr, pair); // arr's node takes the only ref to pair
     }
-    return arr;
+    return vm_new_array_iterator(vm, arr); /* iterator adopts the snapshot */
 }
 
-/* ES6: Set is iterable. [Symbol.iterator] === values; returns a live snapshot
- * iterator over the current values (insertion order). */
+/* Spec: Set.prototype.size is an ACCESSOR on the prototype, not an own data
+ * member (the synced own member stays as a cheap mirror for direct reads). */
+var_t* native_Set_get_size(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* this_v = get_obj(env, THIS);
+    set_data* sd = get_set(this_v);
+    return var_new_int(vm, (int)sd->size);
+}
+
+/* ES6: Set is iterable. [Symbol.iterator] === values; values() already returns
+ * the snapshot iterator. */
 var_t* native_Set_iterator(vm_t* vm, var_t* env, void* data) {
-    var_t* arr = native_Set_values(vm, env, data); /* refs=0; iterator adopts it */
-    return vm_new_array_iterator(vm, arr);
+    return native_Set_values(vm, env, data);
 }
 
 #define CLS_WEAKSET "WeakSet"
@@ -262,6 +272,7 @@ void reg_native_Set(vm_t* vm) {
     vm_reg_native(vm, cls, "keys()", native_Set_values, NULL);
     vm_reg_native(vm, cls, "entries()", native_Set_entries, NULL);
     vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_Set_iterator, NULL);
+    vm_reg_native(vm, cls, "get size()", native_Set_get_size, NULL);
 
     /* ES6 WeakSet: object members only (identity semantics). True weakness is
      * not observable from scripts here, so members stay alive like Set's. */

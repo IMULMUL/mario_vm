@@ -237,7 +237,9 @@ var_t* native_Map_keys(vm_t* vm, var_t* env, void* data) {
     var_t* arr = var_new_array(vm);
     for (uint32_t i = 0; i < md->size; ++i)
         var_array_add(arr, md->keys[i]);
-    return arr;
+    /* Spec: keys() returns a Map ITERATOR (next() + [Symbol.iterator]), not an
+     * array - core-js's NATIVE_MAP detection calls iter.next() directly. */
+    return vm_new_array_iterator(vm, arr); /* iterator adopts the snapshot */
 }
 
 var_t* native_Map_values(vm_t* vm, var_t* env, void* data) {
@@ -247,7 +249,7 @@ var_t* native_Map_values(vm_t* vm, var_t* env, void* data) {
     var_t* arr = var_new_array(vm);
     for (uint32_t i = 0; i < md->size; ++i)
         var_array_add(arr, md->vals[i]);
-    return arr;
+    return vm_new_array_iterator(vm, arr); /* iterator adopts the snapshot */
 }
 
 var_t* native_Map_entries(vm_t* vm, var_t* env, void* data) {
@@ -261,14 +263,25 @@ var_t* native_Map_entries(vm_t* vm, var_t* env, void* data) {
         var_array_add(pair, md->vals[i]);
         var_array_add(arr, pair); // arr's node takes the only ref to pair
     }
-    return arr;
+    return vm_new_array_iterator(vm, arr); /* iterator adopts the snapshot */
 }
 
 /* ES6: Map is iterable; [Symbol.iterator] === entries, yielding [key, value]
- * pairs in insertion order. The iterator drives a snapshot array. */
+ * pairs in insertion order. entries() already returns the snapshot iterator. */
 var_t* native_Map_iterator(vm_t* vm, var_t* env, void* data) {
-    var_t* arr = native_Map_entries(vm, env, data); /* refs=0; iterator adopts it */
-    return vm_new_array_iterator(vm, arr);
+    return native_Map_entries(vm, env, data);
+}
+
+/* Spec: Map.prototype.size is an ACCESSOR on the prototype (live getter),
+ * not an own data member - core-js extracts it via
+ * Object.getOwnPropertyDescriptor(Map.prototype, "size").get. The synced own
+ * "size" data member stays (cheap mirror for direct reads); the accessor only
+ * matters for descriptor inspection and receiver-checked calls. */
+var_t* native_Map_get_size(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* this_v = get_obj(env, THIS);
+    map_data* md = get_map(this_v);
+    return var_new_int(vm, (int)md->size);
 }
 
 #define CLS_WEAKMAP "WeakMap"
@@ -313,6 +326,7 @@ void reg_native_Map(vm_t* vm) {
     vm_reg_native(vm, cls, "values()", native_Map_values, NULL);
     vm_reg_native(vm, cls, "entries()", native_Map_entries, NULL);
     vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_Map_iterator, NULL);
+    vm_reg_native(vm, cls, "get size()", native_Map_get_size, NULL);
 
     /* ES6 WeakMap: same storage/identity semantics as Map but keys must be
      * objects. True weakness is not observable from scripts here, so entries

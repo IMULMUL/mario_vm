@@ -3368,6 +3368,11 @@ bool base(lex_t* l, bytecode_t* bc) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
             } else if (OP(last) == INSTR_ARRAY_AT) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
+            } else if ((op == '=' || arith_compound) && OP(last) == INSTR_LOAD) {
+                /* Bare-name target (`x = v`): plain LOAD invokes an accessor
+                 * getter now, so retarget the binding fetch to LOADW, which
+                 * keeps the raw node for ASIGN / compound-math write-back. */
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_LOADW, OFF(last));
             }
         }
         if (!base(l, bc)) {

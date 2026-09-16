@@ -4729,6 +4729,57 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		char tagsfx[160] = {0};
 		if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
 		mario_printf("Uncaught RangeError: Maximum call stack size exceeded%s\n", tagsfx);
+		{ /* DIAG (temp): dump the top of the call chain so the recursion pair
+		   * (which func_pcs alternate) can be identified. */
+		        static int dbg_depth = -1;
+		        if(dbg_depth < 0) dbg_depth = (getenv("MARIO_THROWDBG") != NULL) ? 1 : 0;
+		        if(dbg_depth) {
+		                scope_t* dsc = vm_get_scope(vm);
+		                int dd = 0, ddp = 0;
+		                while(dsc != NULL && dd < 24) {
+		                        if(dsc->is_func && dsc->func != NULL) {
+		                                const char* dnm = NULL;
+		                                if(dsc->func_var != NULL) {
+		                                        var_t* dnv = var_find_own_member_var(dsc->func_var, "name");
+		                                        if(dnv == NULL || dnv->type != V_STRING)
+		                                                dnv = var_find_own_member_var(dsc->func_var, "@@fname");
+		                                        if(dnv != NULL && dnv->type == V_STRING) dnm = var_get_str(dnv);
+		                                }
+		                                fprintf(stderr, "[depthdbg]   frame func_pc=%u name=%s\n",
+		                                                (unsigned)dsc->func->pc, dnm != NULL ? dnm : "?");
+		                                /* The caller's call site sits at resume_pc - 1;
+		                                 * named CALL(0x12)/CALLO(0x13) carry the callee
+		                                 * name as the string operand. */
+		                                if(dsc->pc > 0 && dsc->pc <= vm->bc.cindex) {
+		                                        PC cw = vm->bc.code_buf[dsc->pc - 1];
+		                                        PC cop = OP(cw);
+		                                        if(cop == 0x12 || cop == 0x13)
+		                                                fprintf(stderr, "[depthdbg]     callsite pc=%u callee=%s\n",
+		                                                                (unsigned)(dsc->pc - 1), bc_getstr(&vm->bc, cw & 0xFFFFF));
+		                                }
+		                                /* First self-repeated frame: dump that function's
+		                                 * opening instructions with string operands decoded. */
+		                                static PC prev_pc_dumped = 0;
+		                                PC this_fpc = (PC)dsc->func->pc;
+		                                if(prev_pc_dumped != (PC)-1 && prev_pc_dumped == this_fpc) {
+		                                        prev_pc_dumped = (PC)-1; /* dump once */
+		                                        PC base = dsc->func->pc;
+		                                        for(PC q = base; q < base + 24 && q < vm->bc.cindex; q++) {
+		                                                PC iw = vm->bc.code_buf[q];
+		                                                PC iop = OP(iw), ioff = iw & 0xFFFFF;
+		                                                bool hs = (iop==0x03||iop==0x06||iop==0x09||iop==0x0e||iop==0x0f||
+		                                                                iop==0x12||iop==0x13||iop==0x17||iop==0x47||iop==0x64||iop==0x94);
+		                                                fprintf(stderr, "[depthdbg]     body pc=%u op=%02x%s%s\n", (unsigned)q, (unsigned)iop,
+		                                                        hs ? " str=" : "", hs ? bc_getstr(&vm->bc, ioff) : "");
+		                                        }
+		                                }
+		                                prev_pc_dumped = this_fpc;
+		                        }
+		                        dsc = dsc->prev;
+		                        dd++;
+		                }
+		        }
+		}
 		vm_terminate(vm);
 		ret = NULL;
 	}
@@ -5012,12 +5063,17 @@ static bool wslot_write(vm_t* vm, node_t* n, var_t* val) {
 	var_t* key = wslot_key(n);
 	if(obj != NULL && key != NULL) {
 		node_t* tn = NULL;
-		if(var_is_symbol(key)) {
-			const char* sk = var_symbol_key(key);
-			if(sk != NULL) tn = var_find_member_create(obj, sk);
-		}
-		else if(key->type == V_STRING) {
-			tn = var_find_member_create(obj, var_get_str(key));
+		/* [[Set]] shadowing: the write target must be an OWN member of the
+		 * receiver - writing through a prototype-chain node would mutate the
+		 * ancestor (the `Sub.prototype.constructor = Sub` clobbering bug). */
+		const char* wk = NULL;
+		if(var_is_symbol(key))
+			wk = var_symbol_key(key);
+		else if(key->type == V_STRING)
+			wk = var_get_str(key);
+		if(wk != NULL) {
+			tn = var_find_own_member(obj, wk);
+			if(tn == NULL) tn = var_add(obj, wk, NULL);
 		}
 		else if(obj->is_array) {
 			tn = var_array_get(obj, var_get_int(key));
@@ -5025,7 +5081,8 @@ static bool wslot_write(vm_t* vm, node_t* n, var_t* val) {
 		else {
 			char kb[32];
 			snprintf(kb, sizeof(kb), "%d", var_get_int(key));
-			tn = var_find_member_create(obj, kb);
+			tn = var_find_own_member(obj, kb);
+			if(tn == NULL) tn = var_add(obj, kb, NULL);
 		}
 		if(tn != NULL)
 			node_replace(tn, val);      /* write through the receiver's real node (refs val) */
@@ -5633,6 +5690,20 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 			}
 		}
 	}
+	/* Function.prototype.name / .length: the Function prototype is not in a
+	 * function's member chain, so resolve the two universal read-only values
+	 * here: the registered name (@@fname, stored at native registration) and
+	 * the declared arity. Own/inherited members still win (n != NULL skips). */
+	if(!for_write && n == NULL && (v->is_func || v->is_class) && strcmp(name, "name") == 0) {
+		var_t* fnv = var_find_own_member_var(v, "@@fname");
+		vm_push(vm, var_new_str(vm, (fnv != NULL && fnv->type == V_STRING) ? var_get_str(fnv) : ""));
+		return;
+	}
+	if(!for_write && n == NULL && v->is_func && strcmp(name, "length") == 0) {
+		func_t* f = var_get_func(v);
+		vm_push(vm, var_new_int(vm, (f != NULL) ? (int)f->args.size : 0));
+		return;
+	}
 	/* Reading `.call`/`.apply`/`.bind` off a callable: the universal Function
 	 * methods are resolved here (same fallback find_func uses for calls) so
 	 * `var c = f.call` and `typeof f.call` behave like a real engine. */
@@ -5677,6 +5748,20 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 			vm_push(vm, var_new(vm));
 			return;
 		}
+	}
+	else if(for_write && v->type == V_OBJECT) {
+		/* [[Set]] shadowing: a DATA member resolved up the prototype chain must be
+		 * written as an OWN member of the receiver - pushing the ancestor's node
+		 * here made handle_asign overwrite the shared prototype member
+		 * (`Sub.prototype.constructor = Sub` clobbered Error.prototype.constructor,
+		 * recursing every later `new Error()` back into Sub). Accessor nodes already
+		 * returned above: an inherited setter is correctly invoked through the
+		 * ancestor node with this=receiver. */
+		node_t* own = var_find_own_member(v, name);
+		if(own == NULL)
+			own = var_add(v, name, NULL);
+		if(own != NULL)
+			n = own;
 	}
 
 	/* Read path: if v is transient the caller releases it right after we return,
@@ -5850,7 +5935,18 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 		constructor = ctor_var;
 	}
 	else {
-		constructor = var_find_member_var(protoV, CONSTRUCTOR);
+		/* Prefer the constructor PINNED on the class var at definition time
+		 * ("@@ctor") over the prototype's public "constructor" member: per spec,
+		 * [[Construct]] belongs to the class object, while X.prototype.constructor
+		 * is just a writable data property. core-js's typed-array wrapper does
+		 * `TA.prototype.constructor = wrapper` - dispatching through the prototype
+		 * then re-entered the wrapper on every `new TA(...)`, recursing until the
+		 * call-depth guard fired. */
+		node_t* pn = var_find_own_member(ctor_var, "@@ctor");
+		if(pn != NULL && pn->var != NULL && !var_empty(pn->var))
+			constructor = pn->var;
+		else
+			constructor = var_find_member_var(protoV, CONSTRUCTOR);
 	}
 
 	if(constructor != NULL) {
@@ -6115,6 +6211,11 @@ var_t* vm_new_class(vm_t* vm, const char* cls) {
 	 * would treat an is_func class var as a plain function object (no func_t),
 	 * breaking `new`. is_class is read only by get_typeof(). */
 	cls_var->is_class = 1;
+	{ /* V8-style internal name slot: Class.name reads it via the do_get
+	   * fallback below, Function.prototype.toString renders it. */
+		node_t* fnn = var_add(cls_var, "@@fname", var_new_str(vm, cls));
+		if(fnn != NULL) { fnn->invisable = 1; fnn->be_unenumerable = 1; }
+	}
 	if(var_get_prototype(cls_var) == NULL) {
 		var_set_prototype(cls_var, var_new_obj_no_proto(vm, NULL, NULL));
 	}
@@ -6244,7 +6345,35 @@ static inline void handle_njmp(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	var_unref(v);
 }
 
-static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe) {
+/* Receiver for a bare-name accessor read: the innermost scope var whose member
+ * lookup yields exactly this binding node (the with-object for `with (document)`
+ * reads like `body`), so the getter runs with the same `this` a member read
+ * would use. NULL when no scope provides it (getter then runs receiverless). */
+static var_t* vm_accessor_scope_owner(vm_t* vm, const char* name, node_t* node) {
+	scope_t* sc = vm_get_scope(vm);
+	int guard = 0;
+	while(sc != NULL) {
+		if(++guard > VM_SCOPE_STACK_MAX)
+			break;
+		if(!var_empty(sc->var)) {
+			if(sc->is_with) {
+				if(var_find_member(sc->var, name) == node)
+					return sc->var;
+			}
+			else {
+				if(var_find_own_member(sc->var, name) == node)
+					return sc->var;
+				var_t* obj = get_obj(sc->var, THIS);
+				if(obj != NULL && var_find_member(obj, name) == node)
+					return obj;
+			}
+		}
+		sc = sc->prev;
+	}
+	return NULL;
+}
+
+static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool raw) {
 	bool loaded = false;
 	node_t* node = NULL;
 	if(offset == vm->this_strIndex) {
@@ -6279,6 +6408,26 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe) {
 			var_t* var = vm_get_scope_var(vm);
 			node = var_add(var, s, NULL);
 		}
+		/* Rvalue read of an accessor binding (e.g. `body` inside `with(document)`):
+		 * invoke the getter and push its result. The receiver is the innermost
+		 * scope var that provided the binding (the with-object), matching member
+		 * access semantics; without this the raw accessor var leaks as the value
+		 * and `with(body)` scopes a getter wrapper instead of the body element.
+		 * Assignment targets are retargeted to INSTR_LOADW by the compiler and
+		 * skip this so the raw node reaches the write path. */
+		if(!raw && node->var != NULL && var_is_accessor(node->var)) {
+			var_t* getter = var_accessor_getter(node->var);
+			if(getter != NULL) {
+				var_t* owner = vm_accessor_scope_owner(vm, s, node);
+				var_ref(getter);           /* protect across the nested run */
+				func_call(vm, owner, getter, 0); /* pushes the getter's return value */
+				var_unref(getter);
+			}
+			else {
+				vm_push(vm, var_new(vm));
+			}
+			return; /* never cache an accessor result */
+		}
 		vm_push_node(vm, node);
 	}
 
@@ -6290,13 +6439,20 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe) {
 }
 
 static inline void handle_load(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
-	handle_load_impl(vm, offset, false);
+	handle_load_impl(vm, offset, false, false);
+}
+
+/* LOADW: assignment-target form of LOAD - always pushes the raw binding node
+ * (the compiler retargets the target LOAD of `x = v` / `x += v`), so accessor
+ * setters see their node instead of the getter's result. */
+static inline void handle_loadw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	handle_load_impl(vm, offset, false, true);
 }
 
 /* LOAD_SAFE $n: the direct bare-identifier operand of `typeof`. Resolution is
  * identical to LOAD; only an unresolvable name differs (undefined, no throw). */
 static inline void handle_load_safe(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
-	handle_load_impl(vm, offset, true);
+	handle_load_impl(vm, offset, true, false);
 }
 
 static inline void handle_compare(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -7534,6 +7690,13 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 			obj = vm_this_in_scopes(vm);
 			func = find_func(vm, sc_var, name->cstr);
 		}
+		/* DIAG (temp): trace how `Error` resolves inside constructor frames. */
+		if(getenv("MARIO_ERRDBG") && strcmp(name->cstr, "Error") == 0) {
+			scope_t* csc = vm_get_scope(vm);
+			fprintf(stderr, "[errdbg] Error -> func=%p (is_func=%d is_class=%d) via %s; caller_funcvar=%p obj=%p\n",
+				(void*)func, func ? (int)func->is_func : -1, func ? (int)func->is_class : -1,
+				wobj ? "with" : "scopes", (csc != NULL && csc->is_func) ? (void*)csc->func_var : NULL, (void*)obj);
+		}
 	}
 
 	if(func == NULL && obj != NULL)
@@ -7620,6 +7783,26 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		        mario_debug("Error: can not find function '%s'!  [%s]\n", name->cstr, vm->dbg_tag);
 		else
 		        mario_debug("Error: can not find function '%s'!\n", name->cstr);
+		if(getenv("MARIO_CALLDBG") != NULL) {
+			scope_t* csc = vm_get_scope(vm);
+			fprintf(stderr, "[calldbg] miss '%s' at pc=%u caller_fpc=%u\n", name->cstr,
+					(unsigned)(vm->pc > 0 ? vm->pc - 1 : 0),
+					(csc != NULL && csc->func != NULL) ? (unsigned)csc->func->pc : 0);
+			if(csc != NULL && csc->is_func && csc->func != NULL) {
+				var_t* cl = csc->func->closure.var;
+				func_t* cf = csc->func->closure.func;
+				int hop = 0;
+				while(cl != NULL && hop++ < 12) {
+					node_t* fn2 = var_find_own_member(cl, name->cstr);
+					fprintf(stderr, "[calldbg]   closure[%d] var=%p has=%d\n", hop, (void*)cl, fn2 != NULL ? 1 : 0);
+					node_t* lex = var_find_own_member(cl, "@@lex");
+					if(lex != NULL && !var_empty(lex->var)) { cl = lex->var; continue; }
+					if(cf == NULL) break;
+					cl = cf->closure.var;
+					cf = cf->closure.func;
+				}
+			}
+		}
 		vm_throw(vm, "can not find function '%s'!", name->cstr);
 		vm->gc.gc_defer--;
 	}
@@ -7936,6 +8119,8 @@ static var_t* native_string_iter_next(vm_t* vm, var_t* env, void* data) {
 }
 
 /* Build an array/string iterator over `src`. Returns with refs=0 (caller owns). */
+static var_t* native_gen_self(vm_t* vm, var_t* env, void* data);
+
 static var_t* new_native_iter(vm_t* vm, var_t* src, bool is_string) {
 	var_t* iter = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
 	node_t* sn = var_add(iter, "@@src", src);
@@ -7944,6 +8129,9 @@ static var_t* new_native_iter(vm_t* vm, var_t* src, bool is_string) {
 	if(in != NULL) { in->invisable = 1; in->be_unenumerable = 1; }
 	vm_reg_native_on(vm, iter, "next()",
 		is_string ? native_string_iter_next : native_array_iter_next, NULL);
+	/* Iterator protocol: [Symbol.iterator]() on an iterator returns the iterator
+	 * itself - core-js's checkCorrectnessOfIteration requires it. */
+	vm_reg_native_on(vm, iter, SYMKEY_ITERATOR"()", native_gen_self, NULL);
 	return iter;
 }
 
@@ -8801,6 +8989,25 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 		var_unref(v2);
 		return;
 	}
+	/* [[Set]] shadowing for computed keys (same rule as do_get): a data member
+	 * resolved through the prototype chain is shadowed by an own member on the
+	 * receiver, never written through to the ancestor. Only the string/symbol
+	 * paths can hit an inherited member (numeric keys resolve via var_array_get
+	 * inside the receiver's own _ARRAY_). Accessor nodes were handled above. */
+	if(for_write && n != NULL && v1->type == V_OBJECT) {
+		const char* wk = NULL;
+		if(var_is_symbol(v2))
+			wk = var_symbol_key(v2);
+		else if(v2->type == V_STRING)
+			wk = var_get_str(v2);
+		if(wk != NULL) {
+			node_t* own = var_find_own_member(v1, wk);
+			if(own == NULL)
+				own = var_add(v1, wk, NULL);
+			if(own != NULL)
+				n = own;
+		}
+	}
 	if(for_write && v1->refs <= 1) {
 		/* Computed write on a TRANSIENT receiver (`getArr()[i] = v`, `f()["k"] = v`):
 		 * the node lives inside v1 and would dangle once v1 is released below, and
@@ -8961,6 +9168,16 @@ static inline void handle_class_end(vm_t* vm, PC ins, opr_code_t instr, uint32_t
 	var_t* cls = (sc != NULL) ? sc->class_var : NULL;
 	if(cls == NULL)
 		cls = vm_get_scope_var(vm);
+	/* Pin the class body's own constructor (if any) on the class var as the
+	 * hidden "@@ctor" - same protection as native classes get in vm_reg_native. */
+	if(cls != NULL && var_find_own_member(cls, "@@ctor") == NULL) {
+		var_t* protoV = var_get_prototype(cls);
+		node_t* cn = (protoV != NULL) ? var_find_own_member(protoV, CONSTRUCTOR) : NULL;
+		if(cn != NULL && cn->var != NULL && cn->var->is_func) {
+			node_t* an = var_add(cls, "@@ctor", cn->var);
+			if(an != NULL) { an->invisable = 1; an->be_unenumerable = true; }
+		}
+	}
 	vm_push(vm, cls);
 	vm_pop_scope(vm);
 }
@@ -9923,6 +10140,50 @@ static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	vm_throw_truncate(vm); // the thrown value is on top; drop operands the interrupted expression leaked
 	scope_t* try_sc = vm_find_inrange_try(vm);
 	if(try_sc == NULL) {
+		/* DIAG (temp): uncaught-throw forensics - dump the throw-site pc, the thrown
+		 * message, and the func-entry pc stack, so the site can be located in a
+		 * bc_dump disassembly of the same script. */
+		static int dbg_throw = -1;
+		if(dbg_throw < 0) dbg_throw = (getenv("MARIO_THROWDBG") != NULL) ? 1 : 0;
+		if(dbg_throw) {
+			var_t* dtv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
+			const char* dmsg = "";
+			if(dtv != NULL && dtv->type == V_OBJECT) {
+				var_t* dmv = var_find_own_member_var(dtv, "message");
+				if(dmv != NULL && dmv->type == V_STRING) dmsg = var_get_str(dmv);
+			}
+			fprintf(stderr, "[throwdbg] uncaught throw at ins=%u msg=%s\n", (unsigned)ins, dmsg);
+			scope_t* dsc = vm_get_scope(vm);
+			int dd = 0, ddf = 0;
+			while(dsc != NULL && dd < 32) {
+				if(dsc->is_func && dsc->func != NULL) {
+					const char* dnm = NULL;
+					if(dsc->func_var != NULL) {
+						var_t* dnv = var_find_own_member_var(dsc->func_var, "name");
+						if(dnv == NULL || dnv->type != V_STRING)
+							dnv = var_find_own_member_var(dsc->func_var, "@@fname");
+						if(dnv != NULL && dnv->type == V_STRING) dnm = var_get_str(dnv);
+					}
+					fprintf(stderr, "[throwdbg]   frame func_pc=%u name=%s\n",
+							(unsigned)dsc->func->pc, dnm != NULL ? dnm : "?");
+					if(ddf <= 1 && getenv("MARIO_THROWDBG_BODY") != NULL) {
+						PC base = dsc->func->pc;
+						for(PC q = base; q < base + 20 && q < vm->bc.cindex; q++) {
+							PC iw = vm->bc.code_buf[q];
+							PC iop = OP(iw), ioff = iw & 0xFFFFF;
+							bool hs = (iop==0x03||iop==0x06||iop==0x09||iop==0x0e||iop==0x0f||
+									iop==0x12||iop==0x13||iop==0x17||iop==0x47||iop==0x64||iop==0x94);
+							fprintf(stderr, "[throwdbg]     body pc=%u op=%02x%s%s\n", (unsigned)q, (unsigned)iop,
+									hs ? " str=" : "", hs ? bc_getstr(&vm->bc, ioff) : "");
+						}
+						fprintf(stderr, "[throwdbg]     live pc=%u\n", (unsigned)vm->pc);
+					}
+					ddf++;
+				}
+				dsc = dsc->prev;
+				dd++;
+			}
+		}
 		/* Unhandled user throw: propagate outward (a vm_run frame with an
 		 * in-range catch consumes it; the script top reports it). */
 		var_t* tv = (vm->stack_top > 0) ? (var_t*)vm->stack[vm->stack_top - 1] : NULL;
@@ -9990,6 +10251,7 @@ static void init_instr_table(void) {
 	instr_table[INSTR_VAR] = handle_var;
 	instr_table[INSTR_CONST] = handle_const;
 	instr_table[INSTR_LOAD] = handle_load;
+	instr_table[INSTR_LOADW] = handle_loadw;
 	instr_table[INSTR_LOAD_SAFE] = handle_load_safe;
 	instr_table[INSTR_GET] = handle_get;
 	instr_table[INSTR_GETW] = handle_getw;
@@ -10386,6 +10648,11 @@ static node_t* reg_native_to(vm_t* vm, var_t* target, const char* decl, native_f
 	func->data = data;
 
 	const char *off = decl;
+	/* Native accessor decls ("get size()" / "set size(v)"): register under the
+	 * bare property name with func_t.regular marking the accessor kind, so
+	 * do_get/handle_asign invoke it exactly like a script `get size(){}`. */
+	if(strncmp(decl, "get ", 4) == 0) { func->regular = FUNC_GETTER; off = decl + 4; }
+	else if(strncmp(decl, "set ", 4) == 0) { func->regular = FUNC_SETTER; off = decl + 4; }
 	//read name
 	while(*off != '(') { 
 		if(*off != ' ') //skip spaces
@@ -10408,7 +10675,18 @@ static node_t* reg_native_to(vm_t* vm, var_t* target, const char* decl, native_f
 	mstr_free(arg);
 
 	var_t* var = var_new_func(vm, func);
-	node_t* node = var_add(cls_var, name->cstr, var);
+	node_t* node = NULL;
+	if(func->regular == FUNC_GETTER || func->regular == FUNC_SETTER) {
+		/* Accessor pair registered in two passes ("get x" + "set x"): merge into
+		 * the existing accessor node instead of replacing it. */
+		node_t* ex = var_find_own_member(cls_var, name->cstr);
+		if(ex != NULL && ex->var != NULL && var_is_accessor(ex->var)) {
+			merge_accessor(ex, var);
+			node = ex;
+		}
+	}
+	if(node == NULL)
+		node = var_add(cls_var, name->cstr, var);
 	node->be_unenumerable = true;
 	/* Remember the declared name on the function var itself so
 	 * Function.prototype.toString can render `function name() { [native code] }`
@@ -10434,7 +10712,15 @@ node_t* vm_reg_native(vm_t* vm, var_t* cls, const char* decl, native_func_t nati
 	if(cls != NULL) {
 		cls_var = var_get_prototype(cls);
 	}
-	return reg_native_to(vm, cls_var, decl, native, data);
+	node_t* n = reg_native_to(vm, cls_var, decl, native, data);
+	/* Pin the real constructor on the class var itself (hidden "@@ctor") so
+	 * new_obj_with_ctor() survives scripts overwriting the prototype's public
+	 * "constructor" member (see the call site there). */
+	if(cls != NULL && n != NULL && strncmp(decl, "constructor(", 12) == 0) {
+		node_t* cn = var_add(cls, "@@ctor", n->var);
+		if(cn != NULL) { cn->invisable = 1; cn->be_unenumerable = true; }
+	}
+	return n;
 }
 
 node_t* vm_reg_static(vm_t* vm, var_t* cls, const char* decl, native_func_t native, void* data) {

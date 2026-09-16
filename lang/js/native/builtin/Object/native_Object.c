@@ -463,6 +463,24 @@ var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) 
 	if(n == NULL || n->be_inherited)
 		return var_new(vm);
 	var_t* d = new_plain_obj(vm);
+	/* Accessor members (func_t.regular == FUNC_GETTER/FUNC_SETTER, the setter
+	 * hanging off the getter as FUNC_SETTER_KEY) report an accessor descriptor
+	 * {get,set,enumerable,configurable}; everything else is a data descriptor.
+	 * core-js extracts native accessors via descriptor[key] (e.g. the
+	 * Map.prototype.size getter), so reporting accessors as {value: fn} breaks
+	 * its getBuiltInAccessor extraction. */
+	func_t* nf = (n->var != NULL && n->var->is_func) ? var_get_func(n->var) : NULL;
+	if(nf != NULL && (nf->regular == FUNC_GETTER || nf->regular == FUNC_SETTER)) {
+		var_t* getter = (nf->regular == FUNC_GETTER) ? n->var : NULL;
+		var_t* setter = (nf->regular == FUNC_SETTER) ? n->var : NULL;
+		if(getter != NULL && setter == NULL)
+			setter = get_obj(getter, FUNC_SETTER_KEY);
+		var_add(d, "get", getter != NULL ? getter : var_new(vm));
+		var_add(d, "set", setter != NULL ? setter : var_new(vm));
+		var_add(d, "enumerable", var_new_bool(vm, !n->be_unenumerable));
+		var_add(d, "configurable", var_new_bool(vm, !n->be_const));
+		return d;
+	}
 	var_add(d, "value", n->var != NULL ? n->var : var_new(vm));
 	var_add(d, "writable", var_new_bool(vm, !n->be_const));
 	var_add(d, "enumerable", var_new_bool(vm, !n->be_unenumerable));
@@ -707,8 +725,39 @@ var_t* native_Object_proto_propEnum(vm_t* vm, var_t* env, void* data) {
         return var_new_bool(vm, (n != NULL && n->be_unenumerable == 0 && n->invisable == 0));
 }
 
+/* Object(value) coercion (spec): `new Object()` / `Object(null|undefined)`
+ * yields the fresh object; an object argument - symbols included, they are
+ * V_OBJECT in mario - is returned AS IS, so `Object(sym) instanceof Symbol`
+ * holds (core-js's NATIVE_SYMBOL detection depends on exactly that check);
+ * a primitive is wrapped by relinking the fresh object to the matching
+ * builtin prototype. Return contract: borrowed refs, func_call refs it. */
+var_t* native_Object_constructor(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        var_t* this_v = get_obj(env, THIS);
+        var_t* v = get_obj(env, "value");
+        if(v == NULL || v->type == V_UNDEF || v->type == V_NULL)
+                return this_v;
+        if(v->type == V_OBJECT)
+                return v; /* passthrough: keeps the identity and proto chain */
+        var_t* wrap_cls = NULL;
+        switch(v->type) {
+                case V_STRING: wrap_cls = vm->builtin_vars.var_String; break;
+                case V_INT: case V_FLOAT: case V_INT64: case V_FLOAT64:
+                        wrap_cls = vm->builtin_vars.var_Number; break;
+                case V_BIGINT: wrap_cls = vm->builtin_vars.var_BigInt; break;
+                default: break; /* V_BOOL: no Boolean builtin class */
+        }
+        if(wrap_cls != NULL) {
+                var_t* wp = var_get_prototype(wrap_cls);
+                if(wp != NULL)
+                        var_set_prototype(this_v, wp);
+        }
+        return this_v;
+}
+
 void reg_native_Object(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_OBJECT);
+	vm_reg_native(vm, cls, "constructor(value)", native_Object_constructor, NULL);
 	vm_reg_static(vm, cls, "create(proto)", native_Object_create, NULL); 
 	vm_reg_static(vm, cls, "getPrototypeOf(obj)", native_Object_getPrototypeOf, NULL); 
 	vm_reg_static(vm, cls, "hasOwnProperty(name)", native_Object_hasOwnProperty, NULL); 

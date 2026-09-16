@@ -124,7 +124,29 @@ int main(int argc, char** argv) {
 	vm_init(vm, reg_all_natives, NULL);
 
 	init_args(vm, argc, argv);
-
+	
+	/* MARIO_DUMPC=1: compile only (no run) and dump the bytecode - used to
+	 * map runtime throw pcs (see MARIO_THROWDBG) onto disassembly without
+	 * needing a DOM. */
+	if(getenv("MARIO_DUMPC") != NULL && _fname[0] != 0) {
+	        FILE* f = fopen(_fname, "rb");
+	        if(f == NULL) { printf("cannot open %s\n", _fname); return -1; }
+	        fseek(f, 0, SEEK_END);
+	        long sz = ftell(f);
+	        fseek(f, 0, SEEK_SET);
+	        char* buf = (char*)malloc(sz + 1);
+	        if(buf == NULL || fread(buf, 1, sz, f) != (size_t)sz) { fclose(f); return -1; }
+	        buf[sz] = 0;
+	        fclose(f);
+	        if(!js_compile(&vm->bc, buf)) { printf("compile failed\n"); free(buf); return -1; }
+	        free(buf);
+	        mstr_t* dump = bc_dump(&vm->bc);
+	        if(dump != NULL) { _platform_out(dump->cstr); mstr_free(dump); }
+	        vm_close(vm);
+	        mario_mem_quit();
+	        return 0;
+	}
+	
 	if(_fname[0] != 0) {
 		bool res = false;
 		if(strstr(_fname, ".js") != NULL)

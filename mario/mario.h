@@ -334,6 +334,7 @@ typedef struct st_bytecode {
 #define INSTR_EXPORT_STAR  0x091 // EXPORT_STAR      : pop a module namespace, copy all its exports into the current namespace (`export * from m`)
 #define INSTR_MODULE       0x092 // MODULE spec      : ensure module `spec` is loaded/evaluated, push its namespace object (import / re-export RHS)
 #define INSTR_IMPORT_BIND  0x093 // IMPORT_BIND name : pop a value, bind it to scope name `name` (an import binding; bypasses the const guard)
+#define INSTR_LOADW        0x094 // LOADW $n : like LOAD, but never invokes an accessor getter - the compiler retargets the LOAD of a bare-name assignment target so the raw binding node reaches ASIGN / compound-math write-back
 #define INSTR_FIELDN       0x095 // FIELDN name : pop an initializer function, register it as an instance field of the class under definition (runs per `new` with this=instance)
 #define INSTR_STATICN      0x096 // STATICN name : pop a value, define it as a static member of the class under definition (ES2022 `static x = e`)
 
