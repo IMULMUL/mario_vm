@@ -532,6 +532,51 @@ var_t* native_global_isNaN(vm_t* vm, var_t* env, void* data) {
 	return var_new_bool(vm, nan);
 }
 
+/* Global isFinite(x). Like the global isNaN it first coerces its argument to a
+ * number, then reports whether the result is a finite number: isFinite("12")===true,
+ * isFinite(NaN)===false, isFinite(Infinity)===false, isFinite(undefined)===false,
+ * isFinite(null)===true (Number(null) is 0). A string that strtod does not fully
+ * consume ("12abc") coerces to NaN and so is not finite. */
+var_t* native_global_isFinite(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* v = get_func_arg(env, 0);
+	if(v == NULL)
+		return var_new_bool(vm, false); /* undefined -> NaN */
+	switch(v->type) {
+		case V_INT:
+		case V_INT64:
+		case V_BOOL:
+		case V_NULL: /* Number(null) === 0 */
+			return var_new_bool(vm, true);
+		case V_FLOAT: {
+			float f = *(float*)v->value;
+			return var_new_bool(vm, (f == f) && !isinf(f));
+		} break;
+		case V_FLOAT64: {
+			double d = *(double*)v->value;
+			return var_new_bool(vm, (d == d) && !isinf(d));
+		} break;
+		case V_STRING: {
+			const char* p = var_get_str(v);
+			while(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f')
+				p++;
+			if(*p == 0)
+				return var_new_bool(vm, true); /* Number("") === 0 */
+			char* end = NULL;
+			double d = strtod(p, &end);
+			if(end == p)
+				return var_new_bool(vm, false); /* nothing consumed -> NaN */
+			while(*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r' || *end == '\v' || *end == '\f')
+				end++;
+			if(*end != 0)
+				return var_new_bool(vm, false); /* trailing garbage -> NaN */
+			return var_new_bool(vm, (d == d) && !isinf(d));
+		} break;
+		default: /* V_UNDEF and objects -> NaN */
+			return var_new_bool(vm, false);
+	}
+}
+
 #define CLS_NUMBER "Number"
 
 void reg_native_Number(vm_t* vm) {
@@ -569,6 +614,7 @@ void reg_native_Number(vm_t* vm) {
 	vm_reg_native(vm, NULL, "parseInt(s, radix)", native_Number_parseInt, NULL);
 	vm_reg_native(vm, NULL, "parseFloat(s)", native_Number_parseFloat, NULL);
 	vm_reg_native(vm, NULL, "isNaN(x)", native_global_isNaN, NULL);
+	vm_reg_native(vm, NULL, "isFinite(x)", native_global_isFinite, NULL);
 }
 
 #ifdef __cplusplus

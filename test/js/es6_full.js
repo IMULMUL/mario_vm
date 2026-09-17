@@ -1793,12 +1793,12 @@ section("15. async / await");
         eq(fd.join(), "1,2,3,4", "join() defaults to a comma");
         eq(fd.toString(), "1,2,3,4", "toString() is comma-joined");
 
-        // --- values / keys / entries ---
-        let vals = fd.values();
-        ok(vals.length === 4 && vals[0] === 1, "values() snapshot");
-        let keys = fd.keys();
-        ok(keys.length === 4 && keys[2] === 2, "keys() snapshot");
-        let ents = fd.entries();
+        // --- values / keys / entries (spec: real iterators, consumed via spread) ---
+        let vals = [...fd.values()];
+        ok(vals.length === 4 && vals[0] === 1, "values() iterator");
+        let keys = [...fd.keys()];
+        ok(keys.length === 4 && keys[2] === 2, "keys() iterator");
+        let ents = [...fd.entries()];
         ok(ents.length === 4 && ents[1][0] === 1 && ents[1][1] === 2, "entries() [index, value] pairs");
 
         // --- iteration protocol: for..of and spread ---

@@ -15,10 +15,36 @@ static void var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only);
 extern var_t* symbol_lookup_by_key(vm_t* vm, const char* key);
 
 var_t* native_Object_create(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
+	(void)data;
 	var_t* proto = get_obj(env, "proto");
 	var_t* ret = var_new_obj_no_proto(vm, NULL, NULL);
 	var_set_prototype(ret, proto);
+	/* Object.create(proto, propertiesObject): the optional second argument is a map
+	 * of own property DESCRIPTORS ({value,writable,enumerable,configurable} or
+	 * {get,set}) to install on the new object. It was previously ignored, so
+	 * core-js's createIteratorConstructor -
+	 *   Object.create(IteratorPrototype, { next: {value: nextFn, ...} }) -
+	 * produced iterator prototypes with NO `next`, breaking every JS-level iterator
+	 * (String.prototype.matchAll's RegExpStringIterator, the Iterator helpers, the
+	 * String/Object iterators). Route each descriptor through the shared
+	 * defineProperty primitive so data AND accessor descriptors install correctly. */
+	var_t* props = get_func_arg(env, 1);
+	if(props != NULL && props->type != V_UNDEF && props->type != V_NULL) {
+		var_t* keys = var_new_array(vm);
+		var_own_keys(vm, props, keys, false);
+		vm->gc.gc_defer++;   /* ret/keys are unrooted while we build */
+		uint32_t sz = var_array_size(keys), j;
+		for(j = 0; j < sz; j++) {
+			var_t* kv = var_array_get_var(keys, (int32_t)j);
+			if(kv == NULL)
+				continue;
+			var_t* desc = var_find_own_member_var(props, var_get_str(kv));
+			if(desc != NULL)
+				mario_define_property_var(vm, ret, kv, desc);
+		}
+		vm->gc.gc_defer--;
+		var_unref(keys);
+	}
 	return ret;
 }
 
@@ -307,6 +333,17 @@ static void var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only) 
 	d.keys_var = keys_var;
 	d.enum_only = enum_only;
 	d.seen = seen;
+	/* Array elements live in the nested _ARRAY_ store (keys "0","1",...), so an
+	 * array's own keys are its indices - enumerate those first (Object.keys([a,b])
+	 * must yield ["0","1"], which core-js structuredClone's key walk relies on).
+	 * Then walk the outer children for any custom own props (a.foo = 1); _ARRAY_
+	 * itself is invisible and skipped by own_keys_cb, and `length` is computed on
+	 * the fly (no own member). Mirrors own_keys_default()/Reflect.ownKeys. */
+	if(var->is_array) {
+		var_t* cont = var_find_own_member_var(var, "_ARRAY_");
+		if(cont != NULL)
+			hash_map_iterate(&cont->children, own_keys_cb, &d);
+	}
 	hash_map_iterate(&var->children, own_keys_cb, &d);
 	hash_map_free(seen, mario_free, NULL);
 	vm->gc.gc_defer--;
@@ -402,6 +439,22 @@ var_t* native_Object_is(vm_t* vm, var_t* env, void* data) {
 	}
 }
 
+/* Fetch an own property VALUE by string key, array-aware: for an array the
+ * elements live in the hidden _ARRAY_ store, so an index key ("0","1",...) must
+ * be resolved there - var_find_own_member_var on the outer var misses them, which
+ * made Object.values([10,20]) yield [undefined,undefined]. Non-index keys (a.foo)
+ * and non-arrays fall through to the ordinary own-member lookup. */
+static var_t* own_value_by_key(var_t* obj, const char* k) {
+	if(obj != NULL && obj->is_array) {
+		var_t* cont = var_find_own_member_var(obj, "_ARRAY_");
+		if(cont != NULL) {
+			var_t* v = var_find_own_member_var(cont, k);
+			if(v != NULL) return v;
+		}
+	}
+	return var_find_own_member_var(obj, k);
+}
+
 var_t* native_Object_values(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_func_arg(env, 0);
@@ -411,7 +464,7 @@ var_t* native_Object_values(vm_t* vm, var_t* env, void* data) {
 	uint32_t sz = var_array_size(keys), j;
 	for(j = 0; j < sz; j++) {
 		const char* k = var_get_str(var_array_get_var(keys, (int32_t)j));
-		var_t* v = var_find_own_member_var(obj, k);
+		var_t* v = own_value_by_key(obj, k);
 		var_array_add(ret, v != NULL ? v : var_new(vm));
 	}
 	var_unref(keys);
@@ -428,7 +481,7 @@ var_t* native_Object_entries(vm_t* vm, var_t* env, void* data) {
 	for(j = 0; j < sz; j++) {
 		var_t* kv = var_array_get_var(keys, (int32_t)j);
 		const char* k = var_get_str(kv);
-		var_t* v = var_find_own_member_var(obj, k);
+		var_t* v = own_value_by_key(obj, k);
 		var_t* pair = var_new_array(vm);
 		var_array_add(pair, var_new_str(vm, k));
 		var_array_add(pair, v != NULL ? v : var_new(vm));
@@ -580,8 +633,14 @@ var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) 
 		var_t* setter = (nf->regular == FUNC_SETTER) ? n->var : NULL;
 		if(getter != NULL && setter == NULL)
 			setter = get_obj(getter, FUNC_SETTER_KEY);
-		var_add(d, "get", getter != NULL ? getter : var_new(vm));
-		var_add(d, "set", setter != NULL ? setter : var_new(vm));
+		/* Store the accessors as plain FUNC_REGULAR forwarders: the getter/setter
+		 * func_t has regular == FUNC_GETTER/FUNC_SETTER, so a bare var_add would make
+		 * `descriptor.get` auto-invoke on read and report the getter's VALUE (e.g. a
+		 * number) instead of the function core-js / the smoke test expect. */
+		var_t* getw = (getter != NULL) ? vm_accessor_as_data_func(vm, getter) : NULL;
+		var_t* setw = (setter != NULL) ? vm_accessor_as_data_func(vm, setter) : NULL;
+		var_add(d, "get", getw != NULL ? getw : var_new(vm));
+		var_add(d, "set", setw != NULL ? setw : var_new(vm));
 		var_add(d, "enumerable", var_new_bool(vm, !n->be_unenumerable));
 		var_add(d, "configurable", var_new_bool(vm, !n->be_const));
 		return d;
@@ -653,10 +712,29 @@ var_t* native_Object_getOwnPropertyDescriptors(vm_t* vm, var_t* env, void* data)
 		if(n == NULL || n->be_inherited)
 			continue;
 		var_t* d = new_plain_obj(vm);
-		var_add(d, "value", n->var != NULL ? n->var : var_new(vm));
-		var_add(d, "writable", var_new_bool(vm, !n->be_const));
-		var_add(d, "enumerable", var_new_bool(vm, !n->be_unenumerable));
-		var_add(d, "configurable", var_new_bool(vm, !n->be_const));
+		/* Mirror getOwnPropertyDescriptor: an accessor member reports
+		 * {get,set,enumerable,configurable} with the accessors wrapped as plain
+		 * forwarders (so `.get` reads back as the function, not its value); every
+		 * other member is a data descriptor. */
+		func_t* nf = (n->var != NULL && n->var->is_func) ? var_get_func(n->var) : NULL;
+		if(nf != NULL && (nf->regular == FUNC_GETTER || nf->regular == FUNC_SETTER)) {
+			var_t* getter = (nf->regular == FUNC_GETTER) ? n->var : NULL;
+			var_t* setter = (nf->regular == FUNC_SETTER) ? n->var : NULL;
+			if(getter != NULL && setter == NULL)
+				setter = get_obj(getter, FUNC_SETTER_KEY);
+			var_t* getw = (getter != NULL) ? vm_accessor_as_data_func(vm, getter) : NULL;
+			var_t* setw = (setter != NULL) ? vm_accessor_as_data_func(vm, setter) : NULL;
+			var_add(d, "get", getw != NULL ? getw : var_new(vm));
+			var_add(d, "set", setw != NULL ? setw : var_new(vm));
+			var_add(d, "enumerable", var_new_bool(vm, !n->be_unenumerable));
+			var_add(d, "configurable", var_new_bool(vm, !n->be_const));
+		}
+		else {
+			var_add(d, "value", n->var != NULL ? n->var : var_new(vm));
+			var_add(d, "writable", var_new_bool(vm, !n->be_const));
+			var_add(d, "enumerable", var_new_bool(vm, !n->be_unenumerable));
+			var_add(d, "configurable", var_new_bool(vm, !n->be_const));
+		}
 		var_add(ret, k, d);
 	}
 	vm->gc.gc_defer--;
@@ -864,7 +942,15 @@ var_t* native_Object_constructor(vm_t* vm, var_t* env, void* data) {
                 return v; /* passthrough: keeps the identity and proto chain */
         var_t* wrap_cls = NULL;
         switch(v->type) {
-                case V_STRING: wrap_cls = vm->builtin_vars.var_String; break;
+                case V_STRING:
+                        /* Box the primitive into a real String object: typeof 'object'
+                         * yet .length / [index] / for..of / valueOf / toString all read
+                         * the characters. core-js's toObject()+arrayFrom() iterate this
+                         * wrapper (the URL parser turns the input into code points via
+                         * arrayFrom), which needs the boxed value to survive. Also links
+                         * String.prototype, so the wrap_cls path below is not needed. */
+                        vm_box_string_obj(vm, this_v, var_get_str(v));
+                        return this_v;
                 case V_INT: case V_FLOAT: case V_INT64: case V_FLOAT64:
                         wrap_cls = vm->builtin_vars.var_Number; break;
                 case V_BIGINT: wrap_cls = vm->builtin_vars.var_BigInt; break;
@@ -881,7 +967,7 @@ var_t* native_Object_constructor(vm_t* vm, var_t* env, void* data) {
 void reg_native_Object(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_OBJECT);
 	vm_reg_native(vm, cls, "constructor(value)", native_Object_constructor, NULL);
-	vm_reg_static(vm, cls, "create(proto)", native_Object_create, NULL); 
+	vm_reg_static(vm, cls, "create(proto, properties)", native_Object_create, NULL); 
 	vm_reg_static(vm, cls, "getPrototypeOf(obj)", native_Object_getPrototypeOf, NULL); 
 	vm_reg_static(vm, cls, "hasOwnProperty(name)", native_Object_hasOwnProperty, NULL); 
 	vm_reg_static(vm, cls, "keys()", native_Object_keys, NULL); 
@@ -919,8 +1005,11 @@ void reg_native_Object(vm_t* vm) {
 	/* globalThis: the global object itself. vm->root already holds every global
 	 * (Object, Array, isNaN, ...), so exposing it under the standard name makes
 	 * `globalThis.X` resolve. The self-member forms a cycle the gc mark phase
-	 * already guards against. */
-	vm_reg_var(vm, NULL, "globalThis", vm->root, true);
+	 * already guards against. The binding is WRITABLE (be_const=false) exactly
+	 * like the real global property: marking it const made `globalThis = x`
+	 * (and `var globalThis = x`) throw and silently abort the whole run, which
+	 * real bundles and shims do hit. */
+	vm_reg_var(vm, NULL, "globalThis", vm->root, false);
 }
 
 #ifdef __cplusplus

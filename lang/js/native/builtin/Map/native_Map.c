@@ -170,9 +170,18 @@ var_t* native_Map_get(vm_t* vm, var_t* env, void* data) {
     map_data* md = get_map(this_v);
     var_t* key = get_obj(env, "key");
     int32_t idx = map_find(md, key);
-    if (getenv("MARIO_WMDBG"))
+   if (getenv("MARIO_WMDBG"))
         fprintf(stderr, "[WMDBG] GET map=%p key=%p md=%p size=%u idx=%d\n", (void*)this_v, (void*)key, (void*)md, md?md->size:0, idx);
     if (idx < 0) return NULL; /* undefined */
+    if (getenv("MARIO_WMDBG") && md->vals[idx] != NULL) {
+        var_t* vv = md->vals[idx];
+        fprintf(stderr, "[WMDBG]   val=%p type=%d refs=%u status=%d keep=",
+            (void*)vv, (int)vv->type, (unsigned)vv->refs, (int)vv->status);
+        var_t* keep = var_find_own_member_var(this_v, "@@keep");
+        if (keep != NULL) fprintf(stderr, "%p sz=%u", (void*)keep, (unsigned)var_array_size(keep));
+        else fprintf(stderr, "(none)");
+        fprintf(stderr, "\n");
+    }
     return md->vals[idx];     /* borrowed; func_call adds the stack ref */
 }
 

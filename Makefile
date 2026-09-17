@@ -10,7 +10,7 @@ endif
 include $(MARIO_VM)/lang/js/lang.mk
 
 mario_OBJS = $(MARIO_VM)/mario/mario.o $(MARIO_VM)/mario/lex/mario_lex.o $(MARIO_VM)/mario/bcdump/bcdump.o
-mvm_OBJS = bin/mario/mario.o bin/lib/mbc.o bin/lib/js.o 
+mvm_OBJS = bin/mario/mario.o bin/lib/mbc.o bin/lib/js.o bin/lib/host_task.o 
 
 MARIO_OBJS = $(mario_OBJS) $(mvm_OBJS) $(lang_OBJS) \
 		$(NATIVE_OBJS)
@@ -49,3 +49,14 @@ $(MARIO): $(MARIO_OBJS)
 
 clean:
 	rm -f $(MARIO_OBJS) $(MARIO)
+
+# core-js bundle harness (see test/corejs/). The bundle is fetched on demand and
+# gitignored; corejs-check loads prelude + bundle and reports via a sentinel.
+corejs-fetch:
+	@test/corejs/fetch.sh
+
+corejs-check: $(MARIO)
+	@test/corejs/fetch.sh
+	@test/corejs/run.sh
+
+.PHONY: all clean corejs-fetch corejs-check

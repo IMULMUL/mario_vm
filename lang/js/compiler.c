@@ -202,54 +202,10 @@ void lex_get_js_str(lex_t* lex) {
     while (lex->curr_ch && lex->curr_ch != '\'') {
         if (lex->curr_ch == '\\') {
             lex_get_nextch(lex);
-            switch (lex->curr_ch) {
-                case 'n':
-                    mstr_add(lex->tk_str, '\n');
-                    break;
-                case 'a':
-                    mstr_add(lex->tk_str, '\a');
-                    break;
-                case 'r':
-                    mstr_add(lex->tk_str, '\r');
-                    break;
-                case 't':
-                    mstr_add(lex->tk_str, '\t');
-                    break;
-                case '\'':
-                    mstr_add(lex->tk_str, '\'');
-                    break;
-                case '\\':
-                    mstr_add(lex->tk_str, '\\');
-                    break;
-                case 'x': {
-                    // hex digits
-                    char buf[3] = "??";
-                    lex_get_nextch(lex);
-                    buf[0] = lex->curr_ch;
-                    lex_get_nextch(lex);
-                    buf[1] = lex->curr_ch;
-                    mstr_add(lex->tk_str, (char)strtol(buf, 0, 16));
-                }
-                break;
-                case 'u':
-                    /* ES6 \uXXXX / \u{...} escape (emits UTF-8, combines surrogate
-                     * pairs); leaves curr_ch on the last consumed char. */
-                    lex_read_u_escape(lex);
-                break;
-                default:
-                    if (lex->curr_ch >= '0' && lex->curr_ch <= '7') {
-                        // octal digits
-                        char buf[4] = "???";
-                        buf[0] = lex->curr_ch;
-                        lex_get_nextch(lex);
-                        buf[1] = lex->curr_ch;
-                        lex_get_nextch(lex);
-                        buf[2] = lex->curr_ch;
-                        mstr_add(lex->tk_str, (char)strtol(buf, 0, 8));
-                    } else {
-                        mstr_add(lex->tk_str, lex->curr_ch);
-                    }
-            }
+            /* Shared spec-correct escape decoder (see mario_lex.c). Fixes the
+             * former octal branch that consumed 3 chars unconditionally, which
+             * desynced the lexer on `'\0'` (core-js String.raw/dedent module). */
+            lex_read_escape(lex);
         } else {
             mstr_add(lex->tk_str, lex->curr_ch);
         }
@@ -916,6 +872,12 @@ static int g_async_depth = 0;
  * for that body and then cleared, so nested definitions default to sync. */
 static int g_async_pending = 0;
 
+/* Set to 1 while defining a function EXPRESSION (base()). factor_def_func then
+ * emits INSTR_FUNC_NAMED carrying the expression's own name so the VM can bind
+ * that name to the function inside its body (ES named-function-expression
+ * self-reference). Cleared right after, so declarations/methods are unaffected. */
+static int g_func_selfname = 0;
+
 /* Set when the immediately preceding subscript kept its receiver on the stack
  * (INSTR_ARRAY_AT_M) because a call `(` follows, telling the postfix `(` case
  * to emit INSTR_CALLXO (bind that receiver as `this`) instead of INSTR_CALLX. */
@@ -1279,7 +1241,14 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
             bc_gen(bc, INSTR_FUNC_SET);
         }
     } else {
-        bc_gen(bc, is_gen ? INSTR_FUNC_GEN : (is_static ? INSTR_FUNC_STC : INSTR_FUNC));
+        /* A named function EXPRESSION (g_func_selfname set by base()) must bind its
+         * own name inside its body; emit INSTR_FUNC_NAMED carrying that name. Only
+         * the plain (non-generator, non-static) form is covered - generator/static
+         * NFE self-reference is rare and keeps the existing behaviour. */
+        if (g_func_selfname && !is_gen && !is_static && name->cstr[0] != 0)
+            bc_gen_str(bc, INSTR_FUNC_NAMED, name->cstr);
+        else
+            bc_gen(bc, is_gen ? INSTR_FUNC_GEN : (is_static ? INSTR_FUNC_STC : INSTR_FUNC));
     }
     bool ok = func_params_and_body(l, bc);
     g_async_depth = saved_async;
@@ -2661,7 +2630,9 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             }
             mstr_t* fname = mstr_new("");
             g_async_pending = 1;
+            g_func_selfname = 1;
             factor_def_func(l, bc, fname);
+            g_func_selfname = 0;
             mstr_free(fname);
         } else {
             /* async arrow: `async (a, b) => ...` or `async a => ...`. Parse the
@@ -2677,7 +2648,9 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             return false;
         }
         mstr_t* fname = mstr_new("");
+        g_func_selfname = 1;
         factor_def_func(l, bc, fname);
+        g_func_selfname = 0;
         mstr_free(fname);
     } else if (l->tk == LEX_R_CLASS) { //define class
         factor_def_class(l, bc);
@@ -2742,7 +2715,11 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
                 bc_gen_str(bc, INSTR_LOAD, name->cstr);
                 factor_def_afunc(l, bc);
             } else {
-                bc_gen_str(bc, INSTR_LOAD, name->cstr);
+                /* Bare-identifier rvalue read: LOADV pushes the binding's current
+                 * VALUE (a snapshot) so the operand is not aliased by a later
+                 * reassignment of the same binding while it sits on the value
+                 * stack (e.g. the first `m` in `f(m, m++, m)`). */
+                bc_gen_str(bc, INSTR_LOADV, name->cstr);
             }
         }
         mstr_free(name);
@@ -2913,7 +2890,7 @@ bool unary(lex_t* l, bytecode_t* bc) {
             } else if (op == INSTR_ARRAY_AT) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_DELETE_AT, OFF(last));
                 return true;
-            } else if (op == INSTR_LOAD) {
+            } else if (op == INSTR_LOAD || op == INSTR_LOADV) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_DELETE_VAR, OFF(last));
                 return true;
             }
@@ -2940,6 +2917,8 @@ bool unary(lex_t* l, bytecode_t* bc) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
             else if (OP(last) == INSTR_GET)
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
+            else if (OP(last) == INSTR_LOADV || OP(last) == INSTR_LOAD)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_LOADW, OFF(last));
         }
         bc_gen(bc, is_inc ? INSTR_PPLUS_PRE : INSTR_MMINUS_PRE);
         return true;
@@ -2993,7 +2972,7 @@ bool unary(lex_t* l, bytecode_t* bc) {
          * exactly like JS. */
         if (instr == INSTR_TYPEOF && bc->cindex > 0) {
             PC last = bc->code_buf[bc->cindex - 1];
-            if (OP(last) == INSTR_LOAD)
+            if (OP(last) == INSTR_LOAD || OP(last) == INSTR_LOADV)
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_LOAD_SAFE, OFF(last));
         }
     } else {
@@ -3015,6 +2994,8 @@ bool unary(lex_t* l, bytecode_t* bc) {
                     bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
                 else if (OP(last) == INSTR_GET)
                     bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
+                else if (OP(last) == INSTR_LOADV || OP(last) == INSTR_LOAD)
+                    bc->code_buf[bc->cindex - 1] = INS(INSTR_LOADW, OFF(last));
             }
             bc_gen(bc, is_inc ? INSTR_PPLUS : INSTR_MMINUS);
         }
@@ -3107,6 +3088,8 @@ bool expr(lex_t* l, bytecode_t* bc) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
             else if (OP(last) == INSTR_GET)
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
+            else if (OP(last) == INSTR_LOADV || OP(last) == INSTR_LOAD)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_LOADW, OFF(last));
         }
         bc_gen(bc, INSTR_PPLUS_PRE);
     } else if (pre == LEX_MINUSMINUS) {
@@ -3116,6 +3099,8 @@ bool expr(lex_t* l, bytecode_t* bc) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
             else if (OP(last) == INSTR_GET)
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_GETW, OFF(last));
+            else if (OP(last) == INSTR_LOADV || OP(last) == INSTR_LOAD)
+                bc->code_buf[bc->cindex - 1] = INS(INSTR_LOADW, OFF(last));
         }
         bc_gen(bc, INSTR_MMINUS_PRE);
     }
@@ -3145,12 +3130,19 @@ bool shift(lex_t* l, bytecode_t* bc) {
         return false;
     }
 
-    if (l->tk == LEX_LSHIFT || l->tk == LEX_RSHIFT || l->tk == LEX_RSHIFTUNSIGNED) {
+    /* Shift operators are LEFT-associative and bind tighter than the bitwise
+     * `& ^ |` and relational levels, so both operands are parsed at the additive
+     * `expr()` level (NOT `base()`). Parsing the right operand with base() let a
+     * following lower-precedence operator be swallowed into the shift's RHS:
+     * `y<<4|digit` compiled as `y<<(4|digit)` (always 0 for the React Flight
+     * row-ID accumulator) and `1<<2|3` gave 8 instead of 7. The `while` (not a
+     * single `if`) keeps `a<<b<<c` left-associative. */
+    while (l->tk == LEX_LSHIFT || l->tk == LEX_RSHIFT || l->tk == LEX_RSHIFTUNSIGNED) {
         int op = l->tk;
         if (!lex_chkread(l, op)) {
             return false;
         }
-        if (!base(l, bc)) {
+        if (!expr(l, bc)) {
             return false;
         }
 
@@ -3209,27 +3201,56 @@ bool condition(lex_t* l, bytecode_t* bc) {
     return true;
 }
 
-/* Bitwise `& | ^` level: above comparison, below the logical operators. */
-static bool logic_bitwise(lex_t* l, bytecode_t* bc) {
+/* Bitwise `& ^ |` occupy THREE distinct precedence levels in JS (`&` binds
+ * tightest, then `^`, then `|`), each left-associative, sitting above the
+ * relational `condition()` level and below the logical `&&`. Lumping them into a
+ * single left-to-right loop mis-grouped mixed operands: `a | b & c` compiled as
+ * `(a|b)&c` instead of `a|(b&c)`, and `a ^ b & c` as `(a^b)&c`. Split them so
+ * each level's operand is the next-tighter level. */
+static bool logic_bitand(lex_t* l, bytecode_t* bc) {
     if (!condition(l, bc)) {
         return false;
     }
-
-    while (l->tk == '&' || l->tk == '|' || l->tk == '^') {
-        int op = l->tk;
+    while (l->tk == '&') {
         if (!lex_chkread(l, l->tk)) {
             return false;
         }
         if (!condition(l, bc)) {
             return false;
         }
-        if (op == '|') {
-            bc_gen(bc, INSTR_OR);
-        } else if (op == '&') {
-            bc_gen(bc, INSTR_AND);
-        } else {
-            bc_gen(bc, INSTR_XOR);
+        bc_gen(bc, INSTR_AND);
+    }
+    return true;
+}
+
+static bool logic_bitxor(lex_t* l, bytecode_t* bc) {
+    if (!logic_bitand(l, bc)) {
+        return false;
+    }
+    while (l->tk == '^') {
+        if (!lex_chkread(l, l->tk)) {
+            return false;
         }
+        if (!logic_bitand(l, bc)) {
+            return false;
+        }
+        bc_gen(bc, INSTR_XOR);
+    }
+    return true;
+}
+
+static bool logic_bitor(lex_t* l, bytecode_t* bc) {
+    if (!logic_bitxor(l, bc)) {
+        return false;
+    }
+    while (l->tk == '|') {
+        if (!lex_chkread(l, l->tk)) {
+            return false;
+        }
+        if (!logic_bitxor(l, bc)) {
+            return false;
+        }
+        bc_gen(bc, INSTR_OR);
     }
     return true;
 }
@@ -3237,7 +3258,7 @@ static bool logic_bitwise(lex_t* l, bytecode_t* bc) {
 /* `&&` level: binds tighter than `||`, so each `||` operand is a whole
  * conjunction and a SCOR slot skips complete `&&` groups. */
 static bool logic_and(lex_t* l, bytecode_t* bc) {
-    if (!logic_bitwise(l, bc)) {
+    if (!logic_bitor(l, bc)) {
         return false;
     }
 
@@ -3252,7 +3273,7 @@ static bool logic_and(lex_t* l, bytecode_t* bc) {
          * patch each slot to the next slot (or the end), so `a&&b&&c`
          * short-circuits fully. */
         PC pc1 = bc_reserve(bc);
-        if (!logic_bitwise(l, bc)) {
+        if (!logic_bitor(l, bc)) {
             return false;
         }
         bc_set_instr(bc, pc1, INSTR_SCAND, ILLEGAL_PC);
@@ -3392,10 +3413,11 @@ bool base(lex_t* l, bytecode_t* bc) {
                 wtarget_name = bc_getstr(bc, OFF(last));
             } else if (OP(last) == INSTR_ARRAY_AT) {
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_ARRAY_AT_W, OFF(last));
-            } else if ((op == '=' || arith_compound) && OP(last) == INSTR_LOAD) {
-                /* Bare-name target (`x = v`): plain LOAD invokes an accessor
-                 * getter now, so retarget the binding fetch to LOADW, which
-                 * keeps the raw node for ASIGN / compound-math write-back. */
+            } else if (OP(last) == INSTR_LOADV || OP(last) == INSTR_LOAD) {
+                /* Bare-name target (`x = v`, `x += v`, `x ||= v`): retarget the
+                 * value-read (LOADV) - or a legacy LOAD - to LOADW, which keeps
+                 * the raw binding node for ASIGN / compound-math / logical
+                 * write-back and never invokes an accessor getter. */
                 bc->code_buf[bc->cindex - 1] = INS(INSTR_LOADW, OFF(last));
             }
         }
@@ -5293,6 +5315,11 @@ bool stmt_try(lex_t* l, bytecode_t* bc) {
     }
     PC pc = bc_gen(bc, INSTR_TRY);
     bc_add_instr(bc, pc, INSTR_JMP, pc + 2);
+    /* Index of the INSTR_TRY word. Its (currently unused) operand is patched below
+     * to the finally-block start PC so handle_block can record it on the scope and
+     * a `return` leaving the body runs the finally (vm_finish_return). */
+    PC pc_try = pc - 1;
+    bool demoted = false;   // set when a try-finally with no catch becomes a plain block
 
     lex_skip_empty(l);
     PC pc_cache = bc_reserve(bc);
@@ -5342,10 +5369,14 @@ bool stmt_try(lex_t* l, bytecode_t* bc) {
          * slot (the JMP right after the BLOCK skips it and no throw targets it).
          * The finally block below still runs on the normal (non-throwing) path. */
         bc->code_buf[pc - 1] = INS(INSTR_BLOCK, OFF(bc->code_buf[pc - 1]));
+        demoted = true;
     }
 
     pc = bc_gen(bc, INSTR_TRY_END) - 1;
     bc_set_instr(bc, pce, INSTR_JMP, pc); // end anchor;
+    /* The finally block (if any) is emitted sequentially right after TRY_END, so
+     * this is where a deferred return/break/continue must jump to run it. */
+    PC finally_start = pc + 1;
 
     /* Optional `finally { ... }`. `finally` is not a reserved word in this
      * lexer (it arrives as LEX_ID), so detect it by name and emit the block
@@ -5360,6 +5391,12 @@ bool stmt_try(lex_t* l, bytecode_t* bc) {
         if (!statement(l, bc)) {
             return false;
         }
+        /* Terminate the finally block: on the normal/catch path pending_op is
+         * FIN_NONE and it is a no-op fall-through; when a return was parked here it
+         * resumes it. Then record the finally start PC on the try (or demoted
+         * block) scope by patching the INSTR_TRY/INSTR_BLOCK operand. */
+        bc_gen(bc, INSTR_FINALLY_END);
+        bc_set_instr(bc, pc_try, demoted ? INSTR_BLOCK : INSTR_TRY, finally_start);
     }
     return true;
 }
@@ -5647,17 +5684,27 @@ bool stmt_switch(lex_t* l, bytecode_t* bc) {
     if (!ok) return false;
 
     PC pc_end = bc_gen(bc, INSTR_SWITCH_END);
-    bc_set_instr(bc, pc_break, INSTR_JMP, pc_end);        // break -> SWITCH_END
+    /* bc_gen returns the post-emit cindex, so SWITCH_END itself sits at pc_end-1.
+     * Every switch-exit jump (break, empty-case fallthrough, no-match, default
+     * with no body) MUST land on SWITCH_END so handle_block_end pops the switch
+     * scope before falling through to pc_end. Targeting pc_end (one past) skips
+     * the pop and leaks the scope; a switch nested in a loop then leaves a stale
+     * is_switch scope on the stack, so the next `break` re-targets this switch's
+     * break anchor forever (JMP break-anchor -> SWITCH_END+1 == the enclosing
+     * break -> back to the anchor): an infinite 2-instruction loop. This mirrors
+     * the loop compiler, which anchors break at LOOP_END (pc-1), not past it. */
+    PC pc_switch_end = pc_end - 1;
+    bc_set_instr(bc, pc_break, INSTR_JMP, pc_switch_end);   // break -> SWITCH_END
     for (int i = 0; i < n_cases; i++) {
         if (i < body_idx) bc_set_instr(bc, body_anchor[i], INSTR_JMP, body_pos[i]);
-        else              bc_set_instr(bc, body_anchor[i], INSTR_JMP, pc_end);
+        else              bc_set_instr(bc, body_anchor[i], INSTR_JMP, pc_switch_end);
     }
     if (has_default && default_anchor != ILLEGAL_PC) {
-        PC dtgt = (default_body_pos != ILLEGAL_PC) ? default_body_pos : pc_end;
+        PC dtgt = (default_body_pos != ILLEGAL_PC) ? default_body_pos : pc_switch_end;
         bc_set_instr(bc, default_anchor, INSTR_JMP, dtgt);
     }
     else if (no_match_anchor != ILLEGAL_PC) {
-        bc_set_instr(bc, no_match_anchor, INSTR_JMP, pc_end);
+        bc_set_instr(bc, no_match_anchor, INSTR_JMP, pc_switch_end);
     }
     return true;
 }

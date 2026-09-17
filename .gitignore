@@ -7,3 +7,7 @@ mariovm
 build
 .vscode
 .scratch
+_scratch/
+# core-js harness artifacts (bundle fetched on demand; scripts stay tracked)
+test/corejs/corejs_bundle.js
+test/corejs/run.log

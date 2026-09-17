@@ -296,6 +296,67 @@ void lex_read_u_escape(lex_t* lex) {
 	lex_add_codepoint(lex->tk_str, cp);
 }
 
+/* Decode one string escape sequence. On entry lex->curr_ch is the escape
+ * designator (the character right after the backslash). Appends the decoded
+ * value to lex->tk_str and leaves lex->curr_ch on the LAST character consumed,
+ * matching the string lexers' convention that the caller performs one trailing
+ * lex_get_nextch(). Shared by the single- and double-quote string lexers so `"`
+ * and `'` decode identically. Handles the ECMAScript forms: \b \f \v \n \r \t,
+ * \xHH, \uHHHH / \u{...} (via lex_read_u_escape), legacy octal \0..\377,
+ * \<LineContinuation>, and identity escapes (\', \", \\, \/, any other \c -> c).
+ * Note: a decoded NUL (e.g. `\0`) is appended as a 0 byte; mstr_t is a C string
+ * so the visible value truncates there, but tokenization stays in sync. */
+void lex_read_escape(lex_t* lex) {
+	switch (lex->curr_ch) {
+		case 'b': mstr_add(lex->tk_str, '\b'); break;
+		case 'f': mstr_add(lex->tk_str, '\f'); break;
+		case 'v': mstr_add(lex->tk_str, '\v'); break;
+		case 'n': mstr_add(lex->tk_str, '\n'); break;
+		case 'r': mstr_add(lex->tk_str, '\r'); break;
+		case 't': mstr_add(lex->tk_str, '\t'); break;
+		case 'u': lex_read_u_escape(lex); break;
+		case 'x': {
+			/* \xHH: exactly two hex digits; leave curr_ch on the 2nd digit. */
+			int v = 0, n = 0;
+			lex_get_nextch(lex); /* first hex digit */
+			while (n < 2 && lex_hexval(lex->curr_ch) >= 0) {
+				v = v * 16 + lex_hexval(lex->curr_ch);
+				n++;
+				if (n < 2) lex_get_nextch(lex);
+			}
+			mstr_add(lex->tk_str, (char)v);
+		}
+		break;
+		case '0': case '1': case '2': case '3':
+		case '4': case '5': case '6': case '7': {
+			/* Legacy octal: consume up to 3 octal digits, stopping BEFORE any
+			 * non-octal char (including a closing quote). Advancing only while
+			 * next_ch is also octal keeps curr_ch on the last consumed digit, so
+			 * `'\0'` decodes to NUL and leaves the closing quote intact. */
+			int v = 0, n = 0;
+			while (n < 3 && lex->curr_ch >= '0' && lex->curr_ch <= '7') {
+				v = v * 8 + (lex->curr_ch - '0');
+				n++;
+				if (n < 3 && lex->next_ch >= '0' && lex->next_ch <= '7')
+					lex_get_nextch(lex);
+				else
+					break;
+			}
+			mstr_add(lex->tk_str, (char)v);
+		}
+		break;
+		case '\n': /* \<LF> line continuation: add nothing. */
+			break;
+		case '\r': /* \<CR> or \<CR><LF> line continuation: add nothing. */
+			if (lex->next_ch == '\n') lex_get_nextch(lex);
+			break;
+		default:
+			/* Identity escape: \', \", \\, \/, and any other \c -> c. */
+			mstr_add(lex->tk_str, lex->curr_ch);
+			break;
+	}
+}
+
 void lex_get_basic_token(lex_t* lex) {
 	// tokens
 	if (is_alpha(lex->curr_ch) || lex->curr_ch == '$' ||
@@ -392,15 +453,7 @@ void lex_get_basic_token(lex_t* lex) {
 		while (lex->curr_ch && lex->curr_ch!='"') {
 			if (lex->curr_ch == '\\') {
 				lex_get_nextch(lex);
-				switch (lex->curr_ch) {
-					case 'n' : mstr_add(lex->tk_str, '\n'); break;
-					case 'r' : mstr_add(lex->tk_str, '\r'); break;
-					case 't' : mstr_add(lex->tk_str, '\t'); break;
-					case '"' : mstr_add(lex->tk_str, '\"'); break;
-					case '\\' : mstr_add(lex->tk_str, '\\'); break;
-					case 'u' : lex_read_u_escape(lex); break;
-					default: mstr_add(lex->tk_str, lex->curr_ch);
-				}
+				lex_read_escape(lex);
 			} else {
 				mstr_add(lex->tk_str, lex->curr_ch);
 			}

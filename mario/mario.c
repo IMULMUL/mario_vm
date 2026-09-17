@@ -2041,6 +2041,41 @@ bool var_is_proxy(var_t* var) {
 	return k != NULL && strcmp(k, EXOTIC_PROXY) == 0;
 }
 
+/* Boxed String object: an ordinary V_OBJECT (not array/func) carrying the hidden
+ * STRBOX_MARKER member. Its primitive characters live in ->value, so var_get_str
+ * already returns them; the marker only flags "treat me like a string" for the
+ * .length / [index] / iteration paths that otherwise gate on type == V_STRING. */
+bool var_is_string_obj(var_t* var) {
+	return var != NULL && var->type == V_OBJECT && !var->is_array && !var->is_func &&
+		var_find_own_member(var, STRBOX_MARKER) != NULL;
+}
+
+/* Turn a fresh V_OBJECT into a boxed String object wrapping `s`: store the
+ * primitive bytes in ->value (freed by var_clean with mario_free, exactly like a
+ * V_STRING), link String.prototype, and drop the hidden invisable marker. Used by
+ * Object(str) and `new String(str)` so the wrapper keeps typeof 'object' while
+ * .length, [index], for..of, valueOf and toString all read the primitive. */
+void vm_box_string_obj(vm_t* vm, var_t* obj, const char* s) {
+	if(obj == NULL || s == NULL)
+		return;
+	if(obj->value != NULL) {
+		if(obj->free_func != NULL)
+			obj->free_func(obj->value);
+		else
+			mario_free(obj->value);
+		obj->value = NULL;
+	}
+	uint32_t n = (uint32_t)strlen(s);
+	obj->value = mario_malloc(n + 1);
+	memcpy(obj->value, s, n + 1);
+	obj->size = n;
+	obj->free_func = NULL;
+	if(vm->builtin_vars.var_String != NULL)
+		var_set_prototype(obj, var_get_prototype(vm->builtin_vars.var_String));
+	node_t* mk = var_add(obj, STRBOX_MARKER, var_new_str(vm, ""));
+	if(mk != NULL) { mk->invisable = 1; mk->be_unenumerable = 1; }
+}
+
 /* ====== TypedArray element access ======
  * A TypedArray is a V_OBJECT with hidden marker @@exotic="ta", a hidden @@etype
  * (TA_* code), and JS-readable unenumerable `buffer` (the shared ArrayBuffer),
@@ -2265,6 +2300,25 @@ node_t* var_array_get(var_t* var, int32_t index) {
 	return node;
 }
 
+/* Non-creating indexed lookup. var_array_get() materializes every hole from 0
+ * up to `index` because an assignment target needs the binding to exist; a READ
+ * must not, or `arr[9]` on a 3-element array permanently grew it (length is
+ * hash_map_size of the element store) and Object.keys()/for-in then reported
+ * phantom entries. */
+static node_t* var_array_peek(var_t* var, int32_t index) {
+	if(var == NULL || index < 0)
+		return NULL;
+	var_t* arr_var = var->is_array ? var_find_own_member_var(var, "_ARRAY_") : var;
+	if(arr_var == NULL)
+		return NULL;
+	char key[32];
+	snprintf(key, sizeof(key), "%d", index);
+	node_t* node = (node_t*)hash_map_get(&arr_var->children, key);
+	if(node_empty(node))
+		return NULL;
+	return node;
+}
+
 var_t* var_array_get_var(var_t* var, int32_t index) {
 	node_t* n = var_array_get(var, index);
 	if(n != NULL)
@@ -2359,6 +2413,26 @@ void var_array_del(var_t* var, int32_t index) {
 	node_t* node = (node_t*)hash_map_remove(&arr_var->children, key);
 	if(node != NULL) {
 		node_free(node);
+	}
+}
+
+/* `arr.length = newlen` (ES23.1.3.19 [[DefineOwnProperty]] "length"): shrink by
+ * deleting every element at index >= newlen, or grow by materializing holes
+ * (undefined) up to newlen. An array's length is virtual - derived from the
+ * hidden _ARRAY_ store's element count - so there is no stored length field to
+ * poke; the store itself must be resized. */
+void var_array_resize(var_t* var, uint32_t newlen) {
+	if(var_empty(var) || !var->is_array)
+		return;
+	uint32_t sz = var_array_size(var);
+	if(newlen < sz) {
+		for(uint32_t i = newlen; i < sz; ++i)
+			var_array_del(var, (int32_t)i);
+	}
+	else if(newlen > sz) {
+		vm_t* vm = var->vm;
+		for(uint32_t i = sz; i < newlen; ++i)
+			var_array_add(var, var_new(vm));   /* hole -> undefined */
 	}
 }
 
@@ -2852,6 +2926,11 @@ static inline void gc_vars(vm_t* vm) {
 	//mario_debug("gc marking cache\n");
 	gc_mark_cache(vm, true); //mark all cached vars
 	gc_mark_scopes(vm, true); //mark all vars owned by a live scope
+	/* A return value parked in pending_value while its `finally` block runs is
+	 * reachable only from that C field, so mark it or the sweep frees it mid-finally
+	 * (the classic C-held-var hazard). NULL when no transfer is deferred. */
+	if(vm->pending_value != NULL)
+		gc_mark(vm->pending_value, true);
 	/* builtin singletons (true/false/null) are held only by vm->builtin_vars and
 	 * are NOT members of vm->root, so gc_mark(vm->root) can not reach them. Mark
 	 * them explicitly, otherwise a GC triggered while a compare result is sitting
@@ -3652,6 +3731,67 @@ static var_t* vm_to_primitive(vm_t* vm, var_t* var, const char* hint) {
 	return r;
 }
 
+/* ToNumber per ECMA-262, exposed for natives that must coerce a value exactly
+ * once. Objects are reduced with ToPrimitive(number): Symbol.toPrimitive, then
+ * valueOf, then toString; a result that is still an object (or absent) yields
+ * NaN. Numbers/strings/bool/null/bigint convert directly. %TypedArray%.prototype
+ * .fill relies on this: core-js's CONVERSION_BUG detection fills an Int8Array(2)
+ * with {valueOf:()=>count++} and requires count===1, so the value must be
+ * converted a single time before the per-element write loop. */
+double vm_to_number(vm_t* vm, var_t* v) {
+	if(v == NULL)
+		return NAN;
+	switch(v->type) {
+		case V_INT:     return (double)var_get_int(v);
+		case V_INT64:   return (double)var_get_int64(v);
+		case V_FLOAT:
+		case V_FLOAT64: return var_get_float64(v);
+		case V_BOOL:    return var_get_bool(v) ? 1.0 : 0.0;
+		case V_NULL:    return 0.0;
+		case V_BIGINT:  return bn_to_double((bignum_t*)v->value);
+		case V_STRING: {
+			const char* s = var_get_str(v);
+			while(*s==' '||*s=='\t'||*s=='\n'||*s=='\r') s++;
+			if(*s == 0) return 0.0;
+			char* end = NULL;
+			double d = strtod(s, &end);
+			while(end != NULL && (*end==' '||*end=='\t'||*end=='\n'||*end=='\r')) end++;
+			if(end != NULL && *end != 0) return NAN;
+			return d;
+		}
+		default: break;   /* V_UNDEF, V_OBJECT handled below */
+	}
+	if(v->type != V_OBJECT)
+		return NAN;       /* undefined -> NaN */
+	/* ToPrimitive(number): Symbol.toPrimitive, else valueOf, else toString. */
+	var_t* p = vm_to_primitive(vm, v, "number");
+	if(p == NULL) {
+		node_t* vo = var_find_member(v, "valueOf");
+		if(vo != NULL && vo->var != NULL && vo->var->is_func) {
+			var_t* r = call_m_func(vm, v, vo->var, NULL);
+			if(r != NULL && r->type != V_OBJECT && r->type != V_UNDEF)
+				p = r;
+			else if(r != NULL)
+				var_unref(r);
+		}
+	}
+	if(p == NULL) {
+		node_t* ts = var_find_member(v, "toString");
+		if(ts != NULL && ts->var != NULL && ts->var->is_func) {
+			var_t* r = call_m_func(vm, v, ts->var, NULL);
+			if(r != NULL && r->type != V_OBJECT && r->type != V_UNDEF)
+				p = r;
+			else if(r != NULL)
+				var_unref(r);
+		}
+	}
+	if(p == NULL)
+		return NAN;
+	double d = vm_to_number(vm, p);   /* p is a primitive now */
+	var_unref(p);
+	return d;
+}
+
 void var_to_str(var_t* var, mstr_t* ret) {
 	mstr_reset(ret);
 	if(var == NULL) {
@@ -4178,12 +4318,6 @@ static void vm_push_scope(vm_t* vm, scope_t* sc) {
 static PC vm_pop_scope(vm_t* vm) {
 	if(vm->scope_stack_top <= 0)
 		return 0;
-	/* DIAG (temp): track one leaking switch site. */
-	{
-		scope_t* p = vm->scope_stack[vm->scope_stack_top - 1];
-		if(p != NULL && p->is_switch && p->pc == 32771)
-			fprintf(stderr, "[swdbg] POP  switch@32771 top=%d pc=%u\n", (int)vm->scope_stack_top, (unsigned)vm->pc);
-	}
 
 	PC pc = 0;
 	scope_t* sc = vm_get_scope(vm);
@@ -4407,6 +4541,16 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 	while(sc != NULL) {
 		if(++scope_guard > VM_SCOPE_STACK_MAX)
 			break;
+		/* An object/array-literal construction scope is not a lexical env: its own
+		 * members are properties-under-construction and its prototype is
+		 * Object.prototype / Array.prototype. Skip it entirely so a free name in a
+		 * property value never resolves to a sibling property or a builtin method
+		 * (`{a:1, b:a}`, `{id: keys[i]}`); resolution continues to the enclosing
+		 * real scope. */
+		if(sc->is_objlit) {
+			sc = sc->prev;
+			continue;
+		}
 		if(mario_scopedbg_arm && getenv("MARIO_SCOPEDBG") != NULL) {
 			fprintf(stderr, "[scopedbg]   ss[%d] sc=%p is_func=%d is_with=%d var=%p(st%d) func=%p\n",
 				scope_guard, (void*)sc, sc->is_func?1:0, sc->is_with?1:0,
@@ -4462,6 +4606,19 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 				closure_func = closure_func->closure.func;
 			}
 		}
+		/* A function scope is a LEXICAL boundary: its own call env (searched above)
+		 * plus its definition-time closure chain (walked here, or in the is_func
+		 * prologue when this frame is the current one) already cover EVERY lexical
+		 * ancestor. Following sc->prev past this point walks into the DYNAMIC caller
+		 * frames, which lets a caller's local shadow a free variable that must
+		 * resolve to the global object - JS is lexically scoped, not dynamically.
+		 * Stop here; unresolved names fall through to the this_hit / vm->root global
+		 * fallback below. (This was the root cause of core-js's map-helpers module
+		 * reading an undefined `Map`: module 305 is first required from inside a
+		 * module that holds a local `var Map`, and the dynamic walk resolved the
+		 * free `Map` to that caller local instead of the global constructor.) */
+		if(sc->is_func)
+			break;
 		sc = sc->prev;
 	}
 
@@ -4723,6 +4880,9 @@ void vm_throw(vm_t* vm, const char *format, ...) {
 		 * body must NOT keep executing (the old report-and-continue let a
 		 * throwing Promise executor still resolve), and redirecting vm->pc to an
 		 * outer frame's catch would run that frame's bytecode in this loop. */
+		if(getenv("MARIO_RSDBG") != NULL) { /* DIAG (temp): pc of an uncaught throw that becomes a promise rejection */
+			fprintf(stderr, "[rsdbg] UNCAUGHT vm_throw pc=%u msg=%s\n", (unsigned)vm->pc, message);
+		}
 		vm_pop2(vm); // lift err off the value stack keeping its ref for the propagation
 		vm_propagate(vm, err);
 		return;
@@ -4859,7 +5019,16 @@ static inline var_t* vm_super_in_scopes(vm_t* vm) {
 }
 
 inline node_t* vm_load_node(vm_t* vm, const char* name, bool create) {
-	var_t* var = vm_get_scope_var(vm);
+	scope_t* sc = vm_get_scope(vm);
+	/* An object/array-literal construction scope (handle_obj) is a MEMBERN/ARRE
+	 * write target, NOT a lexical env. Its var is the literal being built, whose
+	 * own members are properties-under-construction and whose prototype chain is
+	 * Object.prototype / Array.prototype. Resolving a free name against it here
+	 * (via the prototype-inclusive var_find_member below) shadows any real binding
+	 * whose name is also a builtin method - e.g. `{id: keys[i]}` resolved the
+	 * global array `keys` to Object.prototype.keys (a function), so keys[i] read
+	 * undefined. Skip the literal scope and let vm_find_in_scopes resolve outward. */
+	var_t* var = (sc != NULL && !sc->is_objlit) ? vm_get_scope_var(vm) : NULL;
 
 	node_t* n = NULL;
 	if(var != NULL)
@@ -4960,6 +5129,10 @@ static void func_free(void* p) {
 		var_unref(ref);
 	}
 	array_clean(&func->args, NULL);
+	if(func->nfe_name != NULL) {
+		mario_free(func->nfe_name);
+		func->nfe_name = NULL;
+	}
 	mario_free(p);
 }
 
@@ -5172,6 +5345,15 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		vm_push(vm, var_new(vm));
 		return false;
 	}
+	if(getenv("MARIO_FENTRY") != NULL) { /* DIAG (temp): JS func-entry trace lo:hi:max */
+		static int fe_lo = -1, fe_hi = -1, fe_max = 0, fe_n = 0, fe_init = 0;
+		if(!fe_init) { fe_init = 1; sscanf(getenv("MARIO_FENTRY"), "%d:%d:%d", &fe_lo, &fe_hi, &fe_max); }
+		if(fe_lo >= 0 && (int)func->pc >= fe_lo && (int)func->pc <= fe_hi && fe_n < fe_max) {
+			fe_n++;
+			fprintf(stderr, "[fentry] fpc=%u vpc=%u argc=%d depth=%d\n",
+				(unsigned)func->pc, (unsigned)vm->pc, arg_num, (int)vm->call_depth);
+		}
+	}
 	if(obj == NULL) {
 		//obj = vm->root;
 	}
@@ -5228,6 +5410,47 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		}
 	}
 	var_array_reverse(args); // reverse the args array coz stack index.
+
+	if(getenv("MARIO_RSDBG") != NULL && getenv("MARIO_FCHUNK") != NULL) { /* DIAG (temp): trace flight chunk fn entries O/M/P/R */
+		static int fc_lo = -1, fc_hi = -1, fc_init = 0;
+		if(!fc_init) { fc_init = 1; sscanf(getenv("MARIO_FCHUNK"), "%d:%d", &fc_lo, &fc_hi); }
+		if(fc_lo >= 0 && (int)func->pc >= fc_lo && (int)func->pc <= fc_hi) {
+			static const char* an[4] = {"e","t","n","r"};
+			fprintf(stderr, "[fchunk] fpc=%u vpc=%u", (unsigned)func->pc, (unsigned)vm->pc);
+			for(int k = 0; k < 4; k++) {
+				var_t* pv = var_find_own_member_var(env, an[k]);
+				if(pv == NULL) continue;
+				fprintf(stderr, " | %s:t%d/f%d/a%d/p%p", an[k], (int)pv->type, (int)pv->is_func, (int)pv->is_array, (void*)pv);
+				if(pv->type == V_INT || pv->type == V_INT64)
+					fprintf(stderr, "(=%lld)", (long long)var_get_int(pv));
+				else if(pv->type == V_STRING)
+					fprintf(stderr, "(='%s')", var_get_str(pv));
+				if(pv->type == V_OBJECT && !pv->is_array) {
+					var_t* st = var_find_own_member_var(pv, "status");
+					var_t* vv = var_find_own_member_var(pv, "value");
+					var_t* rr = var_find_own_member_var(pv, "reason");
+					if(st != NULL || vv != NULL || rr != NULL) {
+						fprintf(stderr, " {status=%s value:t%d/f%d/a%d reason:t%d/a%d/p%p}",
+							(st != NULL) ? var_get_str(st) : "-",
+							(vv != NULL) ? (int)vv->type : -1, (vv != NULL) ? (int)vv->is_func : 0, (vv != NULL) ? (int)vv->is_array : 0,
+							(rr != NULL) ? (int)rr->type : -1, (rr != NULL) ? (int)rr->is_array : 0, (void*)rr);
+					}
+				}
+			}
+			fprintf(stderr, "\n");
+		}
+	}
+
+	/* ES named-function-expression self-binding: `var f = function name(){ ...name... }`
+	 * must resolve `name` to the function itself inside the body, while `name` stays
+	 * invisible in the defining scope. Bind it into THIS call's env (fresh per
+	 * invocation, never leaks outward). Skip when a parameter already claims the name
+	 * so a same-named parameter still shadows the function, matching ES scope order.
+	 * Without this the React flight reader's tail `u.read().then(t)` (where `t` is the
+	 * reader's own NFE name) passed undefined and the RSC stream stalled after 2 reads. */
+	if(func->nfe_name != NULL && !var_empty(env) &&
+	   var_find_own_member(env, func->nfe_name) == NULL)
+		var_add(env, func->nfe_name, func_var);
 
 	if(func->owner != NULL && func->owner->type == V_OBJECT &&
 	   func->owner->children.buckets != NULL) {
@@ -5536,6 +5759,62 @@ static bool ta_slot_write(vm_t* vm, node_t* n, var_t* val) {
 	return true;
 }
 
+/* ---- Array `length` write sentinel ----
+ * `arr.length = n` compiles to the same GETW target fetch as a plain member
+ * assignment, but an array's length is virtual (the _ARRAY_ store's element
+ * count), so do_get(for_write) can not resolve a writable member node. It pushes
+ * this @@arrlen sentinel carrying the array; arrlen_slot_write() resizes it. */
+static inline bool is_arrlen_slot(node_t* n) {
+	return n != NULL && n->name != NULL && n->name[0] == '@' && strcmp(n->name, ARRLEN_SLOT) == 0;
+}
+
+/* Push a @@arrlen write-target for `arr.length = ..`. Adopts a reference on the
+ * array (via the hidden @@alarr member) so it outlives the caller's var_unref of
+ * its popped stack ref; the sentinel is the sole holder until consumed. */
+static void arrlen_push(vm_t* vm, var_t* arr) {
+	var_t* cur = var_new(vm);   /* placeholder; refs 0, adopted by the ref below */
+	vm->gc.gc_defer++;          /* sn/cur are unrooted until vm_push_node */
+	var_ref(cur);               /* node's own reference */
+	node_t* sn = (node_t*)mario_malloc(sizeof(node_t));
+	memset(sn, 0, sizeof(node_t));
+	sn->magic = 1;
+	sn->name = (char*)mario_malloc(strlen(ARRLEN_SLOT)+1);
+	memcpy(sn->name, ARRLEN_SLOT, strlen(ARRLEN_SLOT)+1);
+	sn->var = cur;
+	node_t* an = var_add(cur, ARRLEN_SLOT_ARR, arr);   /* var_add refs arr */
+	an->invisable = 1; an->be_unenumerable = 1;
+	vm_push_node(vm, sn);                              /* adds the stack reference to cur */
+	vm->gc.gc_defer--;
+}
+
+/* If `n` is a @@arrlen write-target, resize the array to `val` (ToUint32) and
+ * return true (the caller frees the sentinel with node_free). The hidden @@alarr
+ * back-ref is dropped afterwards so the array reference is released with it. */
+static bool arrlen_slot_write(vm_t* vm, node_t* n, var_t* val) {
+	(void)vm;
+	if(!is_arrlen_slot(n))
+		return false;
+	var_t* arr = var_find_own_member_var(n->var, ARRLEN_SLOT_ARR);
+	if(arr != NULL && arr->is_array) {
+		/* ToUint32 on the assigned value; clamp to the valid array-length range. */
+		double d = 0;
+		if(val != NULL) {
+			if(val->type == V_FLOAT || val->type == V_FLOAT64)
+				d = (double)var_get_float64(val);
+			else if(val->type != V_UNDEF && val->type != V_NULL)
+				d = (double)var_get_int(val);
+		}
+		uint32_t newlen = 0;
+		if(d > 0 && d < 4294967295.0)
+			newlen = (uint32_t)d;
+		else if(d >= 4294967295.0)
+			newlen = 4294967295u;
+		var_array_resize(arr, newlen);
+	}
+	var_delete_own_member(n->var, ARRLEN_SLOT_ARR);
+	return true;
+}
+
 /* ---- Proxy write sentinel (Phase 5) ----
  * `proxy.name = v` / `proxy[k] = v` compile to the same GETW / ARRAY_AT_W target
  * fetch as a plain assignment, so the write path routes a proxy through a synthetic
@@ -5695,7 +5974,7 @@ static inline void math_result(vm_t* vm, opr_code_t op, node_t* n, var_t* res) {
 		 * drives the proxy set trap, and a @@wslot target (member write on a
 		 * transient receiver) writes through the receiver's real node; both are
 		 * freed the same way. */
-		if(ta_slot_write(vm, n, res) || proxy_slot_write(vm, n, res) || wslot_write(vm, n, res))
+		if(ta_slot_write(vm, n, res) || proxy_slot_write(vm, n, res) || wslot_write(vm, n, res) || arrlen_slot_write(vm, n, res))
 			node_free(n);
 		else
 			node_replace(n, res); //the node takes its own reference to res.
@@ -6230,6 +6509,41 @@ static int mstr_utf16_length(const char* s) {
 	return units;
 }
 
+/* ES: a canonical numeric STRING key indexes a string's characters, so str["1"]
+ * === str[1] (and the same for a boxed String object, whose primitive lives in
+ * ->value). mario stores strings as UTF-8, so this mirrors the numeric-key path
+ * in array_at_push byte-for-byte. Returns true (having pushed the char, or
+ * undefined when out of range) only for a canonical index on a string/string
+ * object read; every other case returns false so the caller runs its normal
+ * member lookup. Gated on a digit first-char + `!for_write` (an index write is a
+ * JS no-op) so ordinary names never reach the type/marker probe, keeping the hot
+ * do_get / array_at_push paths a single cheap compare for plain objects. Shared
+ * by do_get (C-API mario_get_var with a numeric string key) and array_at_push
+ * (bytecode `str["0"]`). */
+static bool str_obj_index_push(vm_t* vm, var_t* v, const char* name, bool for_write) {
+	if(for_write || name == NULL || v == NULL)
+		return false;
+	if(!(name[0] >= '0' && name[0] <= '9'))
+		return false;
+	if(!(v->type == V_STRING || var_is_string_obj(v)))
+		return false;
+	const char* p = name;
+	while(*p >= '0' && *p <= '9') p++;
+	if(*p != 0 || (name[0] == '0' && name[1] != 0))
+		return false;   /* non-canonical ("01", "1a") -> ordinary lookup */
+	int at = (int)strtol(name, NULL, 10);
+	const char* s = var_get_str(v);
+	int len = (s != NULL) ? (int)strlen(s) : 0;
+	if(at >= 0 && at < len) {
+		char ch[2] = { s[at], 0 };
+		vm_push(vm, var_new_str(vm, ch));
+	}
+	else {
+		vm_push(vm, var_new(vm));
+	}
+	return true;
+}
+
 /* Member fetch. When `for_write` is set the access is an assignment target: an
  * accessor property pushes the object (for the setter's `this`) followed by the
  * node so handle_asign can invoke the setter; a read invokes the getter and
@@ -6262,16 +6576,32 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		}
 		return;
 	}
-	if(v->type == V_STRING && strcmp(name, "length") == 0) {
+	if(strcmp(name, "length") == 0 && (v->type == V_STRING || var_is_string_obj(v))) {
 		int len = mstr_utf16_length(var_get_str(v));
 		vm_push(vm, var_new_int(vm, len));
 		return;
 	}
 	else if(v->is_array && strcmp(name, "length") == 0) {
+		/* `arr.length` is virtual (the _ARRAY_ store's element count). A READ
+		 * yields the size; a WRITE (`arr.length = n`) can not resolve to a plain
+		 * member node, so route it through the @@arrlen sentinel that resizes the
+		 * store. Returning the size even for_write (the old behaviour) pushed a
+		 * bare value, vm_pop2node gave NULL and handle_asign no-op'd the write -
+		 * `buf.length = 0` never cleared React's RSC flight row buffer. */
+		if(for_write) {
+			arrlen_push(vm, v);
+			return;
+		}
 		int len = var_array_size(v);
 		vm_push(vm, var_new_int(vm, len));
 		return;
 	}	
+
+	/* ES: `str["1"]` / a boxed String object indexed by a canonical numeric string
+	 * key. mario_get_var routes string keys here (bytecode `str["0"]` goes via
+	 * array_at_push, which shares this helper). See str_obj_index_push. */
+	if(str_obj_index_push(vm, v, name, for_write))
+		return;
 
 	node_t* n = var_find_member(v, name);
 	/* Function.prototype.toString: functions carry Object.prototype as their
@@ -6337,6 +6667,15 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 	}
 
 	if(n == NULL) {
+		/* A READ of a missing member yields undefined and must NOT materialize an
+		 * own property: `typeof o.then` used to leave a real `then` member behind,
+		 * so Object.keys()/for-in/`in`/hasOwnProperty all reported keys the script
+		 * never created (a read-result record came back with keys value,done,then).
+		 * Only an assignment target may create the binding. */
+		if(!for_write) {
+			vm_push(vm, var_new(vm));
+			return;
+		}
 		if(v->type == V_UNDEF)
 			v->type = V_OBJECT;
 
@@ -7047,7 +7386,7 @@ static var_t* vm_accessor_scope_owner(vm_t* vm, const char* name, node_t* node) 
 	return NULL;
 }
 
-static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool raw) {
+static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool raw, bool as_value) {
 	bool loaded = false;
 	node_t* node = NULL;
 	if(offset == vm->this_strIndex) {
@@ -7126,7 +7465,19 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool r
 			}
 			return; /* never cache an accessor result */
 		}
-		vm_push_node(vm, node);
+		/* Rvalue read of a bare identifier (INSTR_LOADV): push the binding's
+		 * CURRENT VALUE as a snapshot rather than the binding node. The value
+		 * stack otherwise holds the node and dereferences node->var lazily at
+		 * consumption time, so an operand pushed earlier (e.g. the first `m` in
+		 * `f(m, m++, m)`) would observe a later in-place reassignment of the same
+		 * binding (node_replace swaps node->var) instead of the value it had when
+		 * the operand was evaluated. vm_push takes its own reference, so the
+		 * snapshot survives the binding's node_replace (which only unrefs the
+		 * node's own reference). Write targets keep the node form via LOADW. */
+		if(as_value)
+			vm_push(vm, node->var != NULL ? node->var : var_new(vm));
+		else
+			vm_push_node(vm, node);
 	}
 
 	if(node == NULL || node->var == NULL)
@@ -7137,20 +7488,28 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool r
 }
 
 static inline void handle_load(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
-	handle_load_impl(vm, offset, false, false);
+	handle_load_impl(vm, offset, false, false, false);
+}
+
+/* LOADV: rvalue read of a bare identifier - pushes the binding's current VALUE
+ * (a snapshot) instead of the binding node, so an operand already on the value
+ * stack is not aliased by a later reassignment of the same binding. Resolution
+ * (including accessor getter invocation) is identical to LOAD. */
+static inline void handle_loadv(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	handle_load_impl(vm, offset, false, false, true);
 }
 
 /* LOADW: assignment-target form of LOAD - always pushes the raw binding node
  * (the compiler retargets the target LOAD of `x = v` / `x += v`), so accessor
  * setters see their node instead of the getter's result. */
 static inline void handle_loadw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
-	handle_load_impl(vm, offset, false, true);
+	handle_load_impl(vm, offset, false, true, false);
 }
 
 /* LOAD_SAFE $n: the direct bare-identifier operand of `typeof`. Resolution is
  * identical to LOAD; only an unresolvable name differs (undefined, no throw). */
 static inline void handle_load_safe(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
-	handle_load_impl(vm, offset, true, false);
+	handle_load_impl(vm, offset, true, false, false);
 }
 
 static inline void handle_compare(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -7197,9 +7556,6 @@ static inline void handle_block(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		 * NOT stop here (it belongs to an enclosing loop), hence a distinct flag. */
 		sc->is_switch = true;
 		sc->pc = vm->pc+1;
-		/* DIAG (temp): track one leaking switch site. */
-		if(sc->pc == 32771)
-			fprintf(stderr, "[swdbg] PUSH switch@32771 top=%d pc=%u\n", (int)vm->scope_stack_top + 1, (unsigned)vm->pc);
 	}
 	else if(instr == INSTR_LABEL) {
 		/* Labeled-statement scope (`outer: { ... }`): sc->pc is the break anchor
@@ -7210,6 +7566,16 @@ static inline void handle_block(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		sc->label = bc_getstr(&vm->bc, offset);
 		sc->pc = vm->pc+1;
 	}
+	/* A `try` (or a try-finally with no catch, demoted to a plain block) whose
+	 * finally PC the compiler patched into the instruction operand: record it so a
+	 * `return` leaving the body runs the finally first (handle_return). OFF_MASK is
+	 * the "no operand" sentinel bc_gen emits, so ordinary blocks never match. The
+	 * relative-offset math mirrors handle_jmp: operand = target - this_index and
+	 * vm->pc is already this_index+1 here. */
+	if((instr == INSTR_TRY || instr == INSTR_BLOCK) && offset != OFF_MASK) {
+		sc->has_finally = 1;
+		sc->pc_finally = (vm->pc - 1) + offset;
+	}
 	vm_push_scope(vm, sc);
 }
 
@@ -7217,7 +7583,15 @@ static inline void handle_block_end(vm_t* vm, PC ins, opr_code_t instr, uint32_t
 	vm_pop_scope(vm);
 }
 
+/* Defined with vm_finish_return below; forward-declared so break/continue (which
+ * must abandon a return parked for an enclosing finally) can call it. */
+static inline void vm_clear_pending(vm_t* vm);
+
 static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	/* A `break` inside a finally body overrides any return parked for that finally
+	 * (JS: the finally's own exit wins); drop it so a later INSTR_FINALLY_END does
+	 * not resume a stale transfer. No-op in ordinary code. */
+	vm_clear_pending(vm);
 	/* `break <label>` carries the label name as its string operand; an unlabeled
 	 * `break` has an empty operand (OFF_MASK -> ""). A labeled break unwinds to
 	 * the matching labeled-statement scope (skipping any inner loops/switches,
@@ -7239,9 +7613,6 @@ static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 			}
 		}
 		else if(sc->is_loop || sc->is_switch) {
-			/* DIAG (temp): track one leaking switch site. */
-			if(sc->is_switch && sc->pc == 32771)
-				fprintf(stderr, "[swdbg] BREAK stops at switch@32771 (no pop) top=%d pc=%u\n", (int)vm->scope_stack_top, (unsigned)vm->pc);
 			vm->pc = sc->pc;
 			break;
 		}
@@ -7250,6 +7621,8 @@ static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 }
 
 static inline void handle_continue(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	/* See handle_break: a `continue` inside a finally body overrides a parked return. */
+	vm_clear_pending(vm);
 	/* `continue <label>` carries the label name as its string operand; an
 	 * unlabeled `continue` has an empty operand (OFF_MASK -> ""). An unlabeled
 	 * continue restarts the innermost enclosing loop. A labeled continue restarts
@@ -7718,7 +8091,7 @@ static inline void vm_step_op(vm_t* vm, PC ins, node_t* n, var_t* v, int step, b
 		 * buffer and free the sentinel; node_free releases the node's own ref on
 		 * the decoded element exactly as node_replace's var_unref(old) would. A
 		 * @@proxyslot (`p.x++`) drives the proxy set trap and is freed the same way. */
-		if(ta_slot_write(vm, n, nv) || proxy_slot_write(vm, n, nv))
+		if(ta_slot_write(vm, n, nv) || proxy_slot_write(vm, n, nv) || arrlen_slot_write(vm, n, nv))
 			node_free(n);
 		else
 			node_replace(n, nv); //write the new value back through the binding.
@@ -7823,20 +8196,63 @@ static void propagate_closure_cb(const char* key, void* value, void* user_data) 
 	}
 }
 
-static inline void handle_return(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
-	var_t* ret = NULL;
-	if(instr == INSTR_RETURN) {
-		vm_push(vm, var_new(vm));
+/* Abandon any control transfer parked for a `finally` (freeing its held value).
+ * Called when the transfer completes, and when a return/break/continue/throw
+ * INSIDE a finally body overrides the parked one - JS lets the finally's own
+ * exit win, so the original parked transfer must be dropped or a later, unrelated
+ * INSTR_FINALLY_END would resume a stale value. */
+static inline void vm_clear_pending(vm_t* vm) {
+	if(vm->pending_op != FIN_NONE) {
+		if(vm->pending_value != NULL)
+			var_unref(vm->pending_value);
+		vm->pending_value = NULL;
+		vm->pending_op = FIN_NONE;
+		vm->pending_pc = 0;
+	}
+}
+
+/* Finish a function return carrying `ret` (an owned ref, or NULL for
+ * `return;`/undefined). If the return leaves a try body that has a `finally`,
+ * park the value in vm->pending_value, jump to the finally block and let its
+ * INSTR_FINALLY_END call back into here; otherwise push the value, bind closures
+ * on a returned object, jump to the enclosing function frame's return address
+ * and pop scopes, setting fin_ret_done so vm_run breaks this frame. Recursing
+ * through vm_finish_return is what makes nested try/finally run every finally in
+ * inner-to-outer order. */
+static void vm_finish_return(vm_t* vm, var_t* ret) {
+	scope_t* fin = NULL;
+	scope_t* s = vm_get_scope(vm);
+	while(s != NULL && !s->is_func) {
+		if(s->has_finally) { fin = s; break; }
+		s = s->prev;
+	}
+	if(fin != NULL) {
+		PC fpc = fin->pc_finally;
+		/* A return inside a finally body overrides whatever was already parked. */
+		if(vm->pending_value != NULL)
+			var_unref(vm->pending_value);
+		vm->pending_op = FIN_RETURN;
+		vm->pending_value = ret;   /* owned (or NULL); kept gc-reachable in gc_vars() */
+		/* Pop scopes down to and including the try scope, exactly as its
+		 * INSTR_TRY_END would on the normal path, so the finally body runs with the
+		 * same scope stack it always does. fin is freed by the pop, so read fpc first. */
+		while(vm_get_scope(vm) != NULL && vm_get_scope(vm) != fin)
+			vm_pop_scope(vm);
+		if(vm_get_scope(vm) == fin)
+			vm_pop_scope(vm);
+		vm->pc = fpc;
+		return;   /* vm_run keeps running: fin_ret_done stays false */
+	}
+
+	/* Completing: drop any transfer a finally body's own return is overriding. */
+	vm_clear_pending(vm);
+
+	if(ret != NULL) {
+		vm_push(vm, ret);
+		var_unref(ret);
 	}
 	else {
-		ret = vm_pop2(vm);
-		if(ret != NULL) {
-			vm_push(vm, ret);
-			var_unref(ret);
-		}
-		else {
-			vm_push(vm, var_new(vm));
-		}
+		vm_push(vm, var_new(vm));
 	}
 
 	while(true) {
@@ -7859,6 +8275,30 @@ static inline void handle_return(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 			break;
 		}
 		vm_pop_scope(vm);
+	}
+	vm->fin_ret_done = true;   /* this frame must break exactly like a plain return */
+}
+
+static inline void handle_return(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* ret = NULL;
+	if(instr != INSTR_RETURN) {
+		ret = vm_pop2(vm);
+	}
+	vm_finish_return(vm, ret);
+}
+
+/* End of a `finally` block. On the normal (fall-through) path pending_op is
+ * FIN_NONE and this is a no-op - the block simply continues into the code after
+ * the try statement. When a return was parked here by vm_finish_return, resume
+ * it: recurse (another enclosing finally may need to run first, in which case
+ * fin_ret_done stays false and vm_run keeps running); when it truly completes,
+ * vm_finish_return sets fin_ret_done and vm_run breaks the frame. */
+static inline void handle_finally_end(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	if(vm->pending_op == FIN_RETURN) {
+		var_t* ret = vm->pending_value;
+		vm->pending_value = NULL;
+		vm->pending_op = FIN_NONE;
+		vm_finish_return(vm, ret);
 	}
 }
 
@@ -8040,7 +8480,7 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	 * node_free then releases the node's own reference and frees the sentinel.
 	 * A @@wslot target (member write on a transient receiver) and a @@proxyslot
 	 * target are consumed the same way. */
-	if(ta_slot_write(vm, n, v) || proxy_slot_write(vm, n, v) || wslot_write(vm, n, v)) {
+	if(ta_slot_write(vm, n, v) || proxy_slot_write(vm, n, v) || wslot_write(vm, n, v) || arrlen_slot_write(vm, n, v)) {
 		var_unref(n->var);
 		node_free(n);
 		if((ins & INSTR_OPT_CACHE) == 0) {
@@ -8755,6 +9195,98 @@ static inline void handle_callx(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		func_call(vm, obj, func, arg_num);
 	}
 	else {
+		if(getenv("MARIO_RSDBG") != NULL) { /* DIAG (temp): what non-callable value hit CALLX */
+			fprintf(stderr, "[rsdbg] CALLX non-func pc=%u type=%d is_func=%d is_array=%d ptr=%p",
+				(unsigned)vm->pc, (func != NULL) ? (int)func->type : -1,
+				(func != NULL) ? (int)func->is_func : 0, (func != NULL) ? (int)func->is_array : 0, (void*)func);
+			if(func != NULL && func->type == V_STRING)
+				fprintf(stderr, " str='%.80s'", var_get_str(func));
+			fprintf(stderr, "\n");
+			{ /* dump the listener array `e` from R's function env.
+			   * vm_get_scope_var returns the innermost for-loop BLOCK scope, which
+			   * does not hold R's `e` param, so walk the scope stack up to the
+			   * nearest is_func scope. NB: use the non-allocating var_array_peek -
+			   * var_array_get_var would materialize holes (allocate) before gc_defer++
+			   * below, letting a gc sweep the unrooted func/args and crash. */
+				var_t* scv = NULL;
+				for(int32_t si = vm->scope_stack_top - 1; si >= 0; si--) {
+					scope_t* ssc = vm->scope_stack[si];
+					if(ssc != NULL && ssc->is_func && !var_empty(ssc->var)) { scv = ssc->var; break; }
+				}
+				{ /* which frame is this? print its entrypc */
+					scope_t* sfc = NULL;
+					for(int32_t si = vm->scope_stack_top - 1; si >= 0; si--) {
+						scope_t* ssc = vm->scope_stack[si];
+						if(ssc != NULL && ssc->is_func) { sfc = ssc; break; }
+					}
+					fprintf(stderr, "[rsdbg]   frame entrypc=%u\n",
+						(sfc != NULL && sfc->func != NULL) ? (unsigned)sfc->func->pc : 0);
+					/* caller chain: entrypcs of all enclosing func frames */
+					fprintf(stderr, "[rsdbg]   callers:");
+					int hop = 0;
+					for(int32_t si = vm->scope_stack_top - 1; si >= 0 && hop < 14; si--) {
+						scope_t* ssc = vm->scope_stack[si];
+						if(ssc != NULL && ssc->is_func && ssc->func != NULL) {
+							fprintf(stderr, " %u", (unsigned)ssc->func->pc);
+							hop++;
+						}
+					}
+					fprintf(stderr, "\n");
+					/* dump e/t/n/r of the 3 innermost func frames (R, P, O) */
+					{
+						static const char* pn[4] = {"e","t","n","r"};
+						int fi = 0;
+						for(int32_t si = vm->scope_stack_top - 1; si >= 0 && fi < 3; si--) {
+							scope_t* ssc = vm->scope_stack[si];
+							if(ssc == NULL || !ssc->is_func || ssc->func == NULL || var_empty(ssc->var))
+								continue;
+							fprintf(stderr, "[rsdbg]   frame[%d] pc=%u:", fi, (unsigned)ssc->func->pc);
+							for(int k = 0; k < 4; k++) {
+								var_t* pv = var_find_own_member_var(ssc->var, pn[k]);
+								if(pv == NULL) continue;
+								fprintf(stderr, " %s=t%d/f%d/a%d/p%p", pn[k], (int)pv->type,
+									(int)pv->is_func, (int)pv->is_array, (void*)pv);
+							}
+							fprintf(stderr, "\n");
+							fi++;
+						}
+					}
+				}
+				var_t* arr = (scv != NULL) ? var_find_own_member_var(scv, "e") : NULL;
+				if(arr == NULL && scv != NULL) arr = var_find_member_var(scv, "e");
+				fprintf(stderr, "[rsdbg]   R env=%p e=%p", (void*)scv, (void*)arr);
+				if(arr != NULL) {
+					fprintf(stderr, " t=%d is_array=%d", (int)arr->type, (int)arr->is_array);
+					var_t* sub = var_find_own_member_var(arr, "_ARRAY_");
+					var_t* ln = var_find_own_member_var(arr, "length");
+					fprintf(stderr, " _ARRAY_=%p length=%s", (void*)sub,
+						(ln != NULL) ? var_get_str(ln) : "(none)");
+				}
+				if(arr != NULL && arr->is_array) {
+					uint32_t len = var_array_size(arr);
+					fprintf(stderr, " sz=%u:", (unsigned)len);
+					for(uint32_t q = 0; q < len && q < 16; q++) {
+						node_t* nd = var_array_peek(arr, (int32_t)q);
+						var_t* el = (nd != NULL) ? nd->var : NULL;
+						fprintf(stderr, " [%u]t%d/f%d/p%p", (unsigned)q,
+							(el != NULL) ? (int)el->type : -1, (el != NULL) ? (int)el->is_func : 0, (void*)el);
+					}
+				}
+				if(arr != NULL && !arr->is_array) { /* enumerate own members to identify the object */
+					fprintf(stderr, " members[cap=%u]:", (unsigned)arr->children.capacity);
+					int shown = 0;
+					for(uint32_t b = 0; b < arr->children.capacity && shown < 24; b++) {
+						for(hash_entry_t* he = arr->children.buckets[b]; he != NULL && shown < 24; he = he->next, ++shown) {
+							node_t* nd = (node_t*)he->value;
+							var_t* mv = (nd != NULL) ? nd->var : NULL;
+							fprintf(stderr, " %s:t%d/f%d", he->key,
+								(mv != NULL) ? (int)mv->type : -1, (mv != NULL) ? (int)mv->is_func : 0);
+						}
+					}
+				}
+				fprintf(stderr, "\n");
+			}
+		}
 		vm->gc.gc_defer++; //func is a bare C pointer while the args are popped and the throw unwinds
 		while(arg_num > 0) {
 			vm_pop(vm);
@@ -8889,6 +9421,21 @@ static inline void handle_func(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	var_t* v = func_def(vm, regular,
 			(instr == INSTR_FUNC_STC ? true : false));
 	if(v != NULL) {
+		/* ES named function expression: stash the function's own name so func_call
+		 * can bind it into each call's env (self-reference visible inside the body
+		 * only). The name rides this instruction's string operand. */
+		if(instr == INSTR_FUNC_NAMED) {
+			const char* nm = bc_getstr(&vm->bc, offset);
+			if(nm != NULL && nm[0] != 0) {
+				func_t* f = var_get_func(v);
+				if(f != NULL && f->nfe_name == NULL) {
+					size_t nlen = strlen(nm);
+					f->nfe_name = (char*)mario_malloc(nlen + 1);
+					if(f->nfe_name != NULL)
+						memcpy(f->nfe_name, nm, nlen + 1);
+				}
+			}
+		}
 		/* Mark ES6 arrow / generator functions so the runtime can enforce their
 		 * special semantics (arrows are not constructible; generators suspend at
 		 * `yield` instead of running straight through). */
@@ -8969,6 +9516,14 @@ static inline void handle_obj(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 	else
 		obj = var_new_array(vm);
 	scope_t* sc = scope_new(obj);
+	/* The literal-under-construction scope is a MEMBERN/ARRE write target, not a
+	 * lexical env: mark it so free-name resolution (vm_load_node /
+	 * vm_find_in_scopes) skips it. Without this a bare identifier inside a
+	 * property value that happens to name a builtin prototype method (`keys`,
+	 * `values`, `length`, ...) resolves to that method on the literal's prototype
+	 * chain instead of the real binding, e.g. `{id: keys[i]}` read
+	 * Object.prototype.keys (a function) so keys[i] came back undefined. */
+	sc->is_objlit = true;
 	vm_push_scope(vm, sc);
 }
 
@@ -9031,7 +9586,7 @@ static var_t* native_string_iter_next(vm_t* vm, var_t* env, void* data) {
 	var_t* this_v = get_obj(env, THIS);
 	var_t* src = var_find_member_var(this_v, "@@src");
 	var_t* idxv = var_find_member_var(this_v, "@@idx");
-	const char* s = (src != NULL && src->type == V_STRING) ? var_get_str(src) : NULL;
+	const char* s = (src != NULL && (src->type == V_STRING || var_is_string_obj(src))) ? var_get_str(src) : NULL;
 	int len = (s != NULL) ? (int)strlen(s) : 0;
 	int idx = (idxv != NULL) ? var_get_int(idxv) : 0;
 	if(s != NULL && idx < len) {
@@ -9808,6 +10363,11 @@ static int64_t ta_key_index(var_t* v2) {
 	return var_get_int64(v2);
 }
 
+/* Canonical array-index key -> the array's nested _ARRAY_ element store (else the
+ * object itself). Defined below near mario_define_default; forward-declared so the
+ * subscript READ path shares the exact index rule with the WRITE path. */
+static var_t* array_elem_store(var_t* obj, const char* ks);
+
 /* Shared post-pop body of the subscript operators: v1 (receiver) and v2 (key)
  * arrive owning their value-stack references and are released here. Pushes the
  * element/member value or, for a persistent receiver, the binding node so a
@@ -9827,13 +10387,21 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 	 * straight from the shared buffer. The cheap `!is_array && var_is_typedarray`
 	 * guard is one hash miss for every plain object/array, so the hot path is a
 	 * genuine no-op for them. Symbol keys (e.g. @@iterator) fall through to the
-	 * normal member lookup below. OOB / non-canonical index -> undefined. */
+	 * normal member lookup below. Per ECMA-262 only CANONICAL numeric strings index
+	 * a TypedArray, so a non-canonical string key ("entries", "length", "buffer",
+	 * a method name core-js fetches via `proto[key]`) is an ordinary property and
+	 * must also fall through to the prototype-chain lookup rather than decode as an
+	 * out-of-range element (undefined). OOB numeric index -> undefined. */
 	if(!v1->is_array && var_is_typedarray(v1) && !var_is_symbol(v2)) {
-		var_t* el = var_typedarray_get_at(vm, v1, ta_key_index(v2));
-		vm_push(vm, (el != NULL) ? el : var_new(vm));
-		var_unref(v1);
-		var_unref(v2);
-		return;
+		int64_t idx = ta_key_index(v2);
+		if(idx >= 0 || v2->type != V_STRING) {
+			var_t* el = var_typedarray_get_at(vm, v1, idx);
+			vm_push(vm, (el != NULL) ? el : var_new(vm));
+			var_unref(v1);
+			var_unref(v2);
+			return;
+		}
+		/* non-canonical string key: fall through to the member lookup below */
 	}
 	node_t* n = NULL;
 	if(getenv("MARIO_ARRDBG") && v1 != NULL && v1->is_array) { /* DIAG (temp): which subscript branch does arr[i] take? */
@@ -9854,16 +10422,45 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 		/* ES6 symbol key: obj[sym] resolves through the symbol's unique key. */
 		const char* sk = var_symbol_key(v2);
 		if(sk != NULL)
-			n = var_find_member_create(v1, sk);
+			n = for_write ? var_find_member_create(v1, sk) : var_find_member(v1, sk);
 	}
 	else if(v2->type == V_STRING) {
 		const char* s = var_get_str(v2);
-		n = var_find_member_create(v1, s);
+		/* `str["0"]` / a boxed String object indexed by a canonical numeric string
+		 * key: the character read shares do_get's helper. Arrays and every other
+		 * receiver (and non-canonical keys like "01") fall through to the array /
+		 * ordinary member logic below, so this is a no-op for them. */
+		if(str_obj_index_push(vm, v1, s, for_write)) {
+			var_unref(v1);
+			var_unref(v2);
+			return;
+		}
+		/* ES: a canonical numeric string key indexes an array's elements, so
+		 * a["0"] === a[0]; the elements live in the hidden _ARRAY_ store, which a
+		 * plain var_find_member on the outer var misses (core-js structuredClone
+		 * round-trips an array via Object.keys(value) + value[key]). Route index
+		 * keys through the array accessors - matching the write path in
+		 * mario_define_default - and leave non-index strings ("length", method
+		 * names, "01", "-1") on the ordinary member lookup. Reads must not create
+		 * the member (see do_get): `o["k"]` used to leave a phantom own property. */
+		var_t* store = array_elem_store(v1, s);
+		if(store != v1) {
+			int32_t idx = (int32_t)strtol(s, NULL, 10);
+			n = for_write ? var_array_get(v1, idx) : var_array_peek(v1, idx);
+		}
+		else {
+			n = for_write ? var_find_member_create(v1, s) : var_find_member(v1, s);
+		}
 	}
-	else if(v1->type == V_STRING) {
+	else if(v1->type == V_STRING || var_is_string_obj(v1)) {
 		/* ES6: indexing a string yields the character at that position,
 		 * e.g. "abc"[1] == "b"; out-of-range gives undefined (as in JS).
-		 * This also makes `for...of` work over strings. */
+		 * This also makes `for...of` work over strings. A boxed String object
+		 * (Object(str) / new String(str)) carries its primitive in ->value, so
+		 * var_get_str reads it identically and `strObj[i]` yields the same char -
+		 * core-js's arrayFrom index path (module 170) reads O[index] this way.
+		 * The var_is_string_obj hash probe is gated behind the cheap type/is_array
+		 * short-circuits, so arrays never pay it and plain objects pay one miss. */
 		int at = var_get_int(v2);
 		const char* s = var_get_str(v1);
 		int len = (s != NULL) ? (int)strlen(s) : 0;
@@ -9880,7 +10477,9 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 	}
 	else {
 		int at = var_get_int(v2);
-		n = var_array_get(v1, at);
+		/* var_array_get materializes holes up to `at` (needed for a write target);
+		 * a read peeks so `arr[9]` on a short array leaves length alone. */
+		n = for_write ? var_array_get(v1, at) : var_array_peek(v1, at);
 	}
 	/* Accessor via computed key (`navigator["userAgent"]`, `obj[k]` where k names
 	 * a getter property): the string/symbol path above resolves the member node
@@ -9925,7 +10524,12 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 			wk = var_symbol_key(v2);
 		else if(v2->type == V_STRING)
 			wk = var_get_str(v2);
-		if(wk != NULL) {
+		/* A canonical array-index string key already resolved to the element node
+		 * inside v1's own _ARRAY_ store (see the string branch above); that is an
+		 * own slot of the receiver, not an inherited member, so it must NOT be
+		 * shadowed onto the outer var (doing so wrote c["0"] outside _ARRAY_ and
+		 * left the element undefined). */
+		if(wk != NULL && !(v1->is_array && array_elem_store(v1, wk) != v1)) {
 			node_t* own = var_find_own_member(v1, wk);
 			if(own == NULL)
 				own = var_add(v1, wk, NULL);
@@ -10035,15 +10639,16 @@ static inline void handle_array_at_m(vm_t* vm, PC ins, opr_code_t instr, uint32_
 	var_t* v1 = vm_pop2(vm); /* receiver */
 	node_t* n = NULL;
 	if(v1 != NULL && v2 != NULL) {
+		/* Pure read (call target): never materialize the member, see do_get. */
 		if(var_is_symbol(v2)) {
 			const char* sk = var_symbol_key(v2);
 			if(sk != NULL)
-				n = var_find_member_create(v1, sk);
+				n = var_find_member(v1, sk);
 		}
 		else if(v2->type == V_STRING)
-			n = var_find_member_create(v1, var_get_str(v2));
+			n = var_find_member(v1, var_get_str(v2));
 		else
-			n = var_array_get(v1, var_get_int(v2));
+			n = var_array_peek(v1, var_get_int(v2));
 	}
 	if(v1 != NULL)
 		vm_push(vm, v1); /* receiver stays for `this` */
@@ -10502,12 +11107,53 @@ static var_t* make_accessor_wrapper(vm_t* vm, var_t* fn, int regular) {
 	return w;
 }
 
+/* Public: wrap a getter/setter func_t (regular == FUNC_GETTER/FUNC_SETTER) in a
+ * FUNC_REGULAR trampoline so it can be stored as a plain DATA value - e.g. a
+ * property descriptor's `get`/`set` - and read back as a callable function
+ * instead of being auto-invoked by the member-read accessor path. Calls forward
+ * to the original accessor with the caller's `this`. Object.getOwnPropertyDescriptor(s)
+ * uses this to report accessor descriptors truthfully (`.get` must BE the getter,
+ * not its return value). Returns NULL for a non-function. */
+var_t* vm_accessor_as_data_func(vm_t* vm, var_t* fn) {
+	if(fn == NULL || !fn->is_func)
+		return NULL;
+	return make_accessor_wrapper(vm, fn, FUNC_REGULAR);
+}
+
+/* Array element properties live in the hidden _ARRAY_ member store, not in
+ * obj->children, so [[DefineOwnProperty]] / [[GetOwnProperty]] with a canonical
+ * array-index key must target that store - otherwise defineProperty(arr,"0",..)
+ * writes a shadow property that index reads (which consult _ARRAY_) never see,
+ * silently dropping the value. Returns obj itself for non-arrays, TypedArrays
+ * (is_array==0) and non-index keys ("length", named props), whose properties
+ * really do live on obj. */
+static var_t* array_elem_store(var_t* obj, const char* ks) {
+	if(obj == NULL || !obj->is_array || ks == NULL)
+		return obj;
+	const char* p = ks;
+	if(*p < '0' || *p > '9')
+		return obj;                 /* not an index ("length", "foo", "-1", "") */
+	if(*p == '0' && p[1] != '\0')
+		return obj;                 /* "01" etc. are not canonical indices */
+	uint64_t v = 0;
+	for(; *p != '\0'; ++p) {
+		if(*p < '0' || *p > '9')
+			return obj;
+		v = v * 10 + (uint64_t)(*p - '0');
+		if(v >= 4294967295ULL)
+			return obj;             /* >= 2^32-1 is not a valid array index */
+	}
+	var_t* arr_var = var_find_own_member_var(obj, "_ARRAY_");
+	return (arr_var != NULL) ? arr_var : obj;
+}
+
 /* Default [[DefineOwnProperty]] on a plain target, mirroring native_Object. */
 static bool mario_define_default(vm_t* vm, var_t* obj, var_t* key, var_t* desc) {
 	if(obj == NULL)
 		return false;
 	char numbuf[32];
 	const char* ks = proxy_key_cstr(key, numbuf, sizeof(numbuf));
+	var_t* target = array_elem_store(obj, ks); /* element store for index keys */
 
 	/* ES6 accessor descriptor: `{get:f}` / `{set:f}` / both. The property is laid
 	 * out exactly like an object-literal accessor (see merge_accessor): the
@@ -10553,8 +11199,8 @@ static bool mario_define_default(vm_t* vm, var_t* obj, var_t* key, var_t* desc) 
 			node_t* sn = var_add(gw, FUNC_SETTER_KEY, sw);
 			if(sn != NULL) { sn->invisable = 1; sn->be_unenumerable = 1; }
 		}
-		bool acc_existed = (var_find_own_member(obj, ks) != NULL);
-		node_t* node = var_add(obj, ks, primary);
+		bool acc_existed = (var_find_own_member(target, ks) != NULL);
+		node_t* node = var_add(target, ks, primary);
 		if(node == NULL)
 			return false;
 		var_t* e = var_find_own_member_var(desc, "enumerable");
@@ -10566,8 +11212,8 @@ static bool mario_define_default(vm_t* vm, var_t* obj, var_t* key, var_t* desc) 
 	}
 
 	var_t* val = (desc != NULL) ? var_find_own_member_var(desc, "value") : NULL;
-	bool data_existed = (var_find_own_member(obj, ks) != NULL);
-	node_t* node = var_add(obj, ks, val);
+	bool data_existed = (var_find_own_member(target, ks) != NULL);
+	node_t* node = var_add(target, ks, val);
 	if(node == NULL)
 		return false;
 	if(desc != NULL) {
@@ -10589,7 +11235,7 @@ static var_t* mario_gopd_default(vm_t* vm, var_t* obj, var_t* key) {
 		return var_new(vm);
 	char numbuf[32];
 	const char* ks = proxy_key_cstr(key, numbuf, sizeof(numbuf));
-	node_t* node = var_find_own_member(obj, ks);
+	node_t* node = var_find_own_member(array_elem_store(obj, ks), ks);
 	if(node == NULL)
 		return var_new(vm);
 	var_t* d = var_new_obj_no_proto(vm, NULL, NULL);
@@ -10684,9 +11330,21 @@ bool mario_set_var(vm_t* vm, var_t* obj, var_t* key, var_t* value, var_t* receiv
 		var_unref(setter);
 		return true;
 	}
-	if(obj->is_array && key != NULL && key->type != V_STRING && !var_is_symbol(key)) {
-		var_array_set(obj, var_get_int(key), val);
-		return true;
+	if(obj->is_array && key != NULL && !var_is_symbol(key)) {
+		/* A canonical numeric string key ("0") indexes the element store exactly
+		 * like an integer index; array_elem_store routes it into _ARRAY_ (matching
+		 * array_at_push and mario_define_default). var_array_set materializes holes
+		 * so length stays correct. Non-index strings fall through to the ordinary
+		 * own-member write below. */
+		var_t* store = array_elem_store(obj, ks);
+		if(store != obj) {
+			var_array_set(obj, (int32_t)strtol(ks, NULL, 10), val);
+			return true;
+		}
+		if(key->type != V_STRING) {
+			var_array_set(obj, var_get_int(key), val);
+			return true;
+		}
 	}
 	node_t* on = var_find_own_member(obj, ks);
 	if(on == NULL)
@@ -11271,6 +11929,8 @@ static inline void handle_import_bind(vm_t* vm, PC ins, opr_code_t instr, uint32
 }
 
 static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	/* A `throw` inside a finally body overrides any return parked for that finally. */
+	vm_clear_pending(vm);
 	vm_throw_truncate(vm); // the thrown value is on top; drop operands the interrupted expression leaked
 	{ /* TEMP DIAGNOSTIC: log the JS `throw <value>` payload (caught or not). */
 		mstr_t* tts = mstr_new("");
@@ -11443,6 +12103,7 @@ static void init_instr_table(void) {
 	instr_table[INSTR_VAR] = handle_var;
 	instr_table[INSTR_CONST] = handle_const;
 	instr_table[INSTR_LOAD] = handle_load;
+	instr_table[INSTR_LOADV] = handle_loadv;
 	instr_table[INSTR_LOADW] = handle_loadw;
 	instr_table[INSTR_LOAD_SAFE] = handle_load_safe;
 	instr_table[INSTR_GET] = handle_get;
@@ -11470,6 +12131,7 @@ static void init_instr_table(void) {
 	instr_table[INSTR_FUNC_SET] = handle_func;
 	instr_table[INSTR_FUNC_ARROW] = handle_func;
 	instr_table[INSTR_FUNC_GEN] = handle_func;
+	instr_table[INSTR_FUNC_NAMED] = handle_func;
 	instr_table[INSTR_CALL] = handle_call;
 	instr_table[INSTR_CALLO] = handle_call;
 	instr_table[INSTR_CALLX] = handle_callx;
@@ -11581,6 +12243,7 @@ static void init_instr_table(void) {
 	instr_table[INSTR_LOOP_END] = handle_block_end;
 	instr_table[INSTR_TRY] = handle_block;
 	instr_table[INSTR_TRY_END] = handle_block_end;
+	instr_table[INSTR_FINALLY_END] = handle_finally_end;
 	instr_table[INSTR_SWITCH] = handle_block;
 	instr_table[INSTR_SWITCH_END] = handle_block_end;
 	instr_table[INSTR_LABEL] = handle_block;
@@ -11705,8 +12368,31 @@ bool vm_run(vm_t* vm) {
 			if(!pdumped && (PC)(vm->pc - 1) == tgt) {
 				pdumped = 1;
 				void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+				PC rad = 26;
+				if(getenv("MARIO_PCRAD") != NULL) rad = (PC)atoi(getenv("MARIO_PCRAD"));
 				fprintf(stderr, "[PCDUMP] window around pc=%u\n", (unsigned)tgt);
-				bc_dump_window(&vm->bc, tgt, 26);
+				bc_dump_window(&vm->bc, tgt, rad);
+			}
+		}
+
+		{
+			static int ptr_init = 0, ptr_lo = -1, ptr_hi = -1, ptr_max = 0, ptr_skip = 0, ptr_seen = 0, ptr_n = 0;
+			if(!ptr_init) {
+				ptr_init = 1;
+				const char* pe = getenv("MARIO_PTRACE");
+				if(pe != NULL)
+					sscanf(pe, "%d:%d:%d:%d", &ptr_lo, &ptr_hi, &ptr_max, &ptr_skip);
+			}
+			if(ptr_lo >= 0) {
+				PC cur = (PC)(vm->pc - 1);
+				if(cur >= (PC)ptr_lo && cur <= (PC)ptr_hi) {
+					ptr_seen++;
+					if(ptr_seen > ptr_skip && ptr_n < ptr_max) {
+						ptr_n++;
+						fprintf(stderr, "[ptrace %d] pc=%u ins=0x%08X depth=%d\n",
+							ptr_n, (unsigned)cur, (unsigned)ins, (int)vm->call_depth);
+					}
+				}
 			}
 		}
 
@@ -11734,8 +12420,14 @@ bool vm_run(vm_t* vm) {
 				vm->on_step(vm, vm->on_step_data);
 		}
 
-		/* Handle return instructions */
-		if(instr == INSTR_RETURN || instr == INSTR_RETURNV) {
+		/* Handle return instructions. vm_finish_return sets fin_ret_done only when a
+		 * return actually completed (pushed its value and jumped to the func return
+		 * address). A return deferred into a `finally` leaves it false so this frame
+		 * keeps running the finally body; that body's INSTR_FINALLY_END then resumes
+		 * the return and sets the flag. */
+		if((instr == INSTR_RETURN || instr == INSTR_RETURNV || instr == INSTR_FINALLY_END)
+		   && vm->fin_ret_done) {
+			vm->fin_ret_done = false;
 			rv = true;
 			break;
 		}

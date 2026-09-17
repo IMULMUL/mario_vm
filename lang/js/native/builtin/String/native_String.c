@@ -1404,6 +1404,252 @@ var_t* native_StringLocaleCompare(vm_t* vm, var_t* env, void* data) {
 	return var_new_int(vm, c < 0 ? -1 : (c > 0 ? 1 : 0));
 }
 
+/* ------------------------------------------------------------------ */
+/* Global URI / escape functions (ECMA-262 18.2.6 + Annex B).          */
+/* Registered on the root object at the end of reg_native_String; these */
+/* are the standalone-CLI equivalents of the ewebview js_web.c versions */
+/* (the browser host links its own). Args are coerced with JS ToString. */
+/* core-js reads encodeURIComponent/escape/unescape outside any try     */
+/* during load, so a missing binding is a fatal abort, not a no-op.     */
+/* ------------------------------------------------------------------ */
+
+/* Unreserved set (RFC 3986) that both encodeURI and encodeURIComponent keep. */
+static bool uri_unreserved(unsigned char c) {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+	       c == '-' || c == '_' || c == '.' || c == '!' || c == '~' || c == '*' ||
+	       c == '\'' || c == '(' || c == ')';
+}
+/* Set encodeURI leaves alone but encodeURIComponent escapes. */
+static bool uri_reserved(unsigned char c) {
+	return c == ';' || c == '/' || c == '?' || c == ':' || c == '@' || c == '&' ||
+	       c == '=' || c == '+' || c == '$' || c == ',' || c == '[' || c == ']' ||
+	       c == '#';
+}
+
+static void uri_append_escaped(mstr_t* out, unsigned char c) {
+	static const char hex[] = "0123456789ABCDEF";
+	mstr_add(out, '%');
+	mstr_add(out, hex[(c >> 4) & 0xF]);
+	mstr_add(out, hex[c & 0xF]);
+}
+
+static int uri_hex_val(char c) {
+	if(c >= '0' && c <= '9') return c - '0';
+	if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* Coerce arg 0 to a C string via JS ToString into `s` (caller owns/frees `s`). */
+static const char* uri_arg_cstr(var_t* env, mstr_t* s) {
+	var_t* arg = get_func_arg(env, 0);
+	if(arg != NULL)
+		var_to_str(arg, s);
+	return s->cstr;
+}
+
+static var_t* uri_encode(vm_t* vm, var_t* env, bool component) {
+	mstr_t* s = mstr_new("");
+	const char* str = uri_arg_cstr(env, s);
+	mstr_t* out = mstr_new("");
+	for(const unsigned char* p = (const unsigned char*)str; *p != 0; ++p) {
+		if(uri_unreserved(*p) || (!component && uri_reserved(*p)))
+			mstr_add(out, (char)*p);
+		else
+			uri_append_escaped(out, *p);
+	}
+	mstr_free(s);
+	var_t* r = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	return r;
+}
+
+static var_t* native_encodeURIComponent(vm_t* vm, var_t* env, void* data) { (void)data; return uri_encode(vm, env, true); }
+static var_t* native_encodeURI(vm_t* vm, var_t* env, void* data)           { (void)data; return uri_encode(vm, env, false); }
+
+static var_t* uri_decode(vm_t* vm, var_t* env, bool component) {
+	mstr_t* s = mstr_new("");
+	const char* str = uri_arg_cstr(env, s);
+	mstr_t* out = mstr_new("");
+	for(const char* p = str; *p != 0; ) {
+		if(p[0] == '%' && uri_hex_val(p[1]) >= 0 && uri_hex_val(p[2]) >= 0) {
+			unsigned char c = (unsigned char)((uri_hex_val(p[1]) << 4) | uri_hex_val(p[2]));
+			/* decodeURI must not unescape the reserved set: %2F in a path has
+			 * to stay %2F or it would change the URL's meaning. */
+			if(!component && uri_reserved(c)) {
+				mstr_add(out, p[0]); mstr_add(out, p[1]); mstr_add(out, p[2]);
+			}
+			else {
+				mstr_add(out, (char)c);
+			}
+			p += 3;
+		}
+		else if(p[0] == '+' && component) {
+			/* Only the component decoder treats '+' as a space, matching what
+			 * application/x-www-form-urlencoded producers emit. */
+			mstr_add(out, ' ');
+			p += 1;
+		}
+		else {
+			mstr_add(out, *p);
+			p += 1;
+		}
+	}
+	mstr_free(s);
+	var_t* r = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	return r;
+}
+
+static var_t* native_decodeURIComponent(vm_t* vm, var_t* env, void* data) { (void)data; return uri_decode(vm, env, true); }
+static var_t* native_decodeURI(vm_t* vm, var_t* env, void* data)           { (void)data; return uri_decode(vm, env, false); }
+
+/* Legacy escape(): alphanumerics and @*_+-./ pass through, every other byte
+ * becomes %XX, and code points above U+00FF become %uXXXX (which is why it
+ * has to decode UTF-8 rather than work byte-wise). */
+static bool escape_keep(unsigned char c) {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+	       c == '@' || c == '*' || c == '_' || c == '+' || c == '-' || c == '.' || c == '/';
+}
+
+static var_t* native_escape(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	static const char hex[] = "0123456789ABCDEF";
+	mstr_t* s = mstr_new("");
+	const char* str = uri_arg_cstr(env, s);
+	mstr_t* out = mstr_new("");
+	const unsigned char* p = (const unsigned char*)str;
+	while(*p != 0) {
+		unsigned char c = *p;
+		if(c < 0x80) {
+			if(escape_keep(c)) mstr_add(out, (char)c);
+			else uri_append_escaped(out, c);
+			p += 1;
+			continue;
+		}
+		/* Decode one UTF-8 sequence and emit it as %uXXXX. */
+		uint32_t cp = c;
+		uint32_t extra = 0;
+		if((c >> 5) == 0x6)       { cp = c & 0x1F; extra = 1; }
+		else if((c >> 4) == 0xE)  { cp = c & 0x0F; extra = 2; }
+		else if((c >> 3) == 0x1E) { cp = c & 0x07; extra = 3; }
+		p += 1;
+		for(uint32_t i = 0; i < extra && *p != 0; ++i, ++p)
+			cp = (cp << 6) | (uint32_t)(*p & 0x3F);
+		mstr_append(out, "%u");
+		mstr_add(out, hex[(cp >> 12) & 0xF]);
+		mstr_add(out, hex[(cp >> 8) & 0xF]);
+		mstr_add(out, hex[(cp >> 4) & 0xF]);
+		mstr_add(out, hex[cp & 0xF]);
+	}
+	mstr_free(s);
+	var_t* r = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	return r;
+}
+
+static var_t* native_unescape(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	mstr_t* s = mstr_new("");
+	const char* str = uri_arg_cstr(env, s);
+	mstr_t* out = mstr_new("");
+	for(const char* p = str; *p != 0; ) {
+		if(p[0] == '%' && (p[1] == 'u' || p[1] == 'U') &&
+		   uri_hex_val(p[2]) >= 0 && uri_hex_val(p[3]) >= 0 && uri_hex_val(p[4]) >= 0 && uri_hex_val(p[5]) >= 0) {
+			uint32_t cp = (uint32_t)((uri_hex_val(p[2]) << 12) | (uri_hex_val(p[3]) << 8) |
+			                         (uri_hex_val(p[4]) << 4) | uri_hex_val(p[5]));
+			/* Re-encode as UTF-8: the rest of the engine speaks UTF-8. */
+			if(cp < 0x80) mstr_add(out, (char)cp);
+			else if(cp < 0x800) {
+				mstr_add(out, (char)(0xC0 | (cp >> 6)));
+				mstr_add(out, (char)(0x80 | (cp & 0x3F)));
+			}
+			else {
+				mstr_add(out, (char)(0xE0 | (cp >> 12)));
+				mstr_add(out, (char)(0x80 | ((cp >> 6) & 0x3F)));
+				mstr_add(out, (char)(0x80 | (cp & 0x3F)));
+			}
+			p += 6;
+		}
+		else if(p[0] == '%' && uri_hex_val(p[1]) >= 0 && uri_hex_val(p[2]) >= 0) {
+			mstr_add(out, (char)((uri_hex_val(p[1]) << 4) | uri_hex_val(p[2])));
+			p += 3;
+		}
+		else {
+			mstr_add(out, *p);
+			p += 1;
+		}
+	}
+	mstr_free(s);
+	var_t* r = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	return r;
+}
+
+/* ---- Global atob()/btoa() base64 codec (WHATWG / HTML spec) ----
+ * Standalone-CLI equivalents of the ewebview js_web.c versions. core-js ships
+ * web.atob/web.btoa polyfills whose byte handling mis-reads mario strings
+ * (btoa("hi") yielded "AAA=", i.e. all-zero bytes, so atob(btoa(x)) round-tripped
+ * to ""); providing real natives makes core-js feature-detect them as correct
+ * and keep them. btoa encodes the string's bytes (Latin-1/UTF-8 pass-through
+ * rather than throwing on >0xFF, so a page script is never aborted); atob decodes
+ * and tolerates whitespace, padding and malformed input. */
+static const char kB64[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int b64_index(char c) {
+	if(c >= 'A' && c <= 'Z') return c - 'A';
+	if(c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if(c >= '0' && c <= '9') return c - '0' + 52;
+	if(c == '+') return 62;
+	if(c == '/') return 63;
+	return -1;
+}
+
+static var_t* native_btoa(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	mstr_t* s = mstr_new("");
+	const char* str = uri_arg_cstr(env, s);
+	uint32_t len = (uint32_t)strlen(str);
+	mstr_t* out = mstr_new("");
+	for(uint32_t i = 0; i < len; i += 3) {
+		unsigned b0 = (unsigned char)str[i];
+		unsigned b1 = (i + 1 < len) ? (unsigned char)str[i+1] : 0;
+		unsigned b2 = (i + 2 < len) ? (unsigned char)str[i+2] : 0;
+		mstr_add(out, kB64[(b0 >> 2) & 0x3F]);
+		mstr_add(out, kB64[((b0 << 4) | (b1 >> 4)) & 0x3F]);
+		mstr_add(out, (i + 1 < len) ? kB64[((b1 << 2) | (b2 >> 6)) & 0x3F] : '=');
+		mstr_add(out, (i + 2 < len) ? kB64[b2 & 0x3F] : '=');
+	}
+	mstr_free(s);
+	var_t* r = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	return r;
+}
+
+static var_t* native_atob(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	mstr_t* s = mstr_new("");
+	const char* str = uri_arg_cstr(env, s);
+	mstr_t* out = mstr_new("");
+	int acc = 0, bits = 0;
+	for(const char* p = str; *p != 0; ++p) {
+		if(*p == '=' || *p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') continue;
+		int v = b64_index(*p);
+		if(v < 0) continue;                  /* tolerate malformed input */
+		acc = (acc << 6) | v;
+		bits += 6;
+		if(bits >= 8) {
+			bits -= 8;
+			mstr_add(out, (char)((acc >> bits) & 0xFF));
+		}
+	}
+	mstr_free(s);
+	var_t* r = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	return r;
+}
+
 void reg_native_String(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_STRING);
 	vm_reg_native(vm, cls, "constructor(str)", native_StringConstructor, NULL); 
@@ -1457,6 +1703,21 @@ void reg_native_String(vm_t* vm) {
 	cls = vm_new_class(vm, CLS_UTF8_READER);
 	vm_reg_native(vm, cls, "constructor(str)", native_UTF8ReaderConstructor, NULL); 
 	vm_reg_native(vm, cls, "read()", native_UTF8ReaderRead, NULL); 
+
+	/* Global URI / escape functions (ECMA-262 18.2.6 + Annex B). Registered on
+	 * the root object so bare encodeURIComponent(...) etc. resolve; core-js reads
+	 * several of these outside any try during load, so they must be real globals. */
+	vm_reg_native(vm, NULL, "encodeURIComponent(v)", native_encodeURIComponent, NULL);
+	vm_reg_native(vm, NULL, "decodeURIComponent(v)", native_decodeURIComponent, NULL);
+	vm_reg_native(vm, NULL, "encodeURI(v)", native_encodeURI, NULL);
+	vm_reg_native(vm, NULL, "decodeURI(v)", native_decodeURI, NULL);
+	vm_reg_native(vm, NULL, "escape(v)", native_escape, NULL);
+	vm_reg_native(vm, NULL, "unescape(v)", native_unescape, NULL);
+	/* Global base64 codec (HTML spec). Real natives so core-js's web.atob/web.btoa
+	 * detection keeps them instead of installing a polyfill that mis-reads mario
+	 * strings (btoa -> all-zero bytes). */
+	vm_reg_native(vm, NULL, "btoa(v)", native_btoa, NULL);
+	vm_reg_native(vm, NULL, "atob(v)", native_atob, NULL);
 }
 
 #ifdef __cplusplus

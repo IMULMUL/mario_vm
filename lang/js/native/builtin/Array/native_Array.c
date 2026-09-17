@@ -10,13 +10,50 @@ extern "C" {
 /** Array */
 
 var_t* native_Array_constructor(vm_t* vm, var_t* env, void* data) {
-    (void)vm; (void)data;
+    (void)data;
     var_t* this_v = get_obj(env, THIS);
     this_v->is_array = 1;
     var_t* members = var_new_obj_no_proto(vm, NULL, NULL);
     node_t* n = var_add(this_v, "_ARRAY_", members);
     n->be_unenumerable = 1;
 	n->invisable = 1;
+
+    /* ES23.1.1 Array(...values): a single Number argument sets the initial length
+     * (ArrayCreate(len) - holes), any other single value or a list of values
+     * becomes the elements. The previous body ignored arguments entirely, so
+     * `new Array(2).length` was 0 and `new Array(1,2,3)` was []; that also broke
+     * every core-js polyfill that preallocates via `new Array(len)` (Array.of,
+     * toReversed/toSorted/toSpliced/with, structuredClone). mario derives length
+     * from the materialized element count (var_array_size is hash_map_size of the
+     * _ARRAY_ member), so a length-N array is built by materializing N undefined
+     * slots: reading a hole yields undefined exactly as the spec requires and a
+     * later index write simply overwrites a slot. */
+    uint32_t argc = get_func_args_num(env);
+    vm->gc.gc_defer++; /* this_v/members are unrooted while slots are appended */
+    if(argc == 1) {
+        var_t* a0 = get_func_arg(env, 0);
+        if(var_is_number(a0)) {
+            /* Single Number: it is the length. ToUint32 must round-trip to a valid
+             * array length ([0, 2^32-1]), else RangeError (ES23.1.1.1 step 4.c). */
+            double d = var_get_float64(a0);
+            if(!(d >= 0.0 && d <= 4294967295.0 && d == (double)(uint32_t)d)) {
+                vm->gc.gc_defer--;
+                vm_throw(vm, "RangeError: Invalid array length");
+                return this_v;
+            }
+            uint32_t len = (uint32_t)d;
+            for(uint32_t i = 0; i < len; ++i)
+                var_array_add(this_v, var_new(vm)); /* undefined hole */
+        }
+        else {
+            var_array_add(this_v, a0); /* a single non-Number is element 0 */
+        }
+    }
+    else {
+        for(uint32_t i = 0; i < argc; ++i)
+            var_array_add(this_v, get_func_arg(env, i));
+    }
+    vm->gc.gc_defer--;
     return this_v;
 }
     
@@ -620,6 +657,30 @@ var_t* native_Array_from(vm_t* vm, var_t* env, void* data) {
 			var_t* val = var_find_member_var(step, "value");
 			if(has_map) {
 				var_t* out = array_call_cb(vm, env, mapf, val, idx, src);
+				if(vm->propagating_err != NULL) {
+					/* ES IteratorClose: the mapper threw, so invoke iter.return()
+					 * and let the error propagate instead of swallowing it and
+					 * continuing the loop. core-js probes exactly this sequence
+					 * (Array.from(iter, function(){ throw 2 })) to decide whether
+					 * iterators are closed safely on abrupt completion. */
+					var_t* pending = vm->propagating_err;
+					bool ab = vm->abort_run;
+					vm->propagating_err = NULL;
+					vm->abort_run = false;
+					var_t* rr = call_m_func_by_name(vm, iter, "return", 0);
+					if(rr != NULL)
+						var_unref(rr);
+					/* a throw raised by return() itself is discarded: the
+					 * mapper's error is the one that propagates. */
+					if(vm->propagating_err != NULL)
+						var_unref(vm->propagating_err);
+					vm->propagating_err = pending;
+					vm->abort_run = ab;
+					var_unref(step);
+					var_unref(iter);
+					vm->gc.gc_defer--;
+					return NULL; /* ret is unrooted+unreachable: GC reclaims it */
+				}
 				if(out == NULL) out = var_new(vm);
 				var_array_add(ret, out); // ret refs out
 				var_unref(out);          // release call_m_func's owned ref
@@ -641,6 +702,12 @@ var_t* native_Array_from(vm_t* vm, var_t* env, void* data) {
 			var_t* val = var_find_member_var(src, key);
 			if(has_map) {
 				var_t* out = array_call_cb(vm, env, mapf, val, (uint32_t)i, src);
+				if(vm->propagating_err != NULL) {
+					/* mapper threw on an array-like: no iterator to close, but
+					 * the error must still propagate out of Array.from. */
+					vm->gc.gc_defer--;
+					return NULL;
+				}
 				if(out == NULL) out = var_new(vm);
 				var_array_add(ret, out);
 				var_unref(out);
@@ -959,54 +1026,94 @@ var_t* native_Array_every(vm_t* vm, var_t* env, void* data) {
 	return var_new_bool(vm, true);
 }
 
-/* sort([comparator]): in-place selection sort. With a comparator it is called
- * as comparator(a,b) (<0 keeps order); without one, elements are ordered by
- * their string form (matching JS default sort). Elements are swapped by
- * exchanging the owning nodes' var pointers, so refcounts stay intact. */
+/* SortCompare for native_Array_sort. `undefined` operands are not compared and
+ * sort to the end (ECMA-262 23.1.3.30.1); otherwise use the JS comparator (the
+ * SIGN of ToNumber of its result) or the default string-codepoint order. A NaN
+ * comparator result counts as 0 so equal elements keep their relative order. */
+static int array_sort_compare(vm_t* vm, var_t* env, var_t* f, var_t* x, var_t* y) {
+	bool xu = (x == NULL || x->type == V_UNDEF);
+	bool yu = (y == NULL || y->type == V_UNDEF);
+	if(xu || yu)
+		return xu ? (yu ? 0 : 1) : -1;   /* undefined sorts last */
+	if(f != NULL) {
+		var_t* args = var_new_array(vm);
+		var_array_add(args, x);
+		var_array_add(args, y);
+		var_array_reverse(args);
+		var_t* res = call_m_func(vm, env, f, args);
+		var_unref(args);
+		double d = (res != NULL) ? var_get_float(res) : 0.0;
+		if(res != NULL)
+			var_unref(res);
+		if(d != d)                       /* NaN -> equal (keeps stability) */
+			return 0;
+		return (d < 0.0) ? -1 : ((d > 0.0) ? 1 : 0);
+	}
+	mstr_t* sa = mstr_new("");
+	mstr_t* sb = mstr_new("");
+	var_to_str(x, sa);
+	var_to_str(y, sb);
+	int cmp = strcmp(sa->cstr, sb->cstr);
+	mstr_free(sa);
+	mstr_free(sb);
+	return (cmp < 0) ? -1 : ((cmp > 0) ? 1 : 0);
+}
+
+/* sort([comparator]): in-place STABLE insertion sort. With a comparator it is
+ * called as comparator(a,b) (<0 keeps order); without one, elements are ordered
+ * by their string form (matching JS default sort). The element vars are snapshot
+ * into a scratch pointer array (each stays owned by its node, so refcounts are
+ * untouched), reordered, then written back. Stability matters: the previous
+ * swap-based selection sort was UNSTABLE, so core-js's STABLE_SORT detection
+ * failed and it force-installed its own polyfill over the working native. */
 var_t* native_Array_sort(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* arr = get_obj(env, THIS);
+	/* Strict method: `this` must be coercible to an object. core-js's
+	 * arrayMethodIsStrict('sort') calls [].sort.call(null, fn, 1) and requires a
+	 * throw, else it forces its polyfill. */
+	if(arr == NULL || arr->type == V_UNDEF || arr->type == V_NULL) {
+		vm_throw(vm, "TypeError: Array.prototype.sort called on null or undefined");
+		return var_new(vm);
+	}
 	var_t* f = get_obj(env, "f");
+	/* A comparator that is present but not callable (sort(null), sort(1)) is a
+	 * TypeError; only `undefined` selects the default string order. */
+	if(f != NULL && f->type != V_UNDEF && !f->is_func) {
+		vm_throw(vm, "TypeError: The comparison function must be either a function or undefined");
+		return var_new(vm);
+	}
 	uint32_t sz = var_array_size(arr);
 	if(sz < 2)
 		return arr;
-	bool have_cmp = (f != NULL && f->type != V_UNDEF && f->is_func);
+	var_t* cmpf = (f != NULL && f->is_func) ? f : NULL;
+	var_t** tmp = (var_t**)mario_malloc(sizeof(var_t*) * sz);
+	if(tmp == NULL)
+		return arr;
 	uint32_t i, j;
-	vm->gc.gc_defer++; /* comparator args / results unrooted across callbacks */
 	for(i=0; i<sz; ++i) {
-		for(j=i+1; j<sz; ++j) {
-			node_t* ni = var_array_get(arr, (int32_t)i);
-			node_t* nj = var_array_get(arr, (int32_t)j);
-			if(ni == NULL || nj == NULL)
-				continue;
-			int cmp;
-			if(have_cmp) {
-				var_t* args = var_new_array(vm);
-				var_array_add(args, ni->var);
-				var_array_add(args, nj->var);
-				var_array_reverse(args);
-				var_t* res = call_m_func(vm, env, f, args);
-				var_unref(args);
-				cmp = (res != NULL) ? (int)var_get_float(res) : 0;
-				if(res != NULL)
-					var_unref(res);
-			} else {
-				mstr_t* sa = mstr_new("");
-				mstr_t* sb = mstr_new("");
-				var_to_str(ni->var, sa);
-				var_to_str(nj->var, sb);
-				cmp = strcmp(sa->cstr, sb->cstr);
-				mstr_free(sa);
-				mstr_free(sb);
-			}
-			if(cmp > 0) {
-				var_t* t = ni->var;
-				ni->var = nj->var;
-				nj->var = t;
-			}
+		node_t* n = var_array_get(arr, (int32_t)i);
+		tmp[i] = (n != NULL) ? n->var : NULL;
+	}
+	vm->gc.gc_defer++; /* comparator args / results unrooted across callbacks */
+	for(i=1; i<sz; ++i) {
+		var_t* elem = tmp[i];
+		/* Shift right only while the previous element is STRICTLY greater, so equal
+		 * elements never cross -> stable. */
+		for(j=i; j > 0; --j) {
+			if(array_sort_compare(vm, env, cmpf, tmp[j-1], elem) <= 0)
+				break;
+			tmp[j] = tmp[j-1];
 		}
+		tmp[j] = elem;
+	}
+	for(i=0; i<sz; ++i) {
+		node_t* n = var_array_get(arr, (int32_t)i);
+		if(n != NULL)
+			n->var = tmp[i];
 	}
 	vm->gc.gc_defer--;
+	mario_free(tmp);
 	return arr;
 }
 

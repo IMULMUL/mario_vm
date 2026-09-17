@@ -3,6 +3,12 @@ extern "C" {
 #endif
 
 #include "native_Promise.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Reactions run as 0-ms tasks on the DOM bridge timer table (the engine's
+ * microtask pump). Forward-declared: js_dom.o lives in the same archive. */
+int js_dom_add_timer(vm_t* vm, var_t* cb, uint32_t ms, bool repeat);
 
 #define CLS_PROMISE "Promise"
 
@@ -10,15 +16,69 @@ extern "C" {
 #define PROMISE_STATE_FULFILLED 1
 #define PROMISE_STATE_REJECTED 2
 
-typedef struct {
+/* The builtin Promise.prototype, captured in reg_native_Promise() before any
+ * page script runs. Engine-internal promise construction (get_promise_proto,
+ * promise_new_*) uses this so it keeps working after a page replaces the
+ * window.Promise global with a polyfill. */
+static var_t* s_builtin_promise_proto = NULL;
+
+typedef struct promise_data {
     int state;
     var_t* value;
     var_t* fulfilled_callbacks;
     var_t* rejected_callbacks;
+    /* Chained promise paired with each callback (same index), so a reaction's
+     * return value settles the promise .then() handed back. Without this a
+     * `p.then(cb).then(next)` chain dies at the first link once p settles. */
+    var_t* fulfilled_promises;
+    var_t* rejected_promises;
+    bool drain_armed;   /* a reaction-drain task is already queued */
+    /* Debug ledger (MARIO_PROMLEDGER): links every live promise so a stuck
+     * await can be named after a run. Inert when the env flag is off. */
+    struct promise_data* dbg_next;
+    unsigned dbg_id;
+    unsigned dbg_pc;
 } promise_data;
+
+/* Reaction machinery (defined after promise_settle_propagated). */
+static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data);
+static void promise_schedule_drain(vm_t* vm, var_t* promise);
+static void promise_add_reaction(vm_t* vm, promise_data* pd, var_t* onF, var_t* onRej, var_t* np);
+
+static int s_ledger_on = -1;
+static promise_data* s_ledger_head = NULL;
+static unsigned s_ledger_nextid = 1;
+
+static void promise_ledger_unlink(promise_data* pd) {
+    if (s_ledger_on != 1) return;
+    promise_data** pp = &s_ledger_head;
+    while (*pp != NULL) {
+        if (*pp == pd) { *pp = pd->dbg_next; return; }
+        pp = &(*pp)->dbg_next;
+    }
+}
+
+static promise_data* promise_data_alloc(vm_t* vm) {
+    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    pd->fulfilled_promises = NULL;
+    pd->rejected_promises = NULL;
+    pd->drain_armed = false;
+    pd->dbg_next = NULL;
+    pd->dbg_id = 0;
+    pd->dbg_pc = 0;
+    if (s_ledger_on < 0) s_ledger_on = (getenv("MARIO_PROMLEDGER") != NULL) ? 1 : 0;
+    if (s_ledger_on == 1) {
+        pd->dbg_id = s_ledger_nextid++;
+        pd->dbg_pc = (vm != NULL) ? (unsigned)vm->pc : 0u;
+        pd->dbg_next = s_ledger_head;
+        s_ledger_head = pd;
+    }
+    return pd;
+}
 
 static void promise_free(void* p) {
     promise_data* pd = (promise_data*)p;
+    promise_ledger_unlink(pd);
     if (pd->value) {
         var_unref(pd->value);
     }
@@ -27,6 +87,12 @@ static void promise_free(void* p) {
     }
     if (pd->rejected_callbacks) {
         var_unref(pd->rejected_callbacks);
+    }
+    if (pd->fulfilled_promises) {
+        var_unref(pd->fulfilled_promises);
+    }
+    if (pd->rejected_promises) {
+        var_unref(pd->rejected_promises);
     }
     mario_free(pd);
 }
@@ -52,6 +118,8 @@ static void promise_anchor(vm_t* vm, var_t* promise, promise_data* pd) {
     if (pd->value) var_array_add(keep, pd->value);
     if (pd->fulfilled_callbacks) var_array_add(keep, pd->fulfilled_callbacks);
     if (pd->rejected_callbacks) var_array_add(keep, pd->rejected_callbacks);
+    if (pd->fulfilled_promises) var_array_add(keep, pd->fulfilled_promises);
+    if (pd->rejected_promises) var_array_add(keep, pd->rejected_promises);
     vm->gc.gc_defer--;
 }
 
@@ -67,9 +135,90 @@ static void promise_anchor(vm_t* vm, var_t* promise, promise_data* pd) {
 static void promise_alloc_callbacks(vm_t* vm, promise_data* pd) {
     pd->fulfilled_callbacks = var_ref(var_new_array(vm));
     pd->rejected_callbacks = var_ref(var_new_array(vm));
+    pd->fulfilled_promises = var_ref(var_new_array(vm));
+    pd->rejected_promises = var_ref(var_new_array(vm));
+    pd->drain_armed = false;
+}
+
+/* A PENDING promise whose only remaining reachability is a C-side `data`
+ * pointer inside a resolve/reject closure handed to a timer, a thenable or
+ * another promise's callback list is invisible to the GC mark phase: the
+ * classic `new Promise(function(res){ res(other); }).then(cb)` discards the
+ * outer promise, so it was swept while `other` was still pending and the
+ * later settle wrote through a dangling pointer (the await/then chain simply
+ * never ran). Root every pending promise that has work outstanding in a
+ * hidden array on vm->root until it settles. */
+#define PEND_ROOT_KEY "@@pend_prom"
+
+static void promise_root_pending(vm_t* vm, var_t* promise) {
+    if (vm == NULL || promise == NULL) return;
+    var_t* arr = var_find_own_member_var(vm->root, PEND_ROOT_KEY);
+    if (arr == NULL) {
+        node_t* n = var_add(vm->root, PEND_ROOT_KEY, var_new_array(vm));
+        if (n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+        arr = var_find_own_member_var(vm->root, PEND_ROOT_KEY);
+    }
+    if (arr == NULL) return;
+    uint32_t sz = var_array_size(arr);
+    for (uint32_t i = 0; i < sz; ++i) {
+        node_t* nd = var_array_get(arr, (int32_t)i);
+        if (nd != NULL && nd->var == promise) return;
+    }
+    vm->gc.gc_defer++;
+    node_t* added = var_array_add(arr, promise);
+    vm->gc.gc_defer--;
+    if (getenv("MARIO_PRDBG") != NULL)
+        fprintf(stderr, "[prdbg] root promise=%p refs=%d added=%p(root=%p)\n",
+            (void*)promise, (int)promise->refs, (void*)added, (void*)vm->root);
+}
+
+static void promise_unroot_pending(vm_t* vm, var_t* promise) {
+    if (vm == NULL || promise == NULL) return;
+    var_t* arr = var_find_own_member_var(vm->root, PEND_ROOT_KEY);
+    if (arr == NULL) return;
+    if (getenv("MARIO_PRDBG") != NULL)
+        fprintf(stderr, "[prdbg] unroot promise=%p refs=%d size=%u\n",
+            (void*)promise, (int)promise->refs, (unsigned)var_array_size(arr));
+    vm->gc.gc_defer++;
+    /* Collect the promises to KEEP into a temp array first: var_array_add(fresh,..)
+     * takes a ref on each, so they stay alive across the clear below even when the
+     * @@pend_prom array was their only remaining owner (a discarded `new Promise(..)`
+     * outer). */
+    var_t* fresh = var_new_array(vm);
+    uint32_t sz = var_array_size(arr);
+    for (uint32_t i = 0; i < sz; ++i) {
+        node_t* nd = var_array_get(arr, (int32_t)i);
+        if (nd != NULL && nd->var != NULL && nd->var != promise)
+            var_array_add(fresh, nd->var);
+    }
+    /* Clear ONLY the _ARRAY_ child's index nodes, never `arr` itself: wiping `arr`
+     * (var_remove_all(arr)+hash_map_init) destroyed the hidden _ARRAY_ member, so the
+     * re-add loop's var_array_add(arr,..) found no _ARRAY_ and silently added nothing
+     * - every kept promise lost its array ref and was freed the moment `fresh` was
+     * released, leaving the outer promise's promise_data dangling (pd=0x0). This
+     * mirrors promise_anchor()'s rebuild. */
+    var_t* arr_var = var_find_own_member_var(arr, "_ARRAY_");
+    if (arr_var != NULL) {
+        var_remove_all(arr_var);
+        hash_map_init(&arr_var->children);
+    }
+    uint32_t fsz = var_array_size(fresh);
+    for (uint32_t i = 0; i < fsz; ++i) {
+        node_t* nd = var_array_get(fresh, (int32_t)i);
+        if (nd != NULL && nd->var != NULL) var_array_add(arr, nd->var);
+    }
+    var_unref(fresh);
+    vm->gc.gc_defer--;
 }
 
 static var_t* get_promise_proto(vm_t* vm) {
+    /* Prefer the builtin prototype captured at registration time. Page bundles
+     * (e.g. rokid's webpack runtime) replace window.Promise with a polyfill
+     * shim whose object has no usable prototype.constructor, so resolving the
+     * proto through the live global would fail for engine-internal promises. */
+    if (s_builtin_promise_proto != NULL) {
+        return s_builtin_promise_proto;
+    }
     node_t* n = vm_load_node(vm, CLS_PROMISE, false);
     if (n != NULL && n->var != NULL) {
         return var_get_prototype(n->var);
@@ -96,6 +245,56 @@ static bool is_promise(vm_t* vm, var_t* x) {
         p = var_get_prototype(p);
     }
     return false;
+}
+
+/* ES thenable adoption: Promise.resolve(x), an executor's resolve(x) and a
+ * then-callback's return value must adopt ANY object/function carrying a
+ * callable `then`, not just native Promise instances. Without it the
+ * down-levelled async helpers webpack/TS emit (`new P(function(res){
+ * res(yieldedPromise); }).then(step)`) fulfil with the promise OBJECT instead
+ * of its settled value, so generators resume with garbage and the app renders
+ * nothing while throwing nothing. */
+static bool is_thenable(vm_t* vm, var_t* x) {
+    if (x == NULL || (x->type != V_OBJECT && !x->is_func)) return false;
+    if (is_promise(vm, x)) return false;
+    var_t* t = var_find_member_var(x, "then");
+    return t != NULL && t->is_func;
+}
+
+static var_t* native_promise_resolve_cb(vm_t* vm, var_t* env, void* data);
+static var_t* native_promise_reject_cb(vm_t* vm, var_t* env, void* data);
+
+/* ES Promise Resolve Thenable Job: hand this promise's resolve/reject
+ * closures to the thenable so that when IT settles, we settle.
+ * Returns false when adoption could not start (`then` is not callable); the
+ * caller must then fulfil with the value itself - the previous version just
+ * returned, leaving the promise PENDING forever with no way to settle it. */
+static bool promise_adopt_thenable(vm_t* vm, var_t* promise, var_t* thenable) {
+    var_t* thenFn = var_find_member_var(thenable, "then");
+    if (thenFn == NULL || !thenFn->is_func) return false;
+    promise_root_pending(vm, promise);
+    node_t* rn = vm_reg_native_on(vm, promise, "__resolve(value)", native_promise_resolve_cb, promise);
+    node_t* jn = vm_reg_native_on(vm, promise, "__reject(reason)", native_promise_reject_cb, promise);
+    rn->invisable = 1; rn->be_unenumerable = 1;
+    jn->invisable = 1; jn->be_unenumerable = 1;
+    var_t* args = var_new_array(vm);
+    var_array_add(args, rn->var);
+    var_array_add(args, jn->var);
+    var_array_reverse(args);   /* call_m_func wants the last argument first */
+    var_t* r = call_m_func(vm, thenable, thenFn, args);
+    if (vm->propagating_err != NULL) {   /* then() threw: reject with it */
+        var_t* err = vm->propagating_err;
+        vm->propagating_err = NULL;
+        vm->abort_run = false;
+        var_t* jargs = var_new_array(vm);
+        var_array_add(jargs, err);
+        var_t* jr = call_m_func(vm, promise, jn->var, jargs);
+        if (jr != NULL) var_unref(jr);
+        var_unref(jargs);
+    }
+    if (r != NULL) var_unref(r);
+    var_unref(args);
+    return true;
 }
 
 /* Promise adoption: a then-callback returning a promise resolves the chained
@@ -125,11 +324,36 @@ static var_t* promise_unwrap(vm_t* vm, var_t* result) {
 var_t* native_await(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* x = get_obj(env, "x");
+    if (getenv("MARIO_AWAITDBG") != NULL) {
+        var_t* tf = (x != NULL) ? var_find_member_var(x, "then") : NULL;
+        fprintf(stderr, "[awaitdbg] enter pc=%u x=%p isprom=%d isthen=%d tag=%s\n",
+            (unsigned)vm->pc, (void*)x, is_promise(vm, x) ? 1 : 0,
+            (tf != NULL && tf->is_func) ? 1 : 0,
+            vm->dbg_tag != NULL ? vm->dbg_tag : "-");
+    }
     int guard = 0;
     while (is_promise(vm, x) && guard++ < 64) {
         promise_data* pd = (promise_data*)x->value;
-        if (pd == NULL || pd->value == NULL) {
-            return NULL; /* await of an empty/pending promise -> undefined */
+        if (pd == NULL || pd->value == NULL && pd->state != PROMISE_STATE_PENDING) {
+            return NULL; /* await of an empty promise -> undefined */
+        }
+        if (pd->state == PROMISE_STATE_PENDING) {
+            /* The awaited promise settles later (timer / message-queue /
+             * network callback). Without suspension the only way to honour the
+             * await is to let the embedder pump its event loop until it
+             * settles; if the loop runs dry the promise can never settle and
+             * the await degrades to undefined (previous behaviour). */
+            if (vm->on_await_pending == NULL) return NULL;
+            int spins = 0;
+            while (pd->state == PROMISE_STATE_PENDING && spins++ < 65536) {
+                if (vm->on_await_pending(vm, x) == 0) break;
+            }
+            if (getenv("MARIO_AWAITDBG") != NULL)
+                fprintf(stderr, "[awaitdbg] pc=%u id=%u state=%d spins=%d tag=%s\n",
+                    (unsigned)vm->pc, pd->dbg_id, (int)pd->state, spins,
+                    vm->dbg_tag != NULL ? vm->dbg_tag : "-");
+            if (pd->state == PROMISE_STATE_PENDING) return NULL;
+            if (pd->value == NULL) return NULL;
         }
         x = pd->value;
     }
@@ -145,21 +369,38 @@ static var_t* native_promise_resolve_cb(vm_t* vm, var_t* env, void* data) {
     var_t* promise = (var_t*)data;
     var_t* value = get_obj(env, "value");
     promise_data* pd = (promise_data*)promise->value;
+    if (getenv("MARIO_RSDBG") != NULL)
+        fprintf(stderr, "[rsdbg] resolve_cb promise=%p pd=%p state=%d cbs=%u refs=%d value=%p vtype=%d\n",
+            (void*)promise, (void*)pd, pd != NULL ? (int)pd->state : -1,
+            pd != NULL ? (unsigned)var_array_size(pd->fulfilled_callbacks) : 0u,
+            (int)promise->refs, (void*)value, (value != NULL) ? (int)value->type : -1);
     if (pd != NULL && pd->state == PROMISE_STATE_PENDING) {
+        /* ES ResolvePromise: resolving with a promise/thenable adopts it
+         * rather than fulfilling with the promise object itself. If adoption
+         * cannot start (non-callable `then`), fall through and fulfil with the
+         * value - never leave the promise pending. */
+        if (value != promise && (is_promise(vm, value) || is_thenable(vm, value))) {
+            if (promise_adopt_thenable(vm, promise, value))
+                return NULL;
+        }
         pd->state = PROMISE_STATE_FULFILLED;
         pd->value = (value != NULL) ? var_ref(value) : var_ref(var_new(vm));
         promise_anchor(vm, promise, pd);
-        uint32_t n = var_array_size(pd->fulfilled_callbacks);
-        for (uint32_t i = 0; i < n; i++) {
-            var_t* cb = var_array_get_var(pd->fulfilled_callbacks, i);
-            if (cb != NULL && cb->is_func) {
-                var_t* args = var_new_array(vm);
-                var_array_add(args, pd->value);
-                var_t* r = call_m_func(vm, promise, cb, args);
-                if (r != NULL) var_unref(r);
-                var_unref(args);
-            }
-        }
+        /* Reactions run as a queued microtask, never inline: settling inside a
+         * stream enqueue or a timer callback must not re-enter page JS mid-
+         * drain (and the ES spec forbids synchronous reactions).
+         *
+         * The promise stays in the @@pend_prom gc root until that drain has run
+         * (native_promise_drain unroots it). Unrooting here - as this code used
+         * to - left the settled promise reachable only through C pointers (the
+         * drain trampoline's bare func->data) for the whole settle->drain
+         * window, so a gc pass in between swept it: promise_free() dropped
+         * pd->value and the reaction list, and the drain then either bailed on
+         * V_ST_GC_FREE (reactions never ran - Next.js flight stalled after its
+         * first chunk) or handed the callback a recycled var_t whose type had
+         * already been reused as V_UNDEF (reader.read() resolved with
+         * {value: undefined, done: undefined}, silently losing the chunk). */
+        promise_schedule_drain(vm, promise);
     }
     return NULL;
 }
@@ -172,17 +413,8 @@ static var_t* native_promise_reject_cb(vm_t* vm, var_t* env, void* data) {
         pd->state = PROMISE_STATE_REJECTED;
         pd->value = (reason != NULL) ? var_ref(reason) : var_ref(var_new(vm));
         promise_anchor(vm, promise, pd);
-        uint32_t n = var_array_size(pd->rejected_callbacks);
-        for (uint32_t i = 0; i < n; i++) {
-            var_t* cb = var_array_get_var(pd->rejected_callbacks, i);
-            if (cb != NULL && cb->is_func) {
-                var_t* args = var_new_array(vm);
-                var_array_add(args, pd->value);
-                var_t* r = call_m_func(vm, promise, cb, args);
-                if (r != NULL) var_unref(r);
-                var_unref(args);
-            }
-        }
+        /* See resolve_cb: stay gc-rooted until the drain has run the reactions. */
+        promise_schedule_drain(vm, promise);
     }
     return NULL;
 }
@@ -208,6 +440,159 @@ static bool promise_settle_propagated(vm_t* vm, promise_data* newPd, var_t* newP
     return true;
 }
 
+/* Register one .then() reaction. The chained promise is parked in BOTH lists
+ * at the same index as its handler so whichever side drains finds its pair.
+ * A NULL handler gets an undefined placeholder: the drain then applies the
+ * identity (fulfilled) / propagate (rejected) default for it. */
+static void promise_add_reaction(vm_t* vm, promise_data* pd, var_t* onF, var_t* onRej, var_t* np) {
+    if (pd->fulfilled_callbacks == NULL || pd->fulfilled_promises == NULL)
+        promise_alloc_callbacks(vm, pd);
+    var_array_add(pd->fulfilled_callbacks, (onF != NULL) ? onF : var_new(vm));
+    var_array_add(pd->fulfilled_promises, np);
+    var_array_add(pd->rejected_callbacks, (onRej != NULL) ? onRej : var_new(vm));
+    var_array_add(pd->rejected_promises, np);
+}
+
+/* Queue the reaction drain as a 0-ms task (the engine microtask pump). The
+ * trampoline is anchored by the timer table's @@timers array, and it carries
+ * its own ref on the promise so the promise outlives the settling scope. */
+static void promise_schedule_drain(vm_t* vm, var_t* promise) {
+    promise_data* pd = (promise_data*)promise->value;
+    if (pd == NULL || pd->drain_armed)
+        return;
+    pd->drain_armed = true;
+    var_t* tr = var_new_native_func(vm, native_promise_drain, var_ref(promise));
+    int id = js_dom_add_timer(vm, tr, 0, false);
+    if (id == 0) {   /* table full: never lose reactions - run them now */
+        var_unref(tr);
+        native_promise_drain(vm, NULL, promise);
+    }
+}
+
+/* Drop the @@pend_prom gc root once a settled promise's reactions have run.
+ * Skipped when a reaction re-armed the drain (a .then() on this same promise
+ * from inside the loop): the promise must stay rooted until that drain too.
+ * The protection ref pair covers the case where the root array is the promise's
+ * last gc-visible owner; the drain trampoline's own ref keeps it alive until the
+ * caller's trailing var_unref(promise). */
+static void promise_drain_unroot(vm_t* vm, var_t* promise, promise_data* pd) {
+    if (pd != NULL && pd->drain_armed)
+        return;
+    var_ref(promise);
+    promise_unroot_pending(vm, promise);
+    var_unref(promise);
+}
+
+/* Run every queued reaction of a settled promise, then settle each chained
+ * promise with the (unwrapped) reaction result so `.then().then()` chains
+ * propagate. Reactions registered while draining land in the fresh lists and
+ * get their own drain task. */
+static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    var_t* promise = (var_t*)data;
+    if (promise == NULL)
+        return NULL;
+    if (promise->status <= V_ST_GC_FREE) { var_unref(promise); return NULL; }
+    promise_data* pd = (promise_data*)promise->value;
+    if (pd == NULL) { promise_drain_unroot(vm, promise, NULL); var_unref(promise); return NULL; }
+    pd->drain_armed = false;
+    int fulfilled = (pd->state == PROMISE_STATE_FULFILLED);
+    var_t* cbs = fulfilled ? pd->fulfilled_callbacks : pd->rejected_callbacks;
+    var_t* prs = fulfilled ? pd->fulfilled_promises : pd->rejected_promises;
+    var_t* value = pd->value;
+    if (getenv("MARIO_RSDBG") != NULL)
+        fprintf(stderr, "[rsdbg] drain-enter promise=%p value=%p vtype=%d vrefs=%d\n",
+            (void*)promise, (void*)value, (value != NULL) ? (int)value->type : -1,
+            (value != NULL) ? (int)value->refs : -1);
+    if (cbs == NULL || prs == NULL) {
+        promise_drain_unroot(vm, promise, pd);
+        var_unref(promise);
+        return NULL;
+    }
+    /* Detach before running: a reaction that calls .then() on this same
+     * promise must queue for a later drain, not mutate the list in flight. */
+    pd->fulfilled_callbacks = var_ref(var_new_array(vm));
+    pd->rejected_callbacks  = var_ref(var_new_array(vm));
+    pd->fulfilled_promises  = var_ref(var_new_array(vm));
+    pd->rejected_promises   = var_ref(var_new_array(vm));
+    promise_anchor(vm, promise, pd);
+    uint32_t n = var_array_size(cbs);
+    if (getenv("MARIO_RSDBG") != NULL) {
+        fprintf(stderr, "[rsdbg] drain promise=%p fulfilled=%d n=%u value=%p vtype=%d vrefs=%d\n",
+            (void*)promise, fulfilled, (unsigned)n, (void*)value,
+            (value != NULL) ? (int)value->type : -1, (value != NULL) ? (int)value->refs : -1);
+        for (uint32_t k = 0; k < n; k++) {
+            var_t* kc = var_array_get_var(cbs, k);
+            func_t* kf = (kc != NULL) ? (func_t*)kc->value : NULL;
+            fprintf(stderr, "[rsdbg]   drain cb#%u func=%p entrypc=%u native=%d\n", (unsigned)k,
+                (void*)kc, (unsigned)(kf != NULL ? kf->pc : 0u), (kf != NULL && kf->native != NULL) ? 1 : 0);
+        }
+        /* DIAG (temp): reveal WHY a promise rejected - the RSC flight reader's
+         * `.catch(r)` swallows the reason, so dump message/stack/digest here. */
+        if (!fulfilled && value != NULL) {
+            if (value->type == V_STRING) {
+                fprintf(stderr, "[rsdbg]   REJECT reason(str)='%s'\n", var_get_str(value));
+            } else if (value->type == V_OBJECT) {
+                var_t* m = var_find_member_var(value, "message");
+                var_t* st = var_find_member_var(value, "stack");
+                var_t* dg = var_find_member_var(value, "digest");
+                fprintf(stderr, "[rsdbg]   REJECT reason message='%s' digest='%s' stack='%.200s'\n",
+                    (m != NULL && m->type == V_STRING) ? var_get_str(m) : "(none)",
+                    (dg != NULL && dg->type == V_STRING) ? var_get_str(dg) : "(none)",
+                    (st != NULL && st->type == V_STRING) ? var_get_str(st) : "(none)");
+            } else {
+                fprintf(stderr, "[rsdbg]   REJECT reason vtype=%d\n", (int)value->type);
+            }
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        var_t* cb = var_array_get_var(cbs, i);
+        var_t* np = var_array_get_var(prs, i);
+        promise_data* npd = (np != NULL) ? (promise_data*)np->value : NULL;
+        var_t* result = NULL;
+        if (cb != NULL && cb->is_func) {
+            var_t* args = var_new_array(vm);
+            var_array_add(args, (value != NULL) ? value : var_new(vm));
+            result = call_m_func(vm, promise, cb, args);
+            var_unref(args);
+            if (npd != NULL && promise_settle_propagated(vm, npd, np)) {
+                if (result != NULL) var_unref(result);
+                promise_schedule_drain(vm, np);
+                continue;
+            }
+        } else if (!fulfilled) {
+            /* no onRejected: the rejection propagates to the chained promise */
+            if (npd != NULL) {
+                var_t* old = npd->value;
+                npd->state = PROMISE_STATE_REJECTED;
+                npd->value = (value != NULL) ? var_ref(value) : var_ref(var_new(vm));
+                promise_anchor(vm, np, npd);
+                if (old != NULL) var_unref(old);
+                promise_schedule_drain(vm, np);
+            }
+            continue;
+        } else {
+            result = (value != NULL) ? var_ref(value) : NULL;   /* identity */
+        }
+        if (npd != NULL) {
+            result = promise_unwrap(vm, result);   /* consumes result's ref */
+            var_t* old = npd->value;
+            npd->state = PROMISE_STATE_FULFILLED;
+            npd->value = (result != NULL) ? result : var_ref(var_new_null(vm));
+            promise_anchor(vm, np, npd);
+            if (old != NULL) var_unref(old);
+            promise_schedule_drain(vm, np);
+        } else if (result != NULL) {
+            var_unref(result);
+        }
+    }
+    var_unref(cbs);
+    var_unref(prs);
+    promise_drain_unroot(vm, promise, pd);
+    var_unref(promise);
+    return NULL;
+}
+
 /* The executor's throws reach here through mario's cooperative propagation:
  * vm_run() frames unwind their own C frames and hand the error outward instead
  * of redirecting vm->pc across the nested run this constructor started. */
@@ -216,7 +601,7 @@ var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
     var_t* thisV = get_obj(env, THIS);
     var_t* executor = get_obj(env, "executor");
 
-    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    promise_data* pd = promise_data_alloc(vm);
     pd->state = PROMISE_STATE_PENDING;
     pd->value = NULL;
     promise_alloc_callbacks(vm, pd);
@@ -293,7 +678,12 @@ var_t* native_PromiseResolve(vm_t* vm, var_t* env, void* data) {
     (void)env;
     var_t* value = get_obj(env, "value");
 
-    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    /* ES Promise.resolve: an actual promise is returned unchanged. */
+    if (is_promise(vm, value)) {
+        return var_ref(value);
+    }
+
+    promise_data* pd = promise_data_alloc(vm);
     pd->state = PROMISE_STATE_FULFILLED;
     pd->value = var_ref(value);
     promise_alloc_callbacks(vm, pd);
@@ -301,6 +691,21 @@ var_t* native_PromiseResolve(vm_t* vm, var_t* env, void* data) {
     var_t* proto = get_promise_proto(vm);
     var_t* promise = var_new_obj(vm, proto, pd, promise_free);
     promise_anchor(vm, promise, pd);
+
+    /* Promise.resolve(thenable) must adopt, i.e. stay PENDING until the
+     * thenable settles; only plain values fulfil immediately. */
+    if (is_thenable(vm, value)) {
+        pd->state = PROMISE_STATE_PENDING;
+        if (pd->value != NULL) { var_unref(pd->value); pd->value = NULL; }
+        promise_anchor(vm, promise, pd);
+        if (!promise_adopt_thenable(vm, promise, value)) {
+            /* Not actually adoptable: restore the fulfilled state. */
+            pd->state = PROMISE_STATE_FULFILLED;
+            pd->value = var_ref(value);
+            promise_anchor(vm, promise, pd);
+            promise_schedule_drain(vm, promise);
+        }
+    }
 
     return promise;
 }
@@ -310,7 +715,7 @@ var_t* native_PromiseReject(vm_t* vm, var_t* env, void* data) {
     (void)env;
     var_t* reason = get_obj(env, "reason");
 
-    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    promise_data* pd = promise_data_alloc(vm);
     pd->state = PROMISE_STATE_REJECTED;
     pd->value = var_ref(reason);
     promise_alloc_callbacks(vm, pd);
@@ -322,6 +727,35 @@ var_t* native_PromiseReject(vm_t* vm, var_t* env, void* data) {
     return promise;
 }
 
+/* SpeciesConstructor (ES 7.3.20), prototype-only form: the promise returned by
+ * `then` must carry the @@species constructor's prototype so that
+ * `p.then(cb) instanceof C` holds whenever `p.constructor` selects a species C.
+ * core-js gates its native-`then` patch on exactly this probe (it sets
+ * `p.constructor = { [Symbol.species]: Fake }` and requires the chained promise
+ * to be `instanceof Fake`); without it core-js replaces native then with a
+ * facade whose internal reaction list stalls the Next.js RSC flight reader.
+ * Species is symbol-keyed ("@@S:species[#n]"), so scan the constructor's own
+ * symbol members for the prefix rather than assuming a fixed key. Falls back
+ * to `dflt` (the source promise's own prototype) when no species is selected. */
+static var_t* promise_species_proto(vm_t* vm, var_t* promise, var_t* dflt) {
+    (void)vm;
+    var_t* c = var_find_member_var(promise, "constructor");
+    if (c == NULL || (c->type != V_OBJECT && !c->is_func && !c->is_class)) return dflt;
+    const size_t plen = strlen(SYMKEY_SPECIES);
+    var_t* sp = NULL;
+    for (uint32_t b = 0; b < c->children.capacity && sp == NULL; ++b) {
+        for (hash_entry_t* e = c->children.buckets[b]; e != NULL; e = e->next) {
+            if (e->key == NULL || strncmp(e->key, SYMKEY_SPECIES, plen) != 0) continue;
+            node_t* nd = (node_t*)e->value;
+            if (nd != NULL && nd->var != NULL && (nd->var->is_func || nd->var->is_class)) sp = nd->var;
+            break;
+        }
+    }
+    if (sp == NULL) return dflt;
+    var_t* proto = var_get_prototype(sp);
+    return (proto != NULL) ? proto : dflt;
+}
+
 var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* promise = get_obj(env, THIS);
@@ -331,18 +765,18 @@ var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
     promise_data* pd = (promise_data*)promise->value;
 
     if (pd == NULL) {
-        pd = (promise_data*)mario_malloc(sizeof(promise_data));
+        pd = promise_data_alloc(vm);
         pd->state = PROMISE_STATE_PENDING;
         pd->value = NULL;
         promise_alloc_callbacks(vm, pd);
     }
 
-    promise_data* newPd = (promise_data*)mario_malloc(sizeof(promise_data));
+    promise_data* newPd = promise_data_alloc(vm);
     newPd->state = pd->state;
     newPd->value = pd->value ? var_ref(pd->value) : NULL;
     promise_alloc_callbacks(vm, newPd);
 
-    var_t* proto = var_get_prototype(promise);
+    var_t* proto = promise_species_proto(vm, promise, var_get_prototype(promise));
     var_t* newPromise = var_new_obj(vm, proto, newPd, promise_free);
     promise_anchor(vm, newPromise, newPd);
     var_ref(newPromise); /* off the gc list: the callback calls below may trigger a gc.
@@ -350,54 +784,26 @@ var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
                           * unwinds the value stack, so a blind vm_pop2() afterwards
                           * could remove the wrong slots and free newPromise. */
 
-    if (pd->state == PROMISE_STATE_FULFILLED && onFulfilled != NULL) {
-        var_t* args = var_new_array(vm);
-        var_array_add(args, pd->value);
-        var_t* result = call_m_func(vm, promise, onFulfilled, args);
-        if (promise_settle_propagated(vm, newPd, newPromise)) {
-            var_unref(args);
-        } else {
-            result = promise_unwrap(vm, result);
-            var_t* old = newPd->value;
-            if (result != NULL) {
-                newPd->value = result; /* adopt the ref result already carries */
-            } else {
-                newPd->value = var_ref(var_new_null(vm));
-            }
-            promise_anchor(vm, newPromise, newPd); /* gc-reachable before any unref below */
-            if (old) {
-                var_unref(old);
-            }
-            var_unref(args);
+    if (pd->state == PROMISE_STATE_PENDING) {
+        if (getenv("MARIO_RSDBG") != NULL) {
+            func_t* ff = (onFulfilled != NULL) ? (func_t*)onFulfilled->value : NULL;
+            fprintf(stderr, "[rsdbg] then-on-pending promise=%p onF=%p entrypc=%u\n",
+                (void*)promise, (void*)onFulfilled, (unsigned)(ff != NULL ? ff->pc : 0u));
         }
-    } else if (pd->state == PROMISE_STATE_REJECTED && onRejected != NULL) {
-        var_t* args = var_new_array(vm);
-        var_array_add(args, pd->value);
-        var_t* result = call_m_func(vm, promise, onRejected, args);
-        if (promise_settle_propagated(vm, newPd, newPromise)) {
-            var_unref(args);
-        } else {
-            result = promise_unwrap(vm, result);
-            var_t* old = newPd->value;
-            if (result != NULL) {
-                newPd->value = result; /* adopt the ref result already carries */
-            } else {
-                newPd->value = var_ref(var_new_null(vm));
-            }
-            newPd->state = PROMISE_STATE_FULFILLED;
-            promise_anchor(vm, newPromise, newPd); /* gc-reachable before any unref below */
-            if (old) {
-                var_unref(old);
-            }
-            var_unref(args);
+        promise_add_reaction(vm, pd, onFulfilled, onRejected, newPromise);
+        /* The source must survive until it settles even if the caller drops
+         * it (`p.then(cb)` with no other reference to p). */
+        promise_root_pending(vm, promise);
+    } else {
+        /* Already settled: queue the reaction as a microtask (ES spec) instead
+         * of running it inline, and let the drain settle newPromise. */
+        if (getenv("MARIO_RSDBG") != NULL) {
+            func_t* ff = (onFulfilled != NULL) ? (func_t*)onFulfilled->value : NULL;
+            fprintf(stderr, "[rsdbg] then-on-settled promise=%p state=%d onF=%p entrypc=%u\n",
+                (void*)promise, pd->state, (void*)onFulfilled, (unsigned)(ff != NULL ? ff->pc : 0u));
         }
-    } else if (pd->state == PROMISE_STATE_PENDING) {
-        if (onFulfilled != NULL) {
-            var_array_add(pd->fulfilled_callbacks, onFulfilled);
-        }
-        if (onRejected != NULL) {
-            var_array_add(pd->rejected_callbacks, onRejected);
-        }
+        promise_add_reaction(vm, pd, onFulfilled, onRejected, newPromise);
+        promise_schedule_drain(vm, promise);
     }
 
     /* Drop the protection ref with a bare decrement (never var_unref) so
@@ -445,7 +851,7 @@ var_t* native_PromiseAll(vm_t* vm, var_t* env, void* data) {
     (void)env;
     var_t* promises = get_obj(env, "promises");
 
-    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    promise_data* pd = promise_data_alloc(vm);
     pd->state = PROMISE_STATE_FULFILLED;
     /* promise_free() unrefs pd->value, so promise_data must OWN a reference on the
      * result array (matching native_PromiseResolve's var_ref(value)); @@keep adds a
@@ -491,7 +897,7 @@ var_t* native_PromiseRace(vm_t* vm, var_t* env, void* data) {
     (void)env;
     var_t* promises = get_obj(env, "promises");
 
-    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    promise_data* pd = promise_data_alloc(vm);
     pd->state = PROMISE_STATE_PENDING;
     pd->value = NULL;
     promise_alloc_callbacks(vm, pd);
@@ -529,7 +935,7 @@ var_t* native_PromiseAllSettled(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* promises = get_obj(env, "promises");
 
-    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    promise_data* pd = promise_data_alloc(vm);
     pd->state = PROMISE_STATE_FULFILLED;
     /* Own a ref on the result array; see the identical note in native_PromiseAll. */
     pd->value = var_ref(var_new_array(vm));
@@ -573,7 +979,7 @@ var_t* native_PromiseAny(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* promises = get_obj(env, "promises");
 
-    promise_data* pd = (promise_data*)mario_malloc(sizeof(promise_data));
+    promise_data* pd = promise_data_alloc(vm);
     pd->state = PROMISE_STATE_PENDING;
     pd->value = NULL;
     promise_alloc_callbacks(vm, pd);
@@ -644,8 +1050,69 @@ static var_t* native_setTimeout(vm_t* vm, var_t* env, void* data) {
     return NULL;
 }
 
+/* ===== Engine-internal promise construction =====
+ * These build genuine builtin-prototype promises WITHOUT going through the
+ * window.Promise global, so they keep working after a page replaces Promise
+ * with a polyfill. Used by ReadableStream (native_Stream.c) to defer a parked
+ * read and to settle it later: rokid's webpack runtime clobbered window.Promise
+ * with a constructor-less shim, so the stream's old path (run the global
+ * constructor to capture resolve/reject) got nothing and the RSC flight reader
+ * saw an immediate done=true, stalling hydration. */
+
+/* A pending promise plus its resolve/reject handles. Each of *out_resolve and
+ * *out_reject is var_ref'd once for the caller to own (call them with a single
+ * argument array to settle). The returned promise is at baseline refs and is
+ * kept alive by the caller. */
+var_t* promise_new_deferred(vm_t* vm, var_t** out_resolve, var_t** out_reject) {
+    if (out_resolve != NULL) *out_resolve = NULL;
+    if (out_reject != NULL) *out_reject = NULL;
+
+    promise_data* pd = promise_data_alloc(vm);
+    pd->state = PROMISE_STATE_PENDING;
+    pd->value = NULL;
+    promise_alloc_callbacks(vm, pd);
+
+    var_t* proto = get_promise_proto(vm);
+    var_t* obj = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, obj, pd);
+
+    node_t* rn = vm_reg_native_on(vm, obj, "__resolve(value)", native_promise_resolve_cb, obj);
+    node_t* jn = vm_reg_native_on(vm, obj, "__reject(reason)", native_promise_reject_cb, obj);
+    rn->invisable = 1; rn->be_unenumerable = 1;
+    jn->invisable = 1; jn->be_unenumerable = 1;
+
+    if (out_resolve != NULL) *out_resolve = var_ref(rn->var);
+    if (out_reject != NULL) *out_reject = var_ref(jn->var);
+    return obj;
+}
+
+/* An already-fulfilled promise wrapping `value` (a ref on value is taken). */
+var_t* promise_new_resolved(vm_t* vm, var_t* value) {
+    promise_data* pd = promise_data_alloc(vm);
+    pd->state = PROMISE_STATE_FULFILLED;
+    pd->value = (value != NULL) ? var_ref(value) : var_ref(var_new(vm));
+    promise_alloc_callbacks(vm, pd);
+    var_t* proto = get_promise_proto(vm);
+    var_t* promise = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, promise, pd);
+    return promise;
+}
+
+/* An already-rejected promise wrapping `reason` (a ref on reason is taken). */
+var_t* promise_new_rejected(vm_t* vm, var_t* reason) {
+    promise_data* pd = promise_data_alloc(vm);
+    pd->state = PROMISE_STATE_REJECTED;
+    pd->value = (reason != NULL) ? var_ref(reason) : var_ref(var_new(vm));
+    promise_alloc_callbacks(vm, pd);
+    var_t* proto = get_promise_proto(vm);
+    var_t* promise = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, promise, pd);
+    return promise;
+}
+
 void reg_native_Promise(vm_t* vm) {
     var_t* cls = vm_new_class(vm, CLS_PROMISE);
+    s_builtin_promise_proto = var_get_prototype(cls);
     vm_reg_native(vm, cls, "constructor(executor)", native_PromiseConstructor, NULL);
     vm_reg_static(vm, cls, "resolve(value)", native_PromiseResolve, NULL);
     vm_reg_static(vm, cls, "reject(reason)", native_PromiseReject, NULL);
@@ -663,6 +1130,28 @@ void reg_native_Promise(vm_t* vm) {
     vm_reg_native(vm, NULL, "__await(x)", native_await, NULL);
     vm_reg_native(vm, NULL, "__promise_resolve(value)", native_PromiseResolve, NULL);
     vm_reg_native(vm, NULL, "setTimeout(cb, ms)", native_setTimeout, NULL);
+}
+
+/* Debug: walk the live-promise ledger and report every PENDING promise that
+ * somebody is awaiting (has a fulfilled callback registered). Those are the
+ * awaits that can never make progress - exactly the "runApp completed but
+ * nothing rendered" signature. Inert unless MARIO_PROMLEDGER is set. */
+void mario_promise_ledger_dump(vm_t* vm) {
+    (void)vm;
+    if (s_ledger_on != 1) return;
+    unsigned total = 0, pending = 0, awaited = 0;
+    for (promise_data* p = s_ledger_head; p != NULL; p = p->dbg_next) {
+        total++;
+        if (p->state != PROMISE_STATE_PENDING) continue;
+        pending++;
+        unsigned fc = (p->fulfilled_callbacks != NULL) ? (unsigned)var_array_size(p->fulfilled_callbacks) : 0u;
+        if (fc == 0) continue;
+        awaited++;
+        fprintf(stderr, "[promledger] PENDING-AWAITED id=%u pc=%u onFulfilled=%u onRejected=%u\n",
+            p->dbg_id, p->dbg_pc, fc,
+            (p->rejected_callbacks != NULL) ? (unsigned)var_array_size(p->rejected_callbacks) : 0u);
+    }
+    fprintf(stderr, "[promledger] summary live=%u pending=%u pending_awaited=%u\n", total, pending, awaited);
 }
 
 #ifdef __cplusplus

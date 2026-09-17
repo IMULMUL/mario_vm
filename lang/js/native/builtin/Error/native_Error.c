@@ -24,7 +24,13 @@ static void error_set_str_member(var_t* thisV, const char* key, const char* val)
 var_t* native_ErrorConstructor(vm_t* vm, var_t* env, void* data) {
 	const char* name = (data != NULL) ? (const char*)data : CLS_ERROR;
 	const char* s = get_str(env, "str");
-	var_t* thisV = var_new_obj(vm, get_obj(env, THIS), NULL, NULL);
+	/* The engine already created a fresh instance whose [[Prototype]] is
+	 * Error.prototype (or the subtype's) and bound it as `this`; mutate and return
+	 * it directly, exactly like the Set/Map constructors. Wrapping it in
+	 * var_new_obj(.., THIS, ..) used to insert a spurious prototype level, so
+	 * Object.getPrototypeOf(err) !== Error.prototype and core-js's classof-based
+	 * Error.isError brand check saw "[object Object]". */
+	var_t* thisV = get_obj(env, THIS);
 	error_set_str_member(thisV, "message", s);
 	error_set_str_member(thisV, "name", name);
 	return thisV;
@@ -58,7 +64,7 @@ var_t* native_ErrorToString(vm_t* vm, var_t* env, void* data) {
  * iterable of errors as an own `errors` array property. */
 var_t* native_AggregateErrorConstructor(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* thisV = var_new_obj(vm, get_obj(env, THIS), NULL, NULL);
+	var_t* thisV = get_obj(env, THIS); /* fresh instance; see native_ErrorConstructor */
 	error_set_str_member(thisV, "message", get_str(env, "message"));
 	error_set_str_member(thisV, "name", "AggregateError");
 	var_t* errors = get_obj(env, "errors");
@@ -94,6 +100,11 @@ void reg_native_Error(vm_t* vm) {
 	vm_reg_var(vm, cls, "message", var_new_str(vm, ""), false);
 	vm_reg_native(vm, cls, "constructor(str)", native_ErrorConstructor, (void*)CLS_ERROR);
 	vm_reg_native(vm, cls, "toString()", native_ErrorToString, NULL);
+	/* Object.prototype.toString must report "[object Error]" for every error so
+	 * core-js's classof-based Error.isError (and any @@toStringTag brand check)
+	 * resolves. Subtypes inherit this tag: per spec they all report the "Error"
+	 * class rather than their own name. */
+	vm_reg_var(vm, cls, SYMKEY_TOSTRINGTAG, var_new_str(vm, "Error"), true);
 
 	/* Standard error subtypes, all instanceof Error. */
 	reg_error_subtype(vm, cls, "TypeError");

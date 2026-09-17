@@ -50,6 +50,12 @@ void        lex_reset(lex_t* lex);
  * emits UTF-8, combining UTF-16 surrogate pairs. Shared by the single- and
  * double-quote string lexers. */
 void        lex_read_u_escape(lex_t* lex);
+/* Decode one string escape sequence (entry: curr_ch is the char after '\\').
+ * Spec-correct and quote-agnostic: \b \f \v \n \r \t \xHH \uHHHH \u{...},
+ * legacy octal \0..\377, \<LineContinuation>, and identity escapes. Leaves
+ * curr_ch on the last consumed char (caller does one trailing lex_get_nextch).
+ * Shared by the single- and double-quote string lexers. */
+void        lex_read_escape(lex_t* lex);
 void        lex_init(lex_t * lex, const char* input);
 void        lex_release(lex_t* lex);
 void        lex_skip_whitespace(lex_t* lex);

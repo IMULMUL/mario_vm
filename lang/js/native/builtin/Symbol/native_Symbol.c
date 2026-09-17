@@ -194,6 +194,15 @@ void reg_native_Symbol(vm_t* vm) {
         { "asyncIterator", SYMKEY_ASYNCITERATOR },
         { "toStringTag", SYMKEY_TOSTRINGTAG },
         { "toPrimitive", SYMKEY_TOPRIMITIVE },
+        { "species", SYMKEY_SPECIES },
+        { "hasInstance", SYMKEY_PREFIX "hasInstance" },
+        { "isConcatSpreadable", SYMKEY_PREFIX "isConcatSpreadable" },
+        { "match", SYMKEY_PREFIX "match" },
+        { "matchAll", SYMKEY_PREFIX "matchAll" },
+        { "replace", SYMKEY_PREFIX "replace" },
+        { "search", SYMKEY_PREFIX "search" },
+        { "split", SYMKEY_PREFIX "split" },
+        { "unscopables", SYMKEY_PREFIX "unscopables" },
         { NULL, NULL }
     };
     for (int i = 0; wk[i].name != NULL; ++i) {

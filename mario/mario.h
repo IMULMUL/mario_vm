@@ -339,8 +339,18 @@ typedef struct st_bytecode {
 #define INSTR_STATICN      0x096 // STATICN name : pop a value, define it as a static member of the class under definition (ES2022 `static x = e`)
 #define INSTR_WANCHOR      0x097 // WANCHOR name : replace the base lvalue with a @@wanchor sentinel holding it; pairs with INSTR_WTARGET (deferred member write target, `a.b = rhs`)
 #define INSTR_WTARGET      0x098 // WTARGET name : resolve the write target on the base under the nearest @@wanchor, replacing the anchor with the [obj,]node slot(s) beneath the RHS value
+#define INSTR_FINALLY_END  0x099 // FINALLY_END : end of a `finally` block; resumes a return/break/continue that was deferred to run this finally (see vm_t.pending_op)
+#define INSTR_FUNC_NAMED   0x09A // FUNC_NAMED name : define a NAMED function EXPRESSION; the operand is the function's own name, bound to itself in its per-call scope so the body can self-reference it (ES named-function-expression semantics), while staying invisible outside
+#define INSTR_LOADV        0x09B // LOADV x : like LOAD, but pushes the binding's CURRENT VALUE (a snapshot) instead of the binding node. Source-level rvalue reads of a bare identifier use this so an operand already on the value stack is not aliased by a later reassignment of the same binding (e.g. `f(m, m++, m)` must pass m's pre-increment value as the first argument). Write targets keep the node form (LOADW).
 
-#define INSTR_MAX          0x099 // Maximum instruction opcode value
+#define INSTR_MAX          0x09C // Maximum instruction opcode value
+
+/* vm_t.pending_op: the kind of control transfer parked while a `finally` block
+ * runs (see the pending_value comment in the vm struct). */
+#define FIN_NONE      0
+#define FIN_RETURN    1
+#define FIN_BREAK     2
+#define FIN_CONTINUE  3
 
 
 PC          bc_gen(bytecode_t* bc, opr_code_t instr);
@@ -399,6 +409,7 @@ extern const char* _mario_lang;
 #define SYMKEY_ASYNCITERATOR "@@S:asyncIterator"
 #define SYMKEY_TOSTRINGTAG "@@S:toStringTag"
 #define SYMKEY_TOPRIMITIVE "@@S:toPrimitive"
+#define SYMKEY_SPECIES "@@S:species"
 
 /* Exotic objects (ArrayBuffer / SharedArrayBuffer / TypedArray / DataView /
  * Proxy) are ordinary V_OBJECT vars that carry ONE hidden invisable marker
@@ -415,6 +426,15 @@ extern const char* _mario_lang;
 #define EXOTIC_PROXY       "proxy"  // Proxy(target, handler)
 #define EXOTIC_WEAKREF     "wr"     // WeakRef(target): weak observation via deref()
 #define EXOTIC_FR          "fr"     // FinalizationRegistry: post-collection cleanup callbacks
+
+/* Boxed primitive: `Object(str)` / `new String(str)` yield an ordinary V_OBJECT
+ * (typeof 'object') that must still behave like its primitive for .length,
+ * [index], iteration, valueOf and toString. The wrapper carries the primitive
+ * characters in ->value (so var_get_str - and every String.prototype native that
+ * reads get_str(THIS) - sees them unchanged) plus ONE hidden invisable marker
+ * member STRBOX_MARKER for cheap detection. Kept separate from EXOTIC_MARKER so
+ * it never trips the ArrayBuffer/TypedArray/Proxy property-access intercept. */
+#define STRBOX_MARKER "@@strbox"
 
 /* TypedArray element-type codes (hidden @@etype member, a V_INT). One code per
  * concrete view; the element-access primitives in mario.c (var_typedarray_get_at
@@ -469,6 +489,16 @@ extern const char* _mario_lang;
 #define WSLOT_OBJ        "@@wobj"   // hidden member on the @@wslot node's var: the ref'd receiver
 #define WSLOT_KEY        "@@wkey"   // hidden member on the @@wslot node's var: the member key (string/symbol/number var)
 
+/* `arr.length = n` write-target. An array's length is virtual (derived from the
+ * hidden _ARRAY_ store), so do_get(for_write) can not hand back a plain member
+ * node - it pushes a synthetic @@arrlen sentinel carrying the array, and
+ * handle_asign's arrlen_slot_write() truncates/extends it to the assigned value.
+ * Without this the write resolved to a bare value, vm_pop2node returned NULL and
+ * the assignment silently no-op'd (`buf.length = 0` never cleared the buffer,
+ * which corrupted React's RSC flight row parser). */
+#define ARRLEN_SLOT      "@@arrlen" // synthetic write-target node name (array length setter)
+#define ARRLEN_SLOT_ARR  "@@alarr"  // hidden member on the @@arrlen node's var: the ref'd array
+
 /* WeakRef / FinalizationRegistry (Phase 6). A WeakRef holds its target's raw
  * pointer in var->value (NEVER ref'd, so the target stays collectable) with a
  * no-op free_func; value==NULL means the reference has been cleared. A
@@ -513,6 +543,11 @@ typedef struct st_func {
 	int8_t              is_arrow: 4;     // ES6 arrow function: lexical `this`, no `prototype`, not constructible
 	PC                  pc;
 	void*               data;
+	/* ES named-function-expression self-binding: for `var f = function name(){...}`
+	 * the identifier `name` must resolve to the function itself INSIDE the body
+	 * (and nowhere outside). func_call binds this name into the per-call env when
+	 * non-NULL. Owned (mario_malloc'd); freed in func_free(). */
+	char*               nfe_name;
 	m_array_t           args; //argument names
 	var_t*              owner;
 	/* Back-pointer to the var_t that owns this func_t (var->value == this, set by
@@ -616,6 +651,11 @@ typedef struct st_scope {
 	var_t* class_var; // for a class-definition scope: the constructor var (pushed by CLASS_END so class expressions evaluate to the class)
 	PC pc_start; // continue anchor for loop
 	PC pc; // try cache anchor , or break anchor for loop
+	/* Start PC of this try's `finally` block (ILLEGAL_PC when it has none). A
+	 * return/break/continue leaving the try body jumps here first; the block's
+	 * INSTR_FINALLY_END then completes the parked transfer. Set by handle_block
+	 * from the INSTR_TRY/INSTR_BLOCK operand the compiler patches in stmt_try. */
+	PC pc_finally;
 	int32_t stack_top; // value-stack height at scope entry; a runtime throw truncates leaked operands back to the innermost func frame's height (see vm_throw_truncate)
 	uint32_t is_func: 8;
 	uint32_t is_block: 8;
@@ -625,6 +665,8 @@ typedef struct st_scope {
 	uint32_t is_label: 4;  // labeled-statement scope: only a `break <label>` with a matching label stops here (never an unlabeled break/continue)
 	uint32_t is_strict: 4;
 	uint32_t is_with: 4;   // `with (obj)` scope: sc->var IS the with object; name resolution walks its member/prototype chain even when it carries no own members
+	uint32_t has_finally: 4; // this try (or a try-finally demoted to a block) owns a finally block at pc_finally that a leaving return/break/continue must run
+	uint32_t is_objlit: 4;  // object/array-literal construction scope (handle_obj): sc->var is the literal being built, NOT a lexical env. Free-name resolution must skip it entirely - its own members are properties-under-construction and its prototype chain (Object.prototype / Array.prototype) would otherwise shadow a real binding for any name that is also a builtin method (`keys`, `values`, `length`, ...), e.g. `{id: keys[i]}` resolving the global array `keys` to Object.prototype.keys.
 	const char* label;     // for a labeled scope: the label name (points into the bytecode string table, valid for the whole run); NULL otherwise
 	func_t*  func;
 	/* The function OBJECT var that owns `func` (func_t). func_call() picks
@@ -676,6 +718,15 @@ typedef struct st_vm {
 	uint32_t            step_count;
 	void                (*on_step)(struct st_vm* vm, void* data);
 	void*               on_step_data;
+	/* Await spin hook: the synchronous __await() helper calls this while the
+	 * awaited promise is still PENDING, so the embedder can pump its event
+	 * loop (timers / message-queue) and let the promise settle instead of the
+	 * await yielding undefined. One call = one pump tick: return non-zero if
+	 * the tick fired callbacks or slept waiting (caller re-checks and retries),
+	 * 0 when the loop is empty and the promise can never settle (caller gives
+	 * up). The tick may run JS callbacks but must not compile or load bytecode
+	 * (same restriction as on_step). NULL = await never waits. */
+	int                 (*on_await_pending)(struct st_vm* vm, var_t* promise);
 	/* ES6 generator suspension: handle_yield sets yielded + yield_value and the
 	 * running vm_run() returns; gen_resume() (the generator's next()) consumes
 	 * them. yield_delegate carries the iterator of an in-progress `yield*`.
@@ -684,6 +735,20 @@ typedef struct st_vm {
 	bool                yielded;
 	var_t*              yield_value;
 	var_t*              yield_delegate;
+	/* Deferred `finally` completion. A return/break/continue that leaves a try
+	 * body must run that try's finally block BEFORE the transfer completes, so the
+	 * transfer is parked here, vm->pc is set to the scope's pc_finally, and the
+	 * block's terminating INSTR_FINALLY_END resumes it. pending_op is one of the
+	 * FIN_* values below (0 == FIN_NONE, so vm_new's memset leaves try-less code
+	 * completely unaffected); pending_value owns a deferred return value and is
+	 * kept gc-reachable in gc_vars(); pending_pc is the break/continue anchor.
+	 * fin_ret_done tells the vm_run dispatch that a just-run INSTR_FINALLY_END
+	 * finished a deferred return, so this frame must break exactly as the
+	 * INSTR_RETURN dispatch would have. */
+	var_t*              pending_value;
+	PC                  pending_pc;
+	int                 pending_op;
+	bool                fin_ret_done;
 	/* An exception raised inside a native function (vm_throw_native): func_call
 	 * delivers it to the nearest try scope after the native returns, keeping the
 	 * value stack balanced (env pop / ret push protocol). */
@@ -800,6 +865,7 @@ node_t*     var_array_add_head(var_t* var, var_t* add);
 node_t*     var_array_set(var_t* var, int32_t index, var_t* set_var);
 node_t*     var_array_remove(var_t* var, int32_t index);
 void        var_array_del(var_t* var, int32_t index);
+void        var_array_resize(var_t* var, uint32_t newlen);   // set arr.length: truncate or extend with holes
 void        var_array_reverse(var_t* var);
 uint32_t    var_array_size(var_t* var);
 void        var_instance_from(var_t* var, var_t* src);
@@ -835,6 +901,9 @@ var_t*      var_set_int64(var_t* var, int64_t v);
 var_t*      var_new_float64(vm_t* vm, double d);
 double      var_get_float64(var_t* var);
 var_t*      var_set_float64(var_t* var, double v);
+/* ToNumber per ECMA-262 (objects reduced via ToPrimitive(number): Symbol.toPrimitive,
+ * valueOf, toString). For natives that must coerce a value exactly once. */
+double      vm_to_number(vm_t* vm, var_t* v);
 var_t*      var_new_bigint(vm_t* vm, bignum_t* b); // takes ownership of b (freed via bn_free)
 bignum_t*   var_get_bigint(var_t* var);            // NULL unless var is a V_BIGINT
 bool        var_is_number(var_t* var);
@@ -870,6 +939,12 @@ bool        var_is_arraybuffer(var_t* var);   // ArrayBuffer or SharedArrayBuffe
 bool        var_is_typedarray(var_t* var);
 bool        var_is_dataview(var_t* var);
 bool        var_is_proxy(var_t* var);
+
+/* Boxed String object (see STRBOX_MARKER): true for an `Object(str)` /
+ * `new String(str)` wrapper. vm_box_string_obj turns a fresh V_OBJECT into one
+ * (stores the primitive in ->value, links String.prototype, drops the marker). */
+bool        var_is_string_obj(var_t* var);
+void        vm_box_string_obj(vm_t* vm, var_t* obj, const char* s);
 
 /* TypedArray element access, implemented in mario.c next to the exotic
  * predicates so the read/write intercept does not depend on the lang native.
@@ -927,6 +1002,10 @@ bool        mario_set_prototype_var(vm_t* vm, var_t* obj, var_t* proto);
 bool        mario_is_extensible_var(vm_t* vm, var_t* obj);
 bool        mario_prevent_extensions_var(vm_t* vm, var_t* obj);
 bool        mario_define_property_var(vm_t* vm, var_t* obj, var_t* key, var_t* desc);
+/* Wrap a getter/setter func as a FUNC_REGULAR trampoline so it can be stored as a
+ * plain data value (property descriptor `.get`/`.set`) and read back as a callable
+ * function instead of being auto-invoked. Returns NULL for a non-function. */
+var_t*      vm_accessor_as_data_func(vm_t* vm, var_t* fn);
 var_t*      mario_gopd_var(vm_t* vm, var_t* obj, var_t* key);     // owned or undefined
 var_t*      mario_apply_var(vm_t* vm, var_t* func, var_t* thisArg, var_t* argsNatural);   // owned
 var_t*      mario_construct_var(vm_t* vm, var_t* ctor, var_t* argsNatural, var_t* newTarget); // owned

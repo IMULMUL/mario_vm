@@ -3,6 +3,7 @@ extern "C" {
 #endif
 
 #include "native_Stream.h"
+#include "Promise/native_Promise.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -37,7 +38,34 @@ extern "C" {
 #define RS_RES      "@@rs_res"
 #define RS_REJ      "@@rs_rej"
 
-typedef struct { var_t* resolve; var_t* reject; } rs_defer_t;
+/* Parked read requests keep their settle handles in an opaque C struct hung
+ * off rec->value instead of hidden JS members: the member nodes proved
+ * unreliable (the @@rs_res node was gone by the time a later enqueue settled
+ * the read, so Next.js flight's parked read never resolved and the whole RSC
+ * pipeline stalled). rec->value is opaque to the GC and to member surgery, and
+ * the struct owns one ref per handle until rec itself is freed. `promise` owns
+ * a ref on the settled promise too: the native resolve/reject closures carry it
+ * as a bare data pointer, and the caller drops the read() result right after
+ * .then(), so pk must anchor it until a later enqueue/close settles the read. */
+typedef struct { var_t* promise; var_t* resolve; var_t* reject; } rs_park_t;
+
+static void rs_park_free(void* p) {
+	rs_park_t* pk = (rs_park_t*)p;
+	if(pk == NULL) return;
+	if(getenv("MARIO_RSDBG") != NULL)
+		fprintf(stderr, "[rsdbg] park_free pk=%p res=%p rej=%p\n", (void*)pk,
+			(void*)pk->resolve, (void*)pk->reject);
+	if(pk->resolve != NULL) var_unref(pk->resolve);
+	if(pk->reject != NULL) var_unref(pk->reject);
+	if(pk->promise != NULL) var_unref(pk->promise);
+	mario_free(pk);
+}
+
+static var_t* rs_park_fn(var_t* rec, bool want_rej) {
+	rs_park_t* pk = (rec != NULL) ? (rs_park_t*)rec->value : NULL;
+	if(pk == NULL) return NULL;
+	return want_rej ? pk->reject : pk->resolve;
+}
 
 /* mario arrays keep `length` virtual (computed from the hidden _ARRAY_ map), so
  * reading a "length" member yields nothing; use the direct accessors. */
@@ -91,61 +119,34 @@ static node_t* rs_hidden(var_t* obj, const char* key, var_t* val) {
 	return n;
 }
 
-/* The deferred executor: the Promise constructor hands us (resolve, reject)
- * positionally; with no declared parameter names they land in `arguments`. */
-static var_t* rs_executor(vm_t* vm, var_t* env, void* data) {
-	(void)vm;
-	rs_defer_t* d = (rs_defer_t*)data;
-	var_t* argv = var_find_member_var(env, "arguments");
-	if(argv != NULL) {
-		var_t* r = var_find_member_var(argv, "0");
-		var_t* j = var_find_member_var(argv, "1");
-		if(r != NULL && r->is_func) d->resolve = var_ref(r);
-		if(j != NULL && j->is_func) d->reject = var_ref(j);
-	}
-	return NULL;
-}
+/* The deferred promise is built by promise_new_deferred() (native_Promise.c),
+ * which returns a genuine builtin-prototype pending promise plus its
+ * resolve/reject handles directly - no dependence on window.Promise (rokid's
+ * webpack runtime replaces it with a constructor-less polyfill shim, which made
+ * the old run-the-global-constructor path fail and stall the RSC flight reader
+ * at an immediate done=true). */
 
-/* Promise.resolve(v) / Promise.reject(v) via the registered statics. Returns an
- * owned var (hand straight back as the native result). */
+/* Promise.resolve(v) / Promise.reject(v) via the engine-internal builders.
+ * These do NOT touch window.Promise (rokid's bundle replaces it with a
+ * constructor-less polyfill shim). Returns a baseline-refs owned var. */
 static var_t* rs_promise_settle(vm_t* vm, const char* which, var_t* value) {
-	var_t* cls = var_find_own_member_var(vm->root, "Promise");
-	if(cls == NULL)
-		return value ? var_ref(value) : var_new(vm);
-	var_t* proto = var_get_prototype(cls);
-	var_t* fn = (proto != NULL) ? get_obj(proto, which) : NULL;
-	if(fn == NULL || !fn->is_func) fn = get_obj(cls, which);
-	if(fn == NULL || !fn->is_func)
-		return value ? var_ref(value) : var_new(vm);
-	var_t* args = var_new_array(vm);
-	var_array_add(args, value ? value : var_new(vm));
-	var_t* p = call_m_func(vm, cls, fn, args);
-	var_unref(args);
-	return p ? p : var_new(vm);
+	if(strcmp(which, "reject") == 0)
+		return promise_new_rejected(vm, value);
+	return promise_new_resolved(vm, value);
 }
 
-/* A pending Promise plus the resolve/reject handles needed to settle it later.
- * The handles are copied onto `rec` (a pending-request record) by the caller. */
-static var_t* rs_deferred(vm_t* vm, rs_defer_t* d) {
-	d->resolve = NULL; d->reject = NULL;
-	var_t* cls = var_find_own_member_var(vm->root, "Promise");
-	if(cls == NULL) return NULL;
-	var_t* proto = var_get_prototype(cls);
-	var_t* ctor = (proto != NULL) ? get_obj(proto, "constructor") : NULL;
-	if(ctor == NULL || !ctor->is_func) ctor = get_obj(cls, "constructor");
-	if(ctor == NULL || !ctor->is_func) return NULL;
-	var_t* executor = var_new_native_func(vm, rs_executor, d);
-	var_ref(executor);
-	var_t* thisV = var_new_obj(vm, proto, NULL, NULL);
-	var_t* args = var_new_array(vm);
-	var_array_add(args, executor);
-	var_t* p = call_m_func(vm, thisV, ctor, args);
-	var_unref(args);
-	var_unref(executor);
-	return p;
-}
-
-/* Build the {value, done} read-result record. Adopts nothing. */
+/* Build the {value, done} read-result record. Adopts nothing.
+ *
+ * Refcount contract: the record comes back at baseline refs=0 (unowned) and
+ * every holder takes its own ref - promise_new_resolved()/resolve_cb() ref it
+ * into pd->value and promise_anchor() refs it into the promise's @@keep gc
+ * array. Callers must therefore NOT var_unref() it after handing it over: that
+ * dropped an owner that never existed, so the next @@keep rebuild (which
+ * releases the old entries before re-adding them) took the record to 0 and
+ * freed it while pd->value still pointed at it. The reaction then ran with a
+ * recycled var_t (type already reused as V_UNDEF) and reader.read() resolved
+ * with {value: undefined, done: undefined} - Next.js flight silently lost its
+ * first chunk, which is where rokid.com's RSC payload (and its top nav) went. */
 static var_t* rs_result(vm_t* vm, var_t* value, bool done) {
 	var_t* rec = var_new_obj(vm, NULL, NULL, NULL);
 	var_add(rec, "value", value ? value : var_new(vm));
@@ -161,7 +162,7 @@ static void rs_drain_pending(vm_t* vm, var_t* stream, var_t* value, bool done, b
 	while(rs_len(pending) > 0) {
 		var_t* rec = rs_shift(pending);
 		if(rec == NULL) break;
-		var_t* fn = get_obj(rec, is_err ? RS_REJ : RS_RES);
+		var_t* fn = rs_park_fn(rec, is_err);
 		var_t* arg = is_err ? (value ? value : var_new(vm)) : rs_result(vm, value, done);
 		if(fn != NULL && fn->is_func) {
 			var_t* a = var_new_array(vm);
@@ -170,7 +171,8 @@ static void rs_drain_pending(vm_t* vm, var_t* stream, var_t* value, bool done, b
 			var_unref(a);
 			if(r != NULL) var_unref(r);
 		}
-		if(!is_err && arg != NULL) var_unref(arg);
+		/* NB: no var_unref(arg) for the !is_err record (rs_result's contract); the
+		 * is_err branch borrows the caller's error value and must not touch it. */
 		var_unref(rec);
 	}
 }
@@ -183,11 +185,19 @@ static var_t* rs_ctl_enqueue(vm_t* vm, var_t* env, void* data) {
 	var_t* stream = get_obj(ctl, RS_STREAM);
 	if(stream == NULL) return NULL;
 	var_t* pending = get_obj(stream, RS_PENDING);
+	if(getenv("MARIO_RSDBG") != NULL)
+		fprintf(stderr, "[rsdbg] enqueue stream=%p pending=%u\n", (void*)stream,
+			(unsigned)rs_len(pending));
 	if(rs_len(pending) > 0) {
 		var_t* rec = rs_shift(pending);
 		if(rec != NULL) {
-			var_t* fn = get_obj(rec, RS_RES);
+			var_t* fn = rs_park_fn(rec, false);
 			var_t* arg = rs_result(vm, chunk, false);
+			if(getenv("MARIO_RSDBG") != NULL)
+				fprintf(stderr, "[rsdbg] settle rec=%p fn=%p isfunc=%d chunk=%p ctype=%d arg=%p arefs=%d\n",
+					(void*)rec, (void*)fn, (fn != NULL && fn->is_func) ? 1 : 0,
+					(void*)chunk, (chunk != NULL) ? (int)chunk->type : -1,
+					(void*)arg, (arg != NULL) ? (int)arg->refs : -1);
 			if(fn != NULL && fn->is_func) {
 				var_t* a = var_new_array(vm);
 				var_array_add(a, arg);
@@ -195,7 +205,7 @@ static var_t* rs_ctl_enqueue(vm_t* vm, var_t* env, void* data) {
 				var_unref(a);
 				if(r != NULL) var_unref(r);
 			}
-			var_unref(arg);
+			/* NB: no var_unref(arg) - see rs_result()'s refcount contract. */
 			var_unref(rec);
 			return NULL;
 		}
@@ -249,13 +259,16 @@ static var_t* rs_reader_read(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* reader = get_obj(env, THIS);
 	var_t* stream = get_obj(reader, RS_STREAM);
-	if(stream == NULL)
+	if(stream == NULL) {
+		if(getenv("MARIO_RSDBG") != NULL)
+			fprintf(stderr, "[rsdbg] read BAIL reader=%p has NO stream -> reject\n", (void*)reader);
 		return rs_promise_settle(vm, "reject", var_new_str(vm, "TypeError: reader has no stream"));
+	}
 	{ /* DIAG (temp): why does read() never report done? */
 		if(getenv("MARIO_RSDBG") != NULL) {
 			var_t* dq = get_obj(stream, RS_QUEUE);
 			var_t* dc = get_obj(stream, RS_CLOSED);
-			fprintf(stderr, "[rsdbg] read qlen=%u closed=%d cerr=%p\n",
+			fprintf(stderr, "[rsdbg] read stream=%p qlen=%u closed=%d cerr=%p\n", (void*)stream,
 				(unsigned)rs_len(dq), (dc != NULL ? (int)var_get_bool(dc) : -1), (void*)dc);
 		}
 	}
@@ -268,10 +281,8 @@ static var_t* rs_reader_read(vm_t* vm, var_t* env, void* data) {
 	if(rs_len(q) > 0) {
 		var_t* chunk = rs_shift(q);
 		var_t* rec = rs_result(vm, chunk, false);
-		if(chunk != NULL) var_unref(chunk);
-		var_t* p = rs_promise_settle(vm, "resolve", rec);
-		var_unref(rec);
-		return p;
+		if(chunk != NULL) var_unref(chunk);   /* rs_shift's owned ref; rec took its own */
+		return rs_promise_settle(vm, "resolve", rec);   /* NB: no var_unref(rec) */
 	}
 
 	if(get_obj(stream, RS_CLOSED) != NULL && var_get_bool(get_obj(stream, RS_CLOSED)))
@@ -292,26 +303,54 @@ static var_t* rs_reader_read(vm_t* vm, var_t* env, void* data) {
 			var_t* chunk = rs_shift(q);
 			var_t* rec = rs_result(vm, chunk, false);
 			if(chunk != NULL) var_unref(chunk);
-			var_t* p = rs_promise_settle(vm, "resolve", rec);
-			var_unref(rec);
-			return p;
+			return rs_promise_settle(vm, "resolve", rec);   /* NB: no var_unref(rec) */
 		}
 		if(get_obj(stream, RS_CLOSED) != NULL && var_get_bool(get_obj(stream, RS_CLOSED)))
 			return rs_promise_settle(vm, "resolve", rs_result(vm, NULL, true));
 	}
 
 	/* Still nothing: park a deferred read. */
-	rs_defer_t d;
-	var_t* p = rs_deferred(vm, &d);
-	if(p == NULL)
+	var_t* res = NULL; var_t* rej = NULL;
+	var_t* p = promise_new_deferred(vm, &res, &rej);
+	if(p == NULL) {
+		if(getenv("MARIO_RSDBG") != NULL)
+			fprintf(stderr, "[rsdbg] read BAIL deferred=NULL -> done=true\n");
 		return rs_promise_settle(vm, "resolve", rs_result(vm, NULL, true));
-	var_t* rec = var_new_obj(vm, NULL, NULL, NULL);
-	if(d.resolve) rs_hidden(rec, RS_RES, d.resolve); else rs_hidden(rec, RS_RES, var_new(vm));
-	if(d.reject) rs_hidden(rec, RS_REJ, d.reject); else rs_hidden(rec, RS_REJ, var_new(vm));
+	}
+	rs_park_t* pk = (rs_park_t*)mario_malloc(sizeof(rs_park_t));
+	if(pk == NULL) {
+		if(res != NULL) var_unref(res);
+		if(rej != NULL) var_unref(rej);
+		return rs_promise_settle(vm, "resolve", rs_result(vm, NULL, true));
+	}
+	pk->promise = var_ref(p);  /* keep the promise alive: the resolve/reject
+	                            * closures carry it as a bare data pointer, and
+	                            * the flight/pump caller drops the read() result
+	                            * right after .then(), so without this ref p is
+	                            * freed before a later enqueue settles it. */
+	pk->resolve = res;         /* adopts promise_new_deferred's references */
+	pk->reject  = rej;
+	var_t* rec = var_new_obj(vm, NULL, pk, rs_park_free);
+	/* Anchor the promise (and its two settle handles) as hidden members of rec so
+	 * they stay gc-reachable: rec lives in the stream's pending array, but pk is
+	 * an opaque C struct the GC cannot walk, and the resolve/reject closures only
+	 * point at the promise through a bare func->data pointer. Without this a gc
+	 * between park and settle could sweep the promise out from under pk. */
+	rs_hidden(rec, "@@rs_p", p);
+	rs_hidden(rec, "@@rs_res2", res);
+	rs_hidden(rec, "@@rs_rej2", rej);
 	var_t* pending = get_obj(stream, RS_PENDING);
 	if(pending == NULL) { pending = var_new_array(vm); rs_hidden(stream, RS_PENDING, pending); }
 	rs_push(pending, rec);
-	var_unref(rec);
+	if(getenv("MARIO_RSDBG") != NULL)
+		fprintf(stderr, "[rsdbg] park p=%p rec=%p pk=%p res=%p rej=%p pend=%p refs=%u\n",
+			(void*)p, (void*)rec, (void*)pk, (void*)pk->resolve, (void*)pk->reject,
+			(void*)pending, (unsigned)rec->refs);
+	/* NB: no var_unref(rec) here. rec is created at baseline refs=0 and the
+	 * pending array adopts the single reference (var_array_add -> node_new ->
+	 * var_ref). A trailing var_unref would drop the array's own ref to 0 and
+	 * free rec immediately, leaving a dangling node in `pending` (rs_park_free
+	 * ran before the later enqueue could settle the read -> flight stalled). */
 	return p;
 }
 
@@ -341,6 +380,8 @@ static var_t* rs_getReader(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* stream = get_obj(env, THIS);
 	var_t* reader = var_new_obj(vm, NULL, NULL, NULL);
+	if(getenv("MARIO_RSDBG") != NULL)
+		fprintf(stderr, "[rsdbg] getReader stream=%p reader=%p\n", (void*)stream, (void*)reader);
 	rs_hidden(reader, RS_STREAM, stream);
 	vm_reg_native_on(vm, reader, "read()", rs_reader_read, NULL);
 	vm_reg_native_on(vm, reader, "releaseLock()", rs_reader_releaseLock, NULL);
@@ -400,6 +441,12 @@ static var_t* rs_constructor(vm_t* vm, var_t* env, void* data) {
 	var_add(stream, "locked", var_new_bool(vm, false));
 
 	var_t* start = (src != NULL) ? get_obj(src, "start") : NULL;
+	if(getenv("MARIO_RSDBG") != NULL) {
+		var_t* pull = (src != NULL) ? get_obj(src, "pull") : NULL;
+		fprintf(stderr, "[rsdbg] ctor stream=%p src=%p start=%d pull=%d\n", (void*)stream,
+			(void*)src, (start != NULL && start->is_func) ? 1 : 0,
+			(pull != NULL && pull->is_func) ? 1 : 0);
+	}
 	if(start != NULL && start->is_func) {
 		var_t* a = var_new_array(vm);
 		var_array_add(a, ctl);

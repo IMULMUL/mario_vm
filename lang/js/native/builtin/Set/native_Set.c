@@ -177,16 +177,31 @@ var_t* native_Set_forEach(vm_t* vm, var_t* env, void* data) {
     set_data* sd = get_set(this_v);
     var_t* cb = get_obj(env, "callback");
     if (cb == NULL || cb->type == V_UNDEF) return NULL;
-    for (uint32_t i = 0; i < sd->size; ++i) {
+    /* Snapshot the items before iterating: the callback may delete entries, which
+     * shifts sd->items and shrinks sd->size (core-js Set.prototype.difference
+     * removes matching elements while iterating). Walking the live array would
+     * skip elements after a delete. Hold a ref on each so a delete's var_unref
+     * cannot drop the last reference, and defer GC across the loop so an item
+     * removed from the "@@keep" anchor is not swept while still snapshotted.
+     * Spec: entries deleted before being visited are not visited. */
+    uint32_t n = sd->size;
+    var_t** snap = (var_t**)mario_malloc(sizeof(var_t*) * (n ? n : 1));
+    for (uint32_t i = 0; i < n; ++i) snap[i] = var_ref(sd->items[i]);
+    vm->gc.gc_defer++;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (set_find(sd, snap[i]) < 0) continue; /* deleted during iteration */
         var_t* args = var_new_array(vm);
-        var_array_add(args, sd->items[i]);
-        var_array_add(args, sd->items[i]);
+        var_array_add(args, snap[i]);
+        var_array_add(args, snap[i]);
         var_array_add(args, this_v);
         var_array_reverse(args);
         var_t* res = call_m_func(vm, this_v, cb, args);
         var_unref(args);
         if (res != NULL) var_unref(res);
     }
+    vm->gc.gc_defer--;
+    for (uint32_t i = 0; i < n; ++i) var_unref(snap[i]);
+    mario_free(snap);
     return NULL;
 }
 

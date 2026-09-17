@@ -47,6 +47,10 @@ load extra native libs.
 
 void reg_all_natives(vm_t* vm);
 
+/* CLI-host task pump (bin/lib/host_task.c): provides js_dom_add_timer for the
+ * standalone build and drains queued Promise/microtask work after vm_run. */
+void host_task_drain(vm_t* vm);
+
 void init_args(vm_t* vm, int argc, char** argv) {
 	var_t* args = var_new_array(vm);
 	int i;
@@ -183,6 +187,7 @@ int main(int argc, char** argv) {
 				}
 				else  {
 					vm_run(vm);
+					host_task_drain(vm);
 				}
 			}
 		}

@@ -429,8 +429,23 @@ var_t* native_TypedArray_fill(vm_t* vm, var_t* env, void* data) {
 	int64_t start = ta_clamp_rel(var_get_int64(get_obj(env, "start")), len);
 	var_t* endv = get_obj(env, "end");
 	int64_t end = ta_clamp_rel((endv != NULL && endv->type != V_UNDEF) ? var_get_int64(endv) : len, len);
+	/* Spec: ToNumber(value) happens ONCE, before the element loop. Passing `val`
+	 * straight to set_at converted (and thus invoked an object's valueOf) once per
+	 * slot; core-js's CONVERSION_BUG detection fills an Int8Array(2) with
+	 * {valueOf:()=>count++} and requires count===1, so a per-element conversion
+	 * (count===2) made it force-install a broken polyfill. BigInt views keep the
+	 * raw value: set_at reads the bigint directly and ToNumber would lose it. */
+	int et = ta_etype(ta);
+	var_t* fillval = val;
+	bool made_num = false;
+	if(et != TA_BIGINT64 && et != TA_BIGUINT64) {
+		fillval = var_ref(var_new_float64(vm, vm_to_number(vm, val)));
+		made_num = true;
+	}
 	for(int64_t i = start; i < end; i++)
-		var_typedarray_set_at(vm, ta, i, val);
+		var_typedarray_set_at(vm, ta, i, fillval);
+	if(made_num)
+		var_unref(fillval);
 	return ta;
 }
 
@@ -876,27 +891,50 @@ var_t* native_TypedArray_localeCompare(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
-/* values()/keys()/entries() return snapshot arrays (mirrors native_Array_*). */
+/* values()/keys()/entries() return REAL iterators (next present, @@iterator
+ * returns self) over a snapshot, exactly like native_Array_*. Each guards its
+ * receiver with the spec aTypedArray semantics: invoking on a non-TypedArray
+ * throws TypeError. core-js's %TypedArray% iterator module computes
+ *   GENERIC = !fails(() => Uint8Array.prototype[Symbol.iterator].call([1]))
+ * and force-installs a polyfill (deleting the concrete native, see
+ * exportTypedArrayMethod) whenever GENERIC is true OR @@iterator !== values OR
+ * values.name !== 'values'. That polyfill reads core-js internal state absent on
+ * mario's native typed arrays, yielding empty iteration and a no-op fill. So the
+ * native MUST throw on a plain-array receiver (making GENERIC false) and
+ * @@iterator MUST be the same object as values (see reg_ta_proto). */
 var_t* native_TypedArray_values(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	return ta_to_array(vm, get_obj(env, THIS));
+	var_t* ta = get_obj(env, THIS);
+	if(!var_is_typedarray(ta)) {
+		vm_throw_type_native(vm, "TypeError", "TypedArray.prototype.values called on incompatible receiver");
+		return var_new(vm);
+	}
+	return vm_new_array_iterator(vm, ta_to_array(vm, ta));
 }
 
 var_t* native_TypedArray_keys(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* ta = get_obj(env, THIS);
+	if(!var_is_typedarray(ta)) {
+		vm_throw_type_native(vm, "TypeError", "TypedArray.prototype.keys called on incompatible receiver");
+		return var_new(vm);
+	}
 	int64_t len = ta_length(ta);
 	var_t* arr = var_new_array(vm);
 	vm->gc.gc_defer++;   // `arr` is refs=0 while we allocate the index vars
 	for(int64_t i = 0; i < len; i++)
 		var_array_add(arr, var_new_int64(vm, i));
 	vm->gc.gc_defer--;
-	return arr;
+	return vm_new_array_iterator(vm, arr);
 }
 
 var_t* native_TypedArray_entries(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* ta = get_obj(env, THIS);
+	if(!var_is_typedarray(ta)) {
+		vm_throw_type_native(vm, "TypeError", "TypedArray.prototype.entries called on incompatible receiver");
+		return var_new(vm);
+	}
 	int64_t len = ta_length(ta);
 	var_t* arr = var_new_array(vm);
 	vm->gc.gc_defer++;
@@ -908,7 +946,7 @@ var_t* native_TypedArray_entries(vm_t* vm, var_t* env, void* data) {
 		var_array_add(arr, pair);
 	}
 	vm->gc.gc_defer--;
-	return arr;
+	return vm_new_array_iterator(vm, arr);
 }
 
 /* @@iterator: an array iterator over a snapshot, so `for..of ta`, spread and
@@ -919,34 +957,55 @@ var_t* native_TypedArray_iterator(vm_t* vm, var_t* env, void* data) {
 	return vm_new_array_iterator(vm, snap); // iterator refs the snapshot
 }
 
-static void reg_ta_proto(vm_t* vm, var_t* cls) {
-	vm_reg_native(vm, cls, "subarray(begin, end)", native_TypedArray_subarray, NULL);
-	vm_reg_native(vm, cls, "slice(begin, end)", native_TypedArray_slice, NULL);
-	vm_reg_native(vm, cls, "set(source, offset)", native_TypedArray_set, NULL);
-	vm_reg_native(vm, cls, "fill(value, start, end)", native_TypedArray_fill, NULL);
-	vm_reg_native(vm, cls, "reverse()", native_TypedArray_reverse, NULL);
-	vm_reg_native(vm, cls, "copyWithin(target, start, end)", native_TypedArray_copyWithin, NULL);
-	vm_reg_native(vm, cls, "sort(compareFn)", native_TypedArray_sort, NULL);
-	vm_reg_native(vm, cls, "indexOf(search, fromIndex)", native_TypedArray_indexOf, NULL);
-	vm_reg_native(vm, cls, "lastIndexOf(search, fromIndex)", native_TypedArray_lastIndexOf, NULL);
-	vm_reg_native(vm, cls, "includes(search, fromIndex)", native_TypedArray_includes, NULL);
-	vm_reg_native(vm, cls, "find(cb, thisArg)", native_TypedArray_find, NULL);
-	vm_reg_native(vm, cls, "findIndex(cb, thisArg)", native_TypedArray_findIndex, NULL);
-	vm_reg_native(vm, cls, "every(cb, thisArg)", native_TypedArray_every, NULL);
-	vm_reg_native(vm, cls, "some(cb, thisArg)", native_TypedArray_some, NULL);
-	vm_reg_native(vm, cls, "forEach(cb, thisArg)", native_TypedArray_forEach, NULL);
-	vm_reg_native(vm, cls, "map(cb, thisArg)", native_TypedArray_map, NULL);
-	vm_reg_native(vm, cls, "filter(cb, thisArg)", native_TypedArray_filter, NULL);
-	vm_reg_native(vm, cls, "reduce(cb, init)", native_TypedArray_reduce, NULL);
-	vm_reg_native(vm, cls, "reduceRight(cb, init)", native_TypedArray_reduceRight, NULL);
-	vm_reg_native(vm, cls, "at(index)", native_TypedArray_at, NULL);
-	vm_reg_native(vm, cls, "join(sep)", native_TypedArray_join, NULL);
-	vm_reg_native(vm, cls, "toString()", native_TypedArray_toString, NULL);
-	vm_reg_native(vm, cls, "localeCompare(other)", native_TypedArray_localeCompare, NULL);
-	vm_reg_native(vm, cls, "values()", native_TypedArray_values, NULL);
-	vm_reg_native(vm, cls, "keys()", native_TypedArray_keys, NULL);
-	vm_reg_native(vm, cls, "entries()", native_TypedArray_entries, NULL);
-	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_TypedArray_iterator, NULL);
+/* Register the shared %TypedArray%.prototype method surface ONCE on the abstract
+ * prototype `ta_proto` (the ECMA-262 layout: one %TypedArray%.prototype sits
+ * between every concrete Int32Array.prototype and Object.prototype, and holds all
+ * the instance methods). core-js derives TypedArrayPrototype as
+ * getPrototypeOf(Int8Array.prototype) == ta_proto, and its exportTypedArrayMethod
+ * installs a polyfill whenever ta_proto lacks the method (`!TypedArrayPrototype[KEY]`)
+ * or its detection forces it. Registering on the concrete prototypes instead left
+ * ta_proto bare, so core-js always deleted the concrete native and installed a
+ * polyfill that reads core-js internal state absent on mario's typed arrays
+ * (empty iteration, no-op fill). */
+static void reg_ta_proto(vm_t* vm, var_t* ta_proto) {
+	vm_reg_native_on(vm, ta_proto, "subarray(begin, end)", native_TypedArray_subarray, NULL);
+	vm_reg_native_on(vm, ta_proto, "slice(begin, end)", native_TypedArray_slice, NULL);
+	vm_reg_native_on(vm, ta_proto, "set(source, offset)", native_TypedArray_set, NULL);
+	vm_reg_native_on(vm, ta_proto, "fill(value, start, end)", native_TypedArray_fill, NULL);
+	vm_reg_native_on(vm, ta_proto, "reverse()", native_TypedArray_reverse, NULL);
+	vm_reg_native_on(vm, ta_proto, "copyWithin(target, start, end)", native_TypedArray_copyWithin, NULL);
+	vm_reg_native_on(vm, ta_proto, "sort(compareFn)", native_TypedArray_sort, NULL);
+	vm_reg_native_on(vm, ta_proto, "indexOf(search, fromIndex)", native_TypedArray_indexOf, NULL);
+	vm_reg_native_on(vm, ta_proto, "lastIndexOf(search, fromIndex)", native_TypedArray_lastIndexOf, NULL);
+	vm_reg_native_on(vm, ta_proto, "includes(search, fromIndex)", native_TypedArray_includes, NULL);
+	vm_reg_native_on(vm, ta_proto, "find(cb, thisArg)", native_TypedArray_find, NULL);
+	vm_reg_native_on(vm, ta_proto, "findIndex(cb, thisArg)", native_TypedArray_findIndex, NULL);
+	vm_reg_native_on(vm, ta_proto, "every(cb, thisArg)", native_TypedArray_every, NULL);
+	vm_reg_native_on(vm, ta_proto, "some(cb, thisArg)", native_TypedArray_some, NULL);
+	vm_reg_native_on(vm, ta_proto, "forEach(cb, thisArg)", native_TypedArray_forEach, NULL);
+	vm_reg_native_on(vm, ta_proto, "map(cb, thisArg)", native_TypedArray_map, NULL);
+	vm_reg_native_on(vm, ta_proto, "filter(cb, thisArg)", native_TypedArray_filter, NULL);
+	vm_reg_native_on(vm, ta_proto, "reduce(cb, init)", native_TypedArray_reduce, NULL);
+	vm_reg_native_on(vm, ta_proto, "reduceRight(cb, init)", native_TypedArray_reduceRight, NULL);
+	vm_reg_native_on(vm, ta_proto, "at(index)", native_TypedArray_at, NULL);
+	vm_reg_native_on(vm, ta_proto, "join(sep)", native_TypedArray_join, NULL);
+	vm_reg_native_on(vm, ta_proto, "toString()", native_TypedArray_toString, NULL);
+	vm_reg_native_on(vm, ta_proto, "localeCompare(other)", native_TypedArray_localeCompare, NULL);
+	node_t* values_n = vm_reg_native_on(vm, ta_proto, "values()", native_TypedArray_values, NULL);
+	vm_reg_native_on(vm, ta_proto, "keys()", native_TypedArray_keys, NULL);
+	vm_reg_native_on(vm, ta_proto, "entries()", native_TypedArray_entries, NULL);
+	/* Per ECMA-262, %TypedArray%.prototype[Symbol.iterator] IS the same function
+	 * object as %TypedArray%.prototype.values (its .name is "values"), not a
+	 * distinct native. core-js's ITERATOR_IS_VALUES detection compares the two by
+	 * identity (and checks values.name === 'values'); a mismatch force-installs a
+	 * broken polyfill. Alias the symbol key to the values var so both resolve to
+	 * one object. */
+	if(values_n != NULL && values_n->var != NULL) {
+		/* var_add takes a raw member key, so use SYMKEY_ITERATOR without the "()"
+		 * decl suffix that vm_reg_native's parser would strip. */
+		node_t* it_n = var_add(ta_proto, SYMKEY_ITERATOR, values_n->var);
+		if(it_n != NULL) it_n->be_unenumerable = true;
+	}
 }
 
 /* Build a fresh TypedArray of element type `et` over a NEW ArrayBuffer holding a
@@ -982,6 +1041,10 @@ void reg_native_TypedArray(vm_t* vm) {
 	 * recursion that aborts the whole polyfill. ta_proto starts at refs 0 and is
 	 * adopted/ref'd by each var_set_prototype below, so it stays alive. */
 	var_t* ta_proto = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
+	/* The shared instance-method surface lives on ta_proto itself (spec layout),
+	 * registered once, so core-js's TypedArrayPrototype (= ta_proto) already owns
+	 * every method and its exportTypedArrayMethod leaves the natives untouched. */
+	reg_ta_proto(vm, ta_proto);
 
 	for(int et = 0; et < TA_ETYPE_COUNT; et++) {
 		const char* name = ta_types[et].name;
@@ -993,10 +1056,10 @@ void reg_native_TypedArray(vm_t* vm) {
 		 * (via the constructor's [[Prototype]]) and `ta.BYTES_PER_ELEMENT` resolve. */
 		vm_reg_var(vm, cls, "BYTES_PER_ELEMENT", var_new_int(vm, (int)ta_sizes[et]), true);
 		vm_reg_var(vm, cls, SYMKEY_TOSTRINGTAG, var_new_str(vm, name), true);
-		reg_ta_proto(vm, cls);
-		/* Re-parent this concrete prototype onto the shared %TypedArray%.prototype.
-		 * The concrete method surface stays on cls.prototype (closer in the chain),
-		 * so instance behaviour is unchanged; only the abstract parent differs. */
+		/* Re-parent this concrete prototype onto the shared %TypedArray%.prototype,
+		 * which now carries the whole method surface (values/fill/sort/...). The
+		 * concrete prototype keeps only its per-type constructor, BYTES_PER_ELEMENT
+		 * and @@toStringTag. */
 		var_t* cls_proto = var_get_prototype(cls);
 		if(cls_proto != NULL && ta_proto != NULL)
 			var_set_prototype(cls_proto, ta_proto);
