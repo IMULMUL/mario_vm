@@ -408,11 +408,24 @@ var_t* native_Array_pop(vm_t* vm, var_t* env, void* data) {
 	uint32_t sz = var_array_size(arr);
 	if(sz == 0)
 		return NULL;
-	
+
 	node_t* n = var_array_remove(arr, sz-1);
+	if(n == NULL)
+		return NULL;
+	/* Hold a guard ref across node_free (which unrefs the element the detached
+	 * node owned), then drop the guard the same way native_Array_shift does -
+	 * a raw refs-- so the element survives at refs==0 for the caller to root.
+	 * Calling var_unref(ret) here instead drove refs to 0 and freed the element
+	 * outright (var_unref frees at 0), so pop() returned a dangling var that read
+	 * back as undefined. That silently corrupted every consumer relying on the
+	 * popped value - notably React 18's scheduler binary heap, whose pop() does
+	 * `last = heap.pop(); if(last !== first) heap[0] = last;` and so wrote an
+	 * undefined ghost over the next task, losing the queued passive-effect flush
+	 * (useEffect never ran at mount). */
 	ret = var_ref(n->var);
 	node_free(n);
-	var_unref(ret);
+	if(ret != NULL && ret->refs > 0)
+		ret->refs--; /* drop our guard ref; caller roots the return value */
 	return ret;
 }
 
@@ -452,10 +465,15 @@ var_t* native_Array_shift(vm_t* vm, var_t* env, void* data) {
 var_t* native_Array_slice(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* arr = get_obj(env, THIS);
-	uint32_t sz = var_array_size(arr);
+	int32_t sz = (int32_t)var_array_size(arr);
 	int32_t start = get_int(env, "start");
 	if(start < 0) 
 		start = sz + start;
+	/* Clamp start into [0, sz] (ES2022 22.1.3.25): a start past the length
+	 * yields an empty slice, and a negative start that underflows clamps to 0
+	 * (also keeps the unsigned loop counter below from wrapping huge). */
+	if(start < 0) start = 0;
+	if(start > sz) start = sz;
 
 	int32_t end;
 	var_t* end_var= get_obj(env, "end");
@@ -464,11 +482,18 @@ var_t* native_Array_slice(vm_t* vm, var_t* env, void* data) {
 	else 
 		end = var_get_int(end_var);
 	if(end < 0) end = sz + end;
+	/* Clamp end into [0, sz]. Without this, slice(0, N) with N > length walks
+	 * past the last element; var_array_get() materializes each out-of-range
+	 * slot as an undefined node, so the loop appended undefined placeholders
+	 * and [].slice(0,5) wrongly returned five holes instead of an empty array
+	 * (this broke app code doing state.slice(0,5).map(...) on an empty list). */
+	if(end < 0) end = 0;
+	if(end > sz) end = sz;
 
-	uint32_t i;
+	int32_t i;
 	var_t* ret = var_new_array(vm);
 	for(i=start; i<end; ++i) {
-		node_t* n = var_array_get(arr, i);
+		node_t* n = var_array_get(arr, (uint32_t)i);
 		if(n != NULL) {
 			var_array_add(ret, n->var);
 		}
