@@ -160,6 +160,7 @@ typedef struct st_bytecode {
 	m_array_t           mstr_table;
 	PC                 *code_buf;
 	uint32_t            buf_size;
+	PC                  jmptgt_marked; /* code_buf[0..jmptgt_marked) scanned for jump targets */
 } bytecode_t;
 
 /*
@@ -173,6 +174,16 @@ typedef struct st_bytecode {
 
 #define ILLEGAL_PC 0xFFFFFFFF
 #define INSTR_OPT_CACHE	 0x80000000
+/* Set on an instruction word that some jump lands ON. The runtime `X; POP`
+ * elision (handle_asign / vm_step_op) overwrites the POP slot with NIL and then
+ * skips it, which is only sound when that POP is reached by fall-through from
+ * X. A jump target must keep executing it - e.g. the comma operator's
+ * short-circuit target is exactly the POP after `(n = {})` in
+ * `for (let r of (void 0===n && (n={}), Object.values(t[1])))`; erasing it left
+ * the SCAND's LHS on the stack, so the next ASIGN picked a garbage target node
+ * and the assignment vanished. bc_mark_jump_targets() fills these flags, and
+ * OP()/OFF() ignore the bit. */
+#define INSTR_OPT_JMPTGT 0x40000000
 #define OFF_MASK 0x0FFFFF
 #define INS(ins, off) (((((int32_t)ins) << 20) & 0xFFF00000) | ((off) & OFF_MASK))
 #define OP(ins) (((ins) >>20) & 0xFF)
@@ -351,6 +362,11 @@ typedef struct st_bytecode {
 #define FIN_RETURN    1
 #define FIN_BREAK     2
 #define FIN_CONTINUE  3
+/* A `throw` leaving a try that has a `finally`: the propagating error is parked
+ * in pending_value while the finally body runs; handle_finally_end then re-arms
+ * propagation (abort_run) so the error keeps unwinding outward. Nested finallys
+ * thus run inner-to-outer, exactly like the return/break/continue cases. */
+#define FIN_THROW     4
 
 
 PC          bc_gen(bytecode_t* bc, opr_code_t instr);
@@ -367,6 +383,7 @@ PC          bc_reserve(bytecode_t* bc);
 
 void        bc_init(bytecode_t* bc);
 void        bc_release(bytecode_t* bc);
+void        bc_mark_jump_targets(bytecode_t* bc);
 
 
 /**====== mario_vm ======*/
@@ -696,6 +713,20 @@ typedef struct st_scope {
  * tripping the cap means a corrupted chain - stop the walk instead of hanging. */
 #define VM_CLOSURE_CHAIN_MAX  4096
 
+/* One node per active vm_run frame, saving that frame's inherited deferred-
+ * `finally` transfer so a nested call cannot see or clobber it. The nodes are
+ * stack-allocated inside vm_run and chained LIFO exactly like the C frames, so
+ * the list head (vm->pending_saves) is always valid. gc_vars walks it to keep a
+ * saved pending_value reachable while an inner frame runs (a sweep frees any
+ * unmarked var regardless of refcount, so the C field alone is not enough). */
+typedef struct st_pending_save {
+	var_t*              value;
+	const char*         label;
+	PC                  pc;
+	int                 op;
+	struct st_pending_save* prev;
+} pending_save_t;
+
 typedef struct st_vm {
 	bytecode_t          bc;
 	compiler_func_t     compiler;
@@ -747,8 +778,17 @@ typedef struct st_vm {
 	 * INSTR_RETURN dispatch would have. */
 	var_t*              pending_value;
 	PC                  pending_pc;
+	/* Label operand of a parked break/continue (points into the bytecode string
+	 * table, stable for the whole run); NULL/"" when unlabeled. Needed so
+	 * handle_finally_end can resume vm_do_break/vm_do_continue toward the same
+	 * target after the finally body runs. */
+	const char*         pending_label;
 	int                 pending_op;
 	bool                fin_ret_done;
+	/* Head of the per-vm_run-frame save list (see pending_save_t). Each vm_run
+	 * pushes the inherited transfer here and starts clean, so a callee invoked
+	 * inside a finally body cannot wipe the parked break/continue/return. */
+	pending_save_t*     pending_saves;
 	/* An exception raised inside a native function (vm_throw_native): func_call
 	 * delivers it to the nearest try scope after the native returns, keeping the
 	 * value stack balanced (env pop / ret push protocol). */
@@ -828,6 +868,16 @@ typedef struct st_vm {
 		var_t*          gc_vars;
 		var_t*          gc_vars_tail;
 		uint32_t        gc_vars_num;
+		/* C-side roots: vars a running native holds only in C locals. The collector
+		 * walks the var graph, the value stack, the scope stack and the caches - it
+		 * can NOT see the C stack - so such a var looks unreachable and gets swept in
+		 * the middle of the very call holding it (a gc() fired from inside a promise
+		 * drain's own callback freed the drain's detached reaction lists, and the
+		 * trailing var_unref then read freed memory). Natives park those vars here;
+		 * vm_pop_c_roots() releases them when the C frame is done with them. */
+		var_t**         c_roots;
+		int32_t         c_roots_top;
+		int32_t         c_roots_cap;
 	} gc;
 
 	/* Phase 6: weak references & finalization. Cells live in these C-side lists,
@@ -1074,6 +1124,12 @@ void        vm_weak_add_finalizer(vm_t* vm, var_t* registry, var_t* target, var_
 bool        vm_weak_unregister(vm_t* vm, var_t* registry, var_t* token);
 void        vm_weak_remove_registry(vm_t* vm, var_t* registry);
 void        vm_gc_collect(vm_t* vm); // forced full gc + drain pending finalizers (backs the hidden gc() global)
+/* Park a var that is reachable only from a C local so the collector marks it, and
+ * drop the last `n` parked entries again. Nesting is a plain LIFO stack, so a
+ * native that runs arbitrary JS between the two calls (a promise drain, a
+ * finalizer, an event dispatch) keeps its bare pointers valid across any gc. */
+void        vm_push_c_root(vm_t* vm, var_t* v);
+void        vm_pop_c_roots(vm_t* vm, int32_t n);
 
 var_t*      get_obj(var_t* obj, const char* name);
 void*       get_raw(var_t* obj, const char* name);

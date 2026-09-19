@@ -9,7 +9,6 @@
 #include "Array/native_Array.h"
 #include "String/native_String.h"
 #include "Promise/native_Promise.h"
-#include "Console/native_Console.h"
 #include "Error/native_Error.h"
 #include "Map/native_Map.h"
 #include "Set/native_Set.h"
@@ -21,8 +20,9 @@
 #include "SharedArrayBuffer/native_SharedArrayBuffer.h"
 #include "Atomics/native_Atomics.h"
 #include "RegExp/native_RegExp.h"
-#include "TextEncoder/native_TextEncoder.h"
-#include "Stream/native_Stream.h"
+#include "Math/native_Math.h"
+#include "Date/native_Date.h"
+#include "JSON/native_JSON.h"
 
 #ifdef __cplusplus /* __cplusplus */
 extern "C" {
@@ -34,7 +34,6 @@ void reg_builtin_natives(vm_t* vm) {
 	reg_native_Error(vm);
 	reg_native_Array(vm);
 	reg_native_String(vm);
-	reg_native_Console(vm);
 	reg_native_Number(vm);
 	reg_native_BigInt(vm);
 	reg_native_ArrayBuffer(vm);
@@ -51,8 +50,9 @@ void reg_builtin_natives(vm_t* vm) {
 	reg_native_SharedArrayBuffer(vm);
 	reg_native_Atomics(vm);
 	reg_native_RegExp(vm);
-	reg_native_TextEncoder(vm);
-	reg_native_Stream(vm);
+	reg_native_Math(vm);
+	reg_native_Date(vm);
+	reg_native_JSON(vm);
 }
 
 #ifdef __cplusplus /* __cplusplus */

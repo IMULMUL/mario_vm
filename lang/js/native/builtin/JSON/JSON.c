@@ -205,7 +205,14 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 	}
 	else if (l->tk=='{') {
 		lex_json_chkread(l, '{');
-		var_t* obj = var_new_obj_no_proto(vm, NULL, NULL);
+		/* A parsed object is an ordinary JS object: it MUST carry Object.prototype,
+		 * exactly like an object literal (handle_obj / INSTR_OBJ). Building it with
+		 * var_new_obj_no_proto left the [[Prototype]] NULL, so every JSON.parse
+		 * result lacked hasOwnProperty/valueOf/toString. React Flight parses each
+		 * row model with JSON.parse(text, reviver), so all server-component props
+		 * objects reached react-dom without a prototype chain and
+		 * `props.hasOwnProperty(name)` threw "can not find function". */
+		var_t* obj = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
 		while(l->tk != '}') {
 			mstr_t* id = mstr_new(l->tk_str->cstr);
 			if(l->tk == LEX_STR) {

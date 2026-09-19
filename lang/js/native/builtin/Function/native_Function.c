@@ -135,6 +135,25 @@ var_t* native_Function_bind(vm_t* vm, var_t* env, void* data) {
 	node_t* an = var_add(bound, BIND_ARGS, preArgs);
 	an->invisable = 1; an->be_unenumerable = 1;
 
+	/* Spec: a bound function's `length` is max(0, target.length - prependedArgs).
+	 * mario resolves fn.length from func->args.size (mario.c handle_member), which
+	 * is 0 for the native trampoline, so pin an own hidden "length" member instead.
+	 * Read the target's length the same way the VM would: an own "length" member
+	 * wins (so re-binding an already-bound function sees its adjusted length), else
+	 * the target's declared arg count. */
+	int target_len = 0;
+	var_t* tlv = var_find_own_member_var(target, "length");
+	if(tlv != NULL && (tlv->type == V_INT || tlv->type == V_INT64 || tlv->type == V_FLOAT)) {
+		target_len = var_get_int(tlv);
+	} else {
+		func_t* tf = var_get_func(target);
+		target_len = (tf != NULL) ? (int)tf->args.size : 0;
+	}
+	int blen = target_len - (int)var_array_size(preArgs);
+	if(blen < 0) blen = 0;
+	node_t* ln = var_add(bound, "length", var_new_int(vm, blen));
+	ln->invisable = 1; ln->be_unenumerable = 1;
+
 	return bound;   // refs==0 baseline; func_call adopts it
 }
 

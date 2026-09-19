@@ -4068,9 +4068,23 @@ bool stmt_while(lex_t* l, bytecode_t* bc) {
 
     bc_add_instr(bc, pc_break, INSTR_NJMPB, ILLEGAL_PC); //not jump back to break anchor;
 
+    /* ES6: a loop body is a block statement, so every iteration gets a FRESH
+     * scope. Without it a body-level `let x` lives in the loop scope for the whole
+     * loop: iteration 2 collides with iteration 1's binding, and since handle_const
+     * keeps the existing binding instead of throwing, the body silently reuses the
+     * previous round's value where real JS would see a fresh `undefined` - enough to
+     * hang a work loop that breaks on an uninitialized flag (React's commit loop).
+     * The block is pushed only when the condition passed, so every exit path is
+     * balanced: fall-through runs the BLOCK_END below, `break`/`continue` pop scopes
+     * down to the loop scope (vm_do_break/vm_do_continue), and the back edge plus the
+     * condition-false NJMPB rebalance through vm_pop_scopes_to_loop. */
+    bc_gen(bc, INSTR_BLOCK);
+
     if (!stmt_loop_block(l, bc)) {
         return false;
     }
+
+    bc_gen(bc, INSTR_BLOCK_END);
 
     bc_add_instr(bc, pc_condition, INSTR_JMPB, ILLEGAL_PC); //coninue anchor;
     pc = bc_gen(bc, INSTR_LOOP_END);
@@ -4101,10 +4115,15 @@ bool stmt_do(lex_t* l, bytecode_t* bc) {
     PC pc_break = bc_reserve(bc);    // P+3: break anchor (sc->pc)
 
     lex_skip_empty(l);
+    /* Per-iteration body scope, exactly like stmt_while. body_start must stay the
+     * BLOCK slot: the condition-true back edge jumps here, and handle_jmpb pops any
+     * scope left open above the loop before landing. */
     PC body_start = bc->cindex;
+    bc_gen(bc, INSTR_BLOCK);
     if (!stmt_loop_block(l, bc)) {
         return false;
     }
+    bc_gen(bc, INSTR_BLOCK_END);
 
     lex_skip_empty(l);
     if (!lex_chkread(l, LEX_R_WHILE)) {
@@ -4211,10 +4230,17 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
         bc_gen(bc, INSTR_POP);
     }
     
+    /* Per-iteration body scope (see stmt_while). The increment below doubles as the
+     * `continue` anchor and stays OUTSIDE the block; vm_do_continue pops the
+     * iteration scope before jumping there, so the index still advances. */
+    bc_gen(bc, INSTR_BLOCK);
+
     // Loop body
     if (!stmt_loop_block(l, bc)) {
         return false;
     }
+
+    bc_gen(bc, INSTR_BLOCK_END);
     
     // Increment index  (also the `continue` target, so the index always advances)
     PC incr_pc = bc->cindex;
@@ -4644,6 +4670,11 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
         bc_gen(bc, INSTR_ASIGN);
         bc_gen(bc, INSTR_POP);
     }
+    else {
+        /* No loop-variable block was opened above, but the body still needs its own
+         * per-iteration scope for body-level let/const (see stmt_while). */
+        bc_gen(bc, INSTR_BLOCK);
+    }
 
     // Loop body
     if (!stmt_loop_block(l, bc)) {
@@ -4670,6 +4701,9 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             bc_gen(bc, INSTR_ASIGN);
             bc_gen(bc, INSTR_POP);
         }
+    }
+    else {
+        bc_gen(bc, INSTR_BLOCK_END);
     }
 
     bc_add_instr(bc, pci, INSTR_JMPB, ILLEGAL_PC); //jump to iterator anchor;

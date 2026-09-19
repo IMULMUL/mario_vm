@@ -1,6 +1,8 @@
 #include "js.h"
 #include "mbc.h"
+#include "host_task.h"
 #include "bcdump/bcdump.h"
+#include "Process/native_Process.h"
 
 #include <unistd.h>
 #include <stdlib.h>
@@ -47,10 +49,6 @@ load extra native libs.
 
 void reg_all_natives(vm_t* vm);
 
-/* CLI-host task pump (bin/lib/host_task.c): provides js_dom_add_timer for the
- * standalone build and drains queued Promise/microtask work after vm_run. */
-void host_task_drain(vm_t* vm);
-
 void init_args(vm_t* vm, int argc, char** argv) {
 	var_t* args = var_new_array(vm);
 	int i;
@@ -59,6 +57,7 @@ void init_args(vm_t* vm, int argc, char** argv) {
 		var_array_add(args, v);
 	}
 	var_add(vm->root, "_args", args);
+	native_Process_set_argv(vm);
 }
 
 enum {
@@ -126,6 +125,7 @@ int main(int argc, char** argv) {
 		return -1;
 	}
 	vm_init(vm, reg_all_natives, NULL);
+	host_task_register(vm);
 
 	init_args(vm, argc, argv);
 	
@@ -144,8 +144,18 @@ int main(int argc, char** argv) {
 	        fclose(f);
 	        if(!js_compile(&vm->bc, buf)) { printf("compile failed\n"); free(buf); return -1; }
 	        free(buf);
-	        mstr_t* dump = bc_dump(&vm->bc);
-	        if(dump != NULL) { _platform_out(dump->cstr); mstr_free(dump); }
+	        /* MARIO_DUMPFILE streams the dump to a file: bc_dump()'s single mstr_t
+	         * caps at 64KB and corrupts multi-MB disassembly of big bundles. */
+	        const char* dfn = getenv("MARIO_DUMPFILE");
+	        if(dfn != NULL) {
+	                FILE* df = fopen(dfn, "wb");
+	                if(df == NULL) { printf("cannot write %s\n", dfn); return -1; }
+	                bc_dump_file(&vm->bc, df);
+	                fclose(df);
+	        } else {
+	                mstr_t* dump = bc_dump(&vm->bc);
+	                if(dump != NULL) { _platform_out(dump->cstr); mstr_free(dump); }
+	        }
 	        vm_close(vm);
 	        mario_mem_quit();
 	        return 0;

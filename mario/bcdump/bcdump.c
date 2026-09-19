@@ -238,19 +238,48 @@ void bc_dump_window(bytecode_t* bc, PC center, PC radius) {
 	mstr_free(s);
 }
 
+/* Streaming variant of bc_dump: writes each line straight to `f`. bc_dump()
+ * accumulates everything in one mstr_t, whose max/len are 16-bit bit-fields -
+ * a big bundle's disassembly (multi-MB) silently wrapped and corrupted the
+ * whole output. One mstr per line keeps every intermediate far below 64KB
+ * (only a single >64KB string-table entry can truncate, and only its own
+ * line). */
+void bc_dump_file(bytecode_t* bc, FILE* f) {
+	if(bc == NULL || f == NULL)
+		return;
+	PC i;
+	PC sz = bc->mstr_table.size;
+	fprintf(f, "mstr_index| value\n---------------------------------------\n");
+	for(i = 0; i < sz; ++i)
+		fprintf(f, "0x%06X | %s\n", (unsigned)i, (const char*)bc->mstr_table.items[i]);
+	fprintf(f, "\npc_index | opr_code   ; instruction\n---------------------------------------\n");
+	mstr_t* s = mstr_new("");
+	i = 0;
+	while(i < bc->cindex) {
+		i = bc_get_inmstr_str(bc, i, s);
+		fprintf(f, "%s\n", s->cstr);
+		i++;
+	}
+	mstr_free(s);
+	fprintf(f, "---------------------------------------\n");
+	fflush(f);
+}
+
 mstr_t* bc_dump(bytecode_t* bc) {
 	mstr_t* ret = mstr_new("");
     if(ret == NULL)
         return NULL;
 
 	PC i;
-	char index[32];
+	char index[64];   /* big bundles carry source-text strings: the formatted
+	                   * index plus a multi-100KB table entry must not overrun
+	                   * a 32-byte scratch (it corrupted whole dumps). */
 	PC sz = bc->mstr_table.size;
 
 	mstr_append(ret, "mstr_index| value\n");
 	mstr_append(ret, "---------------------------------------\n");
 	for(i=0; i<sz; ++i) {
-		sprintf(index, "0x%06X | ", i);
+		snprintf(index, sizeof(index), "0x%06X | ", (unsigned)i);
 		mstr_append(ret, index);
 		mstr_append(ret, (const char*)bc->mstr_table.items[i]);
 		mstr_append(ret, "\n");

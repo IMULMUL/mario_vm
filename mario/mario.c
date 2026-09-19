@@ -104,6 +104,10 @@ void hash_map_init(hash_map_t* map) {
 
 // Add a key-value pair to the hash map
 void hash_map_add(hash_map_t* map, const char* key, void* value) {
+    // A cleaned map has no bucket array; re-initialize so the insert below is valid.
+    if (map->buckets == NULL || map->capacity == 0) {
+        hash_map_init(map);
+    }
     // Check if we need to resize
     if (map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
         // Resize the hash map
@@ -158,6 +162,7 @@ void hash_map_add(hash_map_t* map, const char* key, void* value) {
 
 // Get a value from the hash map
 void* hash_map_get(hash_map_t* map, const char* key) {
+    if (map->buckets == NULL || map->capacity == 0) return NULL;
     uint32_t hash = hash_string(key) % map->capacity;
     hash_entry_t* entry = map->buckets[hash];
     while (entry) {
@@ -171,6 +176,7 @@ void* hash_map_get(hash_map_t* map, const char* key) {
 
 // Remove a key-value pair from the hash map
 void* hash_map_remove(hash_map_t* map, const char* key) {
+    if (map->buckets == NULL || map->capacity == 0) return NULL;
     uint32_t hash = hash_string(key) % map->capacity;
     hash_entry_t* entry = map->buckets[hash];
     hash_entry_t* prev = NULL;
@@ -227,6 +233,10 @@ void hash_map_clean(hash_map_t* map, free_func_t free_key, free_func_t free_valu
 	mario_free(map->buckets);
 	map->buckets = NULL;
     map->size = 0;
+    /* capacity must drop with buckets: get/remove/add modulo by capacity and
+     * index buckets, so a stale non-zero capacity over a NULL bucket array
+     * faults on the next access (var_remove_all then var_add). */
+    map->capacity = 0;
 }
 
 // Free the hash map
@@ -1437,11 +1447,13 @@ void bc_init(bytecode_t* bc) {
 	bc->cindex = 0;
 	bc->code_buf = NULL;
 	bc->buf_size = 0;
+	bc->jmptgt_marked = 0;
 	array_init(&bc->mstr_table);
 }
 
 void bc_release(bytecode_t* bc) {
 	array_clean(&bc->mstr_table, NULL);
+	bc->jmptgt_marked = 0;
 	if(bc->code_buf != NULL)
 		mario_free(bc->code_buf);
 }
@@ -1581,6 +1593,10 @@ void bc_remove_instr(bytecode_t* bc, PC from, uint32_t num) {
 		off++;
 	}
 	bc->cindex -= num;
+	/* Jump targets moved with the shift: rescan everything from scratch. Stale
+	 * INSTR_OPT_JMPTGT flags left behind only disable a peephole, never mislead
+	 * it, so a plain reset is enough. */
+	bc->jmptgt_marked = 0;
 }
 
 void bc_set_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target) {
@@ -1601,6 +1617,55 @@ PC bc_add_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target) {
 	bc_add(bc, ins);
 	return bc->cindex;
 } 
+
+/** Flag every instruction a jump can land on (see INSTR_OPT_JMPTGT).
+ *
+ *  The scan is incremental: code_buf[jmptgt_marked .. cindex) is new since the
+ *  last call, and a jump emitted in an earlier slice is already final (its
+ *  operand is patched before the next script is appended). Every word is
+ *  inspected, including literal payload words - a payload that happens to look
+ *  like a jump only marks one extra slot, which merely disables a peephole
+ *  there. Missing a real target is impossible, so the elisions stay sound. */
+void bc_mark_jump_targets(bytecode_t* bc) {
+	if(bc == NULL || bc->code_buf == NULL)
+		return;
+	if(bc->jmptgt_marked > bc->cindex)
+		bc->jmptgt_marked = 0;
+	if(bc->jmptgt_marked == bc->cindex)
+		return;
+
+	PC i;
+	for(i = bc->jmptgt_marked; i < bc->cindex; i++) {
+		PC ins = bc->code_buf[i];
+		opr_code_t op = OP(ins);
+		uint32_t off = OFF(ins);
+		bool fwd;
+		if(op == INSTR_JMP || op == INSTR_NJMP ||
+		   /* `a ?? b`, `a && b`, `a || b`: handle_nullish/handle_logic_sc keep the
+		    * LHS and jump forward past the RHS - the SAME relative math as NJMP.
+		    * This is the case that actually bit us: the comma operator's
+		    * short-circuit target is the POP right after `(n = {})`'s ASIGN. */
+		   op == INSTR_SCOR || op == INSTR_SCAND || op == INSTR_NULLISH)
+			fwd = true;            /* handler: pc = (i+1) + off - 1 */
+		else if(op == INSTR_JMPB || op == INSTR_NJMPB)
+			fwd = false;           /* handler: pc = (i+1) - off - 1 */
+		else if((op == INSTR_TRY || op == INSTR_BLOCK) && off != OFF_MASK)
+			fwd = true;            /* handle_block: sc->pc_finally = i + off */
+		else
+			continue;
+		if(off == OFF_MASK)
+			continue;              /* reserved, not patched yet */
+		PC tgt = fwd ? (i + off) : (off > i ? 0 : (i - off));
+		if(tgt < bc->cindex)
+			bc->code_buf[tgt] |= INSTR_OPT_JMPTGT;
+	}
+	bc->jmptgt_marked = bc->cindex;
+}
+
+/* The `X; POP` elision may only fire when nothing jumps onto that POP. */
+static inline bool bc_pop_elidable(PC* code, PC pc) {
+	return OP(code[pc]) == INSTR_POP && (code[pc] & INSTR_OPT_JMPTGT) == 0;
+}
 
 /** var cache for const value --------------*/
 
@@ -2779,6 +2844,36 @@ static inline void gc_mark_scopes(vm_t* vm, bool mark) {
 	}
 }
 
+/* ---- C-side gc roots -------------------------------------------------------
+ * A native that runs arbitrary JS while holding vars in C locals (a promise
+ * drain iterating its detached reaction lists, a finalizer, an event dispatch)
+ * can be re-entered by a collection: the marker walks the var graph, the value
+ * stack, the scope stack and the caches, none of which contain a C frame's
+ * locals, so those vars are swept mid-call and the native then reads freed
+ * memory. Parking them here makes them roots for the duration. */
+void vm_push_c_root(vm_t* vm, var_t* v) {
+	if(vm == NULL || var_empty(v))
+		return;
+	if(vm->gc.c_roots_top >= vm->gc.c_roots_cap) {
+		int32_t cap = (vm->gc.c_roots_cap == 0) ? 16 : vm->gc.c_roots_cap * 2;
+		var_t** nr = (var_t**)mario_realloc(vm->gc.c_roots,
+				(uint32_t)(sizeof(var_t*) * (size_t)vm->gc.c_roots_cap),
+				(uint32_t)(sizeof(var_t*) * (size_t)cap));
+		if(nr == NULL)
+			return; /* allocation failure: skip this anchor, never corrupt the list */
+		vm->gc.c_roots = nr;
+		vm->gc.c_roots_cap = cap;
+	}
+	vm->gc.c_roots[vm->gc.c_roots_top++] = v;
+}
+
+void vm_pop_c_roots(vm_t* vm, int32_t n) {
+	if(vm == NULL)
+		return;
+	while(n-- > 0 && vm->gc.c_roots_top > 0)
+		vm->gc.c_roots[--vm->gc.c_roots_top] = NULL;
+}
+
 /* Refcount teardown recurses through the object graph (var_free -> var_clean ->
  * var_remove_all -> node_free -> var_unref -> var_free). Deeply chained
  * structures (React's fiber/alternate tree, long prototype or linked chains)
@@ -2926,11 +3021,22 @@ static inline void gc_vars(vm_t* vm) {
 	//mario_debug("gc marking cache\n");
 	gc_mark_cache(vm, true); //mark all cached vars
 	gc_mark_scopes(vm, true); //mark all vars owned by a live scope
+	/* C-side roots: vars a running native holds only in C locals. */
+	for(int32_t ci = 0; ci < vm->gc.c_roots_top; ++ci)
+		gc_mark(vm->gc.c_roots[ci], true);
 	/* A return value parked in pending_value while its `finally` block runs is
 	 * reachable only from that C field, so mark it or the sweep frees it mid-finally
 	 * (the classic C-held-var hazard). NULL when no transfer is deferred. */
 	if(vm->pending_value != NULL)
 		gc_mark(vm->pending_value, true);
+	/* Deferred transfers saved by enclosing vm_run frames (see pending_save_t):
+	 * a value parked by an outer frame is reachable only from that frame's save
+	 * node while an inner frame runs, so mark every saved value or the sweep
+	 * frees it mid-finally. */
+	for(pending_save_t* ps = vm->pending_saves; ps != NULL; ps = ps->prev) {
+		if(ps->value != NULL)
+			gc_mark(ps->value, true);
+	}
 	/* builtin singletons (true/false/null) are held only by vm->builtin_vars and
 	 * are NOT members of vm->root, so gc_mark(vm->root) can not reach them. Mark
 	 * them explicitly, otherwise a GC triggered while a compare result is sitting
@@ -2964,6 +3070,8 @@ static inline void gc_vars(vm_t* vm) {
 	//mario_debug("gc unmarking cache\n");
 	gc_mark_cache(vm, false); //unmark all cached vars
 	gc_mark_scopes(vm, false);
+	for(int32_t ci = 0; ci < vm->gc.c_roots_top; ++ci)
+		gc_mark(vm->gc.c_roots[ci], false);
 	gc_mark(vm->builtin_vars.var_true, false);
 	gc_mark(vm->builtin_vars.var_false, false);
 	gc_mark(vm->builtin_vars.var_null, false);
@@ -3504,11 +3612,17 @@ inline var_t* var_new_str(vm_t* vm, const char* s) {
 inline var_t* var_new_str2(vm_t* vm, const char* s, uint32_t len) {
 	var_t* var = var_new(vm);
 	var->type = V_STRING;
-	var->size = (uint32_t)strlen(s);
-	if(var->size > len)
-		var->size = len;
+	/* Bound the length scan to `len` bytes: callers may pass a buffer that is NOT
+	 * null-terminated within len (a Buffer / ArrayBuffer / TypedArray byte slice),
+	 * where the old unbounded strlen() - and the memcpy of size+1 bytes below -
+	 * would read one-or-more bytes past the allocation. For a null-terminated
+	 * input this yields the same min(strlen(s), len) result as before, and only
+	 * `size` bytes are copied (the terminator is written explicitly). */
+	uint32_t n = 0;
+	while(n < len && s[n] != 0) n++;
+	var->size = n;
 	var->value = mario_malloc(var->size + 1);
-	memcpy(var->value, s, var->size + 1);
+	memcpy(var->value, s, var->size);
 	((char*)(var->value))[var->size] = 0;
 	var_set_prototype(var, var_get_prototype(vm->builtin_vars.var_String));
 	return var;
@@ -4784,6 +4898,21 @@ static scope_t* vm_find_inrange_try(vm_t* vm) {
 	return NULL;
 }
 
+/* Same scan as vm_find_inrange_try, but for the innermost in-range scope that
+ * owns a `finally` (has_finally): a throw (or any propagating error) that no
+ * catch handles in this frame must still run every finally it leaves on the way
+ * out. Only [run_scope_base, scope_stack_top) is scanned, so a finally owned by
+ * an OUTER vm_run frame is left for that frame to run once the error reaches it
+ * (a nested JS call is its own vm_run frame with its own baseline). */
+static scope_t* vm_find_inrange_finally(vm_t* vm) {
+	for(int32_t i = vm->scope_stack_top - 1; i >= vm->run_scope_base; i--) {
+		scope_t* sc = vm->scope_stack[i];
+		if(sc != NULL && sc->has_finally)
+			return sc;
+	}
+	return NULL;
+}
+
 /* Start propagating `err` (adopts the reference): every vm_run frame unwinds
  * until one catches it in-range or the script top reports it. */
 static void vm_propagate(vm_t* vm, var_t* err) {
@@ -4975,28 +5104,31 @@ void vm_throw_type(vm_t* vm, const char* type_name, const char* format, ...) {
 	var_t* err = vm_make_type_error(vm, type_name, message);
 	vm_push(vm, err);
 
-	scope_t* try_sc = vm_get_try_catch_scope(vm);
+	/* Same unwind contract as vm_throw(): only a try scope owned by the CURRENT
+	 * vm_run frame (index >= run_scope_base) may be entered here. The legacy
+	 * vm_get_try_catch_scope() walked the WHOLE scope stack, so a typed error
+	 * raised inside a nested callee (e.g. the BigInt-mix TypeError thrown by an
+	 * arrow handed to a try/catch helper) latched onto the CALLER's try scope,
+	 * popped the callee's own func scope by hand - never running func_call's
+	 * return protocol, so call_depth stayed inflated - and redirected vm->pc into
+	 * the caller's bytecode. The callee frame then executed the caller's tail,
+	 * corrupting the shared scope/value stacks and clobbering the promise a
+	 * synchronous .then() was about to hand back (surfacing later as
+	 * "can not find function 'catch'/'then' on object{}"). */
+	scope_t* try_sc = vm_find_inrange_try(vm);
 	if(try_sc == NULL) {
-		/* Unhandled: surface it like a console would (see vm_throw). */
-		char tagsfx[160] = {0};
-		if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
-		mario_printf("Uncaught %s: %s%s\n", type_name, message, tagsfx);
-		vm_pop(vm);
+		/* No frame of this run can catch: propagate outward so every intermediate
+		 * frame unwinds through func_call (exactly like vm_throw). The interrupted
+		 * body must NOT keep executing, and this must NOT print-and-continue. */
+		vm_pop2(vm); // lift err off the value stack keeping its ref for the propagation
+		vm_propagate(vm, err);
 		return;
 	}
 	vm_throw_truncate(vm); // drop operands the interrupted expression leaked (keep err on top)
-	while(true) {
-		scope_t* sc = vm_get_scope(vm);
-		if(sc == NULL) {
-			vm_pop(vm);
-			break;
-		}
-		if(sc->is_try) {
-			vm->pc = sc->pc;
-			break;
-		}
+	while(vm_get_scope(vm) != try_sc)
 		vm_pop_scope(vm);
-	}
+	try_sc->is_try = false; //consume: a throw inside this catch must not re-trigger the same handler
+	vm->pc = try_sc->pc;
 }
 
 
@@ -5603,6 +5735,14 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		sc->stack_top = vm->stack_top; //frame baseline (env already pushed): a throw truncates leaked operands down to here
 
 		vm_push_scope(vm, sc);
+		/* sc's slot index and resume pc, captured before the body runs. The error
+		 * path below must not assume sc is still alive: a callee can both return
+		 * normally - vm_finish_return pops AND frees the func scope - and leave an
+		 * error propagating (a throw from a finally body overriding a parked
+		 * return), so by the time vm_run hands control back, sc may be gone. */
+		int32_t sc_idx = vm->scope_stack_top - 1;
+		bool sc_pushed = (sc_idx >= 0 && vm->scope_stack[sc_idx] == sc);
+		PC resume_pc = sc->pc;
 
 		//script function
 		int32_t frame_base = vm->stack_top; //value-stack baseline for this frame (env on top; == sc->stack_top)
@@ -5617,11 +5757,31 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 			 * Restore the caller's resume pc (saved in sc->pc at entry, never restored
 			 * because no RET ran), pop sc, truncate to this frame's baseline, drop the
 			 * env slot and hand the caller handler a placeholder result (the outer
-			 * loop's abort check discards it and propagates further, or catches). */
-			while(vm_get_scope(vm) != sc && vm->scope_stack_top > 0)
+			 * loop's abort check discards it and propagates further, or catches).
+			 *
+			 * sc may already have been popped and freed by the callee's own return
+			 * path (see the capture above), in which case the old
+			 * `while(vm_get_scope(vm) != sc)` unwind spun to the BOTTOM of the scope
+			 * stack - destroying every live caller frame - and then read sc->pc from
+			 * freed memory. Unwind by index instead, and only touch sc when it is
+			 * verifiably still on the stack. */
+			bool sc_live = (sc_pushed && vm->scope_stack_top > sc_idx &&
+			                vm->scope_stack[sc_idx] == sc);
+			/* Pop the body's leftover block scopes only: when sc is still on the stack
+			 * it must survive this loop (the pop below releases it), and when it is
+			 * already gone its slot belongs to the CALLER's frame, so stop there. If
+			 * the push was dropped (scope stack full -> vm_terminate), unwind nothing. */
+			int32_t keep = sc_live ? (sc_idx + 1)
+			                       : (sc_pushed ? sc_idx : vm->scope_stack_top);
+			while(vm->scope_stack_top > keep && vm->scope_stack_top > 0)
 				vm_pop_scope(vm);
-			vm->pc = sc->pc;
-			vm_pop_scope(vm);
+			if(sc_live) {
+				vm->pc = sc->pc;
+				vm_pop_scope(vm);
+			}
+			else {
+				vm->pc = resume_pc;
+			}
 			while(vm->stack_top > frame_base)
 				vm_pop(vm);
 			vm_pop(vm);              // the env slot pushed before vm_run
@@ -7587,92 +7747,122 @@ static inline void handle_block_end(vm_t* vm, PC ins, opr_code_t instr, uint32_t
  * must abandon a return parked for an enclosing finally) can call it. */
 static inline void vm_clear_pending(vm_t* vm);
 
-static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
-	/* A `break` inside a finally body overrides any return parked for that finally
-	 * (JS: the finally's own exit wins); drop it so a later INSTR_FINALLY_END does
-	 * not resume a stale transfer. No-op in ordinary code. */
+/* Perform a `break`, running any `finally` block it leaves on the way out.
+ * Walks the scope chain from the innermost to the break target (the matching
+ * labeled scope, or the innermost loop/switch when unlabeled), remembering the
+ * first scope that owns a finally. If such a scope exists the transfer is parked
+ * (pending_op = FIN_BREAK, pending_label = label), the scopes down to and
+ * including that try are popped exactly as vm_finish_return does, and vm->pc is
+ * set to the finally body; its INSTR_FINALLY_END resumes here via
+ * handle_finally_end, so nested finallys run inner-to-outer. Otherwise it jumps
+ * straight to the target's break anchor. */
+static void vm_do_break(vm_t* vm, const char* label) {
+	/* A `break` inside a finally body overrides any transfer parked for that
+	 * finally (JS: the finally's own exit wins); drop it so a later
+	 * INSTR_FINALLY_END does not resume a stale transfer. No-op in ordinary code. */
 	vm_clear_pending(vm);
-	/* `break <label>` carries the label name as its string operand; an unlabeled
-	 * `break` has an empty operand (OFF_MASK -> ""). A labeled break unwinds to
-	 * the matching labeled-statement scope (skipping any inner loops/switches,
-	 * which are popped here), while an unlabeled break stops at the innermost
-	 * loop or switch. */
-	const char* label = bc_getstr(&vm->bc, offset);
 	bool labeled = (label != NULL && label[0] != 0);
-	while(true) {
-		scope_t* sc = vm_get_scope(vm);
-		if(sc == NULL) {
-			mario_printf("Error: 'break' not in any loop!\n");
-			vm_terminate(vm);
-			break;
-		}
-		if(labeled) {
-			if(sc->is_label && sc->label != NULL && strcmp(sc->label, label) == 0) {
-				vm->pc = sc->pc;
-				break;
-			}
-		}
-		else if(sc->is_loop || sc->is_switch) {
-			vm->pc = sc->pc;
-			break;
-		}
-		vm_pop_scope(vm);
+	scope_t* target = NULL;
+	scope_t* fin = NULL;
+	scope_t* s = vm_get_scope(vm);
+	while(s != NULL) {
+		bool is_target = labeled
+			? (s->is_label && s->label != NULL && strcmp(s->label, label) == 0)
+			: (s->is_loop || s->is_switch);
+		if(is_target) { target = s; break; }
+		if(fin == NULL && s->has_finally) fin = s;
+		s = s->prev;
 	}
+	if(target == NULL) {
+		mario_printf("Error: 'break' not in any loop!\n");
+		vm_terminate(vm);
+		return;
+	}
+	if(fin != NULL) {
+		PC fpc = fin->pc_finally;   /* read before fin is popped/freed */
+		vm->pending_op = FIN_BREAK;
+		vm->pending_label = label;
+		while(vm_get_scope(vm) != NULL && vm_get_scope(vm) != fin)
+			vm_pop_scope(vm);
+		if(vm_get_scope(vm) == fin)
+			vm_pop_scope(vm);
+		vm->pc = fpc;
+		return;   /* vm_run keeps running the finally body */
+	}
+	while(vm_get_scope(vm) != NULL && vm_get_scope(vm) != target)
+		vm_pop_scope(vm);
+	vm->pc = target->pc;
 }
 
-static inline void handle_continue(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
-	/* See handle_break: a `continue` inside a finally body overrides a parked return. */
+/* Perform a `continue`, running any `finally` block it leaves on the way out.
+ * Same park/run-finally/resume machinery as vm_do_break, but the target is the
+ * loop to restart: for a labeled continue, the loop the label directly wraps
+ * (the labeled scope's immediate loop child); for an unlabeled continue, the
+ * innermost enclosing loop. The jump goes to the loop's continue anchor
+ * (pc_start), not its break anchor. */
+static void vm_do_continue(vm_t* vm, const char* label) {
 	vm_clear_pending(vm);
-	/* `continue <label>` carries the label name as its string operand; an
-	 * unlabeled `continue` has an empty operand (OFF_MASK -> ""). An unlabeled
-	 * continue restarts the innermost enclosing loop. A labeled continue restarts
-	 * the loop that the label directly wraps (`L: for(...){ ... continue L; }`):
-	 * walk the scope chain to the labeled scope L, take its immediate child (the
-	 * loop it labels), pop every scope above that loop, then jump to the loop's
-	 * start. The label and loop scopes stay on the stack since iteration
-	 * continues. */
-	const char* label = bc_getstr(&vm->bc, offset);
 	bool labeled = (label != NULL && label[0] != 0);
+	scope_t* target = NULL;
+	scope_t* fin = NULL;
 	if(labeled) {
-		scope_t* target_loop = NULL;
 		scope_t* child = NULL;
-		scope_t* sc = vm_get_scope(vm);
-		while(sc != NULL) {
-			if(sc->is_label && sc->label != NULL && strcmp(sc->label, label) == 0) {
+		scope_t* s = vm_get_scope(vm);
+		while(s != NULL) {
+			if(s->is_label && s->label != NULL && strcmp(s->label, label) == 0) {
 				if(child != NULL && child->is_loop)
-					target_loop = child;
+					target = child;
 				break;
 			}
-			child = sc;
-			sc = sc->prev;
+			if(fin == NULL && s->has_finally) fin = s;
+			child = s;
+			s = s->prev;
 		}
-		if(target_loop == NULL) {
+		if(target == NULL) {
 			mario_printf("Error: 'continue %s' has no matching labeled loop!\n", label);
 			vm_terminate(vm);
 			return;
 		}
-		while(true) {
-			scope_t* top = vm_get_scope(vm);
-			if(top == NULL || top == target_loop)
-				break;
-			vm_pop_scope(vm);
-		}
-		vm->pc = target_loop->pc_start;
-		return;
 	}
-	while(true) {
-		scope_t* sc = vm_get_scope(vm);
-		if(sc == NULL) {
+	else {
+		scope_t* s = vm_get_scope(vm);
+		while(s != NULL) {
+			if(s->is_loop) { target = s; break; }
+			if(fin == NULL && s->has_finally) fin = s;
+			s = s->prev;
+		}
+		if(target == NULL) {
 			mario_printf("Error: 'continue' not in any loop!\n");
 			vm_terminate(vm);
-			break;
+			return;
 		}
-		if(sc->is_loop) {
-			vm->pc = sc->pc_start;
-			break;
-		}
-		vm_pop_scope(vm);
 	}
+	if(fin != NULL) {
+		PC fpc = fin->pc_finally;
+		vm->pending_op = FIN_CONTINUE;
+		vm->pending_label = label;
+		while(vm_get_scope(vm) != NULL && vm_get_scope(vm) != fin)
+			vm_pop_scope(vm);
+		if(vm_get_scope(vm) == fin)
+			vm_pop_scope(vm);
+		vm->pc = fpc;
+		return;
+	}
+	while(vm_get_scope(vm) != NULL && vm_get_scope(vm) != target)
+		vm_pop_scope(vm);
+	vm->pc = target->pc_start;
+}
+
+static inline void handle_break(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	/* `break <label>` carries the label name as its string operand; an unlabeled
+	 * `break` has an empty operand (OFF_MASK -> ""). */
+	vm_do_break(vm, bc_getstr(&vm->bc, offset));
+}
+
+static inline void handle_continue(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	/* `continue <label>` carries the label name as its string operand; an
+	 * unlabeled `continue` has an empty operand (OFF_MASK -> ""). */
+	vm_do_continue(vm, bc_getstr(&vm->bc, offset));
 }
 
 static inline void handle_cache(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -8055,7 +8245,7 @@ static inline void vm_step_op(vm_t* vm, PC ins, node_t* n, var_t* v, int step, b
 			}
 		}
 		if((ins & INSTR_OPT_CACHE) == 0) {
-			if(OP(code[vm->pc]) != INSTR_POP)
+			if(!bc_pop_elidable(code, vm->pc))
 				vm_push(vm, res);
 			else {
 				code[vm->pc] = INSTR_NIL;
@@ -8098,7 +8288,7 @@ static inline void vm_step_op(vm_t* vm, PC ins, node_t* n, var_t* v, int step, b
 	}
 
 	if((ins & INSTR_OPT_CACHE) == 0) {
-		if(OP(code[vm->pc]) != INSTR_POP) {
+		if(!bc_pop_elidable(code, vm->pc)) {
 			vm_push(vm, res);
 		}
 		else {
@@ -8208,6 +8398,7 @@ static inline void vm_clear_pending(vm_t* vm) {
 		vm->pending_value = NULL;
 		vm->pending_op = FIN_NONE;
 		vm->pending_pc = 0;
+		vm->pending_label = NULL;
 	}
 }
 
@@ -8300,6 +8491,34 @@ static inline void handle_finally_end(vm_t* vm, PC ins, opr_code_t instr, uint32
 		vm->pending_op = FIN_NONE;
 		vm_finish_return(vm, ret);
 	}
+	else if(vm->pending_op == FIN_BREAK) {
+		/* Resume a break parked by vm_do_break: re-run it from the current scope
+		 * (the try just finished), so an enclosing finally parks again or the
+		 * break completes to its target. Does NOT set fin_ret_done - this frame
+		 * keeps running at the new vm->pc. */
+		const char* label = vm->pending_label;
+		vm->pending_label = NULL;
+		vm->pending_op = FIN_NONE;
+		vm_do_break(vm, label);
+	}
+	else if(vm->pending_op == FIN_CONTINUE) {
+		const char* label = vm->pending_label;
+		vm->pending_label = NULL;
+		vm->pending_op = FIN_NONE;
+		vm_do_continue(vm, label);
+	}
+	else if(vm->pending_op == FIN_THROW) {
+		/* Resume a throw parked by vm_run's abort branch: the finally has run, so
+		 * re-arm propagation with the same error and let the loop-top abort handler
+		 * keep unwinding (an enclosing finally parks again, or the error reaches an
+		 * outer catch / the script top). Does NOT set fin_ret_done - this frame keeps
+		 * running at the new vm->pc. */
+		var_t* err = vm->pending_value;
+		vm->pending_value = NULL;
+		vm->pending_op = FIN_NONE;
+		vm->propagating_err = err;
+		vm->abort_run = true;
+	}
 }
 
 static inline void handle_var(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -8336,17 +8555,18 @@ static inline void handle_const(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 				node->be_const = true;
 		}
 		else {
-			if(getenv("MARIO_LETDBG")) { /* DIAG (temp): locate the empty-name let/const */
-				fprintf(stderr, "[letdbg] name='%s' pc=%u instr=%u bc.cindex=%u mstr.size=%u\n",
-					s, (unsigned)vm->pc, (unsigned)ins, (unsigned)vm->bc.cindex, (unsigned)vm->bc.mstr_table.size);
-				for(PC q = (vm->pc > 12 ? vm->pc - 12 : 0); q < vm->pc + 3 && q < vm->bc.cindex; q++) {
-					PC iw = vm->bc.code_buf[q];
-					PC iop = OP(iw), ioff = iw & 0xFFFFF;
-					fprintf(stderr, "[letdbg]   pc=%u op=%02x off=%u str=%s\n", (unsigned)q, (unsigned)iop, (unsigned)ioff, bc_getstr(&vm->bc, ioff));
-				}
-			}
-			mario_debug("Error: let '%s' has already existed!\n", s);
-			vm_throw(vm, "let '%s' has already existed!", s);
+			/* Re-run declaration in a still-live scope. Real JS gives each entry
+			 * of a loop/switch body its own block scope; mario keeps ONE scope for
+			 * the whole loop, so a second iteration re-declares the same `let`.
+			 * Throwing here aborts the entire bundle (minified react-dom reuses
+			 * single-letter lets across iterations -> React hydration error #423
+			 * and an empty root), while rebinding to a FRESH var resets loop-
+			 * critical state and can spin forever. Keep the existing binding: the
+			 * initializer re-assigns it immediately, so per-iteration values stay
+			 * correct. (Known limitation: without scope-entry hoisting there is no
+			 * true TDZ, so a read before the declaration yields undefined.) */
+			if(instr == INSTR_CONST)
+				node->be_const = true;
 		}
 	}
 	else {
@@ -8456,7 +8676,7 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		 * receiver pick in the enclosing expression. */
 		mario_debug("Error: Can not find an assignable target!\n");
 		if((ins & INSTR_OPT_CACHE) == 0) {
-			if(OP(code[vm->pc]) != INSTR_POP) {
+			if(!bc_pop_elidable(code, vm->pc)) {
 				vm_push(vm, (v != NULL) ? v : var_new(vm));
 			}
 			else {
@@ -8484,7 +8704,7 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		var_unref(n->var);
 		node_free(n);
 		if((ins & INSTR_OPT_CACHE) == 0) {
-			if(OP(code[vm->pc]) != INSTR_POP) {
+			if(!bc_pop_elidable(code, vm->pc)) {
 				vm_push(vm, v);
 			}
 			else {
@@ -8558,7 +8778,7 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	node_replace(n, v);
 
 	if((ins & INSTR_OPT_CACHE) == 0) {
-		if(OP(code[vm->pc]) != INSTR_POP) {
+		if(!bc_pop_elidable(code, vm->pc)) {
 			vm_push(vm, n->var);
 		}
 		else {
@@ -9146,9 +9366,56 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		        mario_debug("Error: can not find function '%s'!\n", name->cstr);
 		if(getenv("MARIO_CALLDBG") != NULL) {
 			scope_t* csc = vm_get_scope(vm);
-			fprintf(stderr, "[calldbg] miss '%s' at pc=%u caller_fpc=%u\n", name->cstr,
+			fprintf(stderr, "[calldbg] miss '%s' at pc=%u caller_fpc=%u recv_type=%d\n", name->cstr,
 					(unsigned)(vm->pc > 0 ? vm->pc - 1 : 0),
-					(csc != NULL && csc->func != NULL) ? (unsigned)csc->func->pc : 0);
+					(csc != NULL && csc->func != NULL) ? (unsigned)csc->func->pc : 0,
+					(obj != NULL) ? (int)obj->type : -1);
+			if(obj != NULL && obj->type == V_OBJECT && obj->children.buckets != NULL) {
+				for(uint32_t b = 0; b < obj->children.capacity; ++b) {
+					for(hash_entry_t* e2 = obj->children.buckets[b]; e2 != NULL; e2 = e2->next)
+						if(e2->key != NULL)
+							fprintf(stderr, "[calldbg]   member '%s'\n", e2->key);
+				}
+			}
+			if(csc != NULL && csc->var != NULL && csc->var->children.buckets != NULL) {
+				fprintf(stderr, "[calldbg]   locals:\n");
+				for(uint32_t b = 0; b < csc->var->children.capacity; ++b) {
+					for(hash_entry_t* e3 = csc->var->children.buckets[b]; e3 != NULL; e3 = e3->next) {
+						node_t* nd = (node_t*)e3->value;
+						if(nd == NULL || nd->var == NULL || e3->key == NULL) continue;
+						fprintf(stderr, "[calldbg]     local '%s' type=%d\n", e3->key, (int)nd->var->type);
+						if(nd->var->type == V_OBJECT && nd->var->children.buckets != NULL) {
+							for(uint32_t b2 = 0; b2 < nd->var->children.capacity; ++b2) {
+								for(hash_entry_t* e4 = nd->var->children.buckets[b2]; e4 != NULL; e4 = e4->next) {
+									node_t* m4 = (node_t*)e4->value;
+									if(m4 == NULL || m4->var == NULL || e4->key == NULL || e4->key[0] == '@') continue;
+									fprintf(stderr, "[calldbg]       .%s type=%d\n", e4->key, (int)m4->var->type);
+								}
+							}
+						}
+					}
+				}
+			}
+			{
+				/* walk enclosing scopes and dump array locals (len + elem types) */
+				scope_t* sc = csc;
+				for(int sd = 0; sc != NULL && sd < 8; ++sd, sc = sc->prev) {
+					if(sc->var == NULL || sc->var->children.buckets == NULL) continue;
+					for(uint32_t b = 0; b < sc->var->children.capacity; ++b) {
+						for(hash_entry_t* e5 = sc->var->children.buckets[b]; e5 != NULL; e5 = e5->next) {
+							node_t* nd = (node_t*)e5->value;
+							if(nd == NULL || nd->var == NULL || !nd->var->is_array) continue;
+							int n = (int)var_array_size(nd->var);
+							fprintf(stderr, "[calldbg]   scope%d array '%s' len=%d elems=", sd, e5->key, n);
+							for(int ei = 0; ei < n && ei < 8; ++ei) {
+								node_t* el = var_array_get(nd->var, ei);
+								fprintf(stderr, "%d,", (el != NULL && el->var != NULL) ? (int)el->var->type : -1);
+							}
+							fprintf(stderr, "\n");
+						}
+					}
+				}
+			}
 			if(csc != NULL && csc->is_func && csc->func != NULL) {
 				var_t* cl = csc->func->closure.var;
 				func_t* cf = csc->func->closure.func;
@@ -9190,6 +9457,13 @@ static inline void handle_callx(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 
 	var_t* func = vm_stack_pick(vm, arg_num + 1);
 	var_t* obj = vm_this_in_scopes(vm);
+
+	/* The pick removed func's only gc-visible owner (its value-stack slot), so
+	 * until the trailing var_unref it lives in a C local the collector can not
+	 * see. func_call runs arbitrary JS - including a nested vm_run whose
+	 * instruction-boundary gc_pending check, or an explicit gc(), both of which
+	 * can sweep it mid-call. Park it as a C-side root for the whole handler. */
+	vm_push_c_root(vm, func);
 
 	if(func != NULL && (func->is_func || var_is_callable(func))) {
 		func_call(vm, obj, func, arg_num);
@@ -9297,6 +9571,7 @@ static inline void handle_callx(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		vm->gc.gc_defer--;
 	}
 
+	vm_pop_c_roots(vm, 1);
 	if(func != NULL)
 		var_unref(func); // release the ref the value-stack slot held
 }
@@ -9315,6 +9590,11 @@ static inline void handle_callxo(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 	var_t* func = vm_stack_pick(vm, arg_num + 1); /* removes the func slot */
 	var_t* obj  = vm_stack_pick(vm, arg_num + 1); /* receiver now at that depth */
 
+	/* Both were just detached from the value stack, so only these C locals keep
+	 * them alive across func_call's arbitrary JS (see handle_callx). */
+	vm_push_c_root(vm, func);
+	vm_push_c_root(vm, obj);
+
 	if(func != NULL && (func->is_func || var_is_callable(func))) {
 		func_call(vm, obj, func, arg_num);
 	}
@@ -9329,6 +9609,7 @@ static inline void handle_callxo(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 		vm->gc.gc_defer--;
 	}
 
+	vm_pop_c_roots(vm, 2);
 	vm->gc.gc_defer++; //the first unref may gc-sweep the second target
 	if(func != NULL)
 		var_unref(func);
@@ -11479,7 +11760,7 @@ static void diag_scan_cb(const char* key, void* value, void* user_data) {
 var_t* mario_apply_var(vm_t* vm, var_t* func, var_t* thisArg, var_t* argsNatural) {
 	if(func == NULL || !var_is_callable(func)) {
 		/* TEMP taobao diag: scope chain + pc of the non-callable apply. */
-		{
+		if(getenv("MARIO_APPLYDBG")) {
 			scope_t* sc = vm_get_scope(vm);
 			int hop = 0;
 			fprintf(stderr, "[mario-diag] apply NOT callable pc=%u tag=%s func=%p stack_top=%d/%d scope_top=%d\n",
@@ -12278,6 +12559,11 @@ bool vm_run(vm_t* vm) {
 		init_instr_table();
 	}
 
+	/* Flag jump targets before any instruction runs: the `X; POP` elisions below
+	 * rewrite code in place and must not erase a POP some branch lands on. The
+	 * scan is incremental, so on a nested (per-call) entry it is just a compare. */
+	bc_mark_jump_targets(&vm->bc);
+
 	register PC code_size = vm->bc.cindex;
 	register PC* code = vm->bc.code_buf;
 	/* This frame's catch/propagate baselines: a try scope or stack operand from
@@ -12286,6 +12572,23 @@ bool vm_run(vm_t* vm) {
 	int32_t save_stack_base = vm->run_stack_base;
 	vm->run_scope_base = vm->scope_stack_top;
 	vm->run_stack_base = vm->stack_top;
+	/* This frame owns its own deferred-finally transfer. A break/continue/return
+	 * parked by an OUTER frame (waiting on that frame's finally) must be invisible
+	 * here: otherwise a callee invoked inside the finally body returns through
+	 * vm_finish_return -> vm_clear_pending and wipes the outer transfer, so the
+	 * finally's INSTR_FINALLY_END never resumes it. Push the inherited state onto
+	 * the gc-rooted save list and start clean; restore on the single exit below. */
+	pending_save_t psave;
+	psave.value = vm->pending_value;
+	psave.label = vm->pending_label;
+	psave.pc = vm->pending_pc;
+	psave.op = vm->pending_op;
+	psave.prev = vm->pending_saves;
+	vm->pending_saves = &psave;
+	vm->pending_op = FIN_NONE;
+	vm->pending_value = NULL;
+	vm->pending_label = NULL;
+	vm->pending_pc = 0;
 	bool rv = false;
 
 	do {
@@ -12309,6 +12612,38 @@ bool vm_run(vm_t* vm) {
 					vm_pop_scope(vm);
 				try_sc->is_try = false; //consume: a throw inside this catch must not re-trigger it
 				vm->pc = try_sc->pc;
+				continue;
+			}
+			/* No catch in this frame. Before unwinding out, run any `finally` the
+			 * propagating error leaves behind: a throw out of try{}finally{} (whose
+			 * TRY was demoted to a BLOCK, so vm_find_inrange_try skips it), or out of
+			 * a try{}catch{}finally{} whose catch rethrew. Park the error as
+			 * pending_value (FIN_THROW), clear abort_run, pop scopes down to and
+			 * including the finally's scope, and jump into the finally body; its
+			 * INSTR_FINALLY_END re-arms propagation (handle_finally_end), so this
+			 * branch is re-entered, finds no finally left, and unwinds out. Nested
+			 * finallys thus run inner-to-outer, matching return/break/continue. This
+			 * is what lets React's scheduler reset isMessageLoopRunning in the finally
+			 * of performWorkUntilDeadline when flushWork throws - without it the flag
+			 * stays true forever and no further work is ever scheduled/committed. */
+			scope_t* fin = vm_find_inrange_finally(vm);
+			if(fin != NULL) {
+				PC fpc = fin->pc_finally;   /* read before fin is popped/freed */
+				/* Discard operands the interrupted expression leaked (stack BEFORE
+				 * scopes, per the note below) so the finally body starts clean. */
+				while(vm->stack_top > vm->run_stack_base)
+					vm_pop(vm);
+				if(vm->pending_value != NULL)
+					var_unref(vm->pending_value);
+				vm->pending_op = FIN_THROW;
+				vm->pending_value = vm->propagating_err;   /* adopt the ref; gc-rooted */
+				vm->propagating_err = NULL;
+				vm->abort_run = false;
+				while(vm_get_scope(vm) != NULL && vm_get_scope(vm) != fin)
+					vm_pop_scope(vm);
+				if(vm_get_scope(vm) == fin)
+					vm_pop_scope(vm);
+				vm->pc = fpc;
 				continue;
 			}
 			/* Propagate: unwind this frame's leftover value-stack operands FIRST,
@@ -12442,6 +12777,11 @@ bool vm_run(vm_t* vm) {
 	while(vm->pc < code_size && !vm->terminated);
 	vm->run_scope_base = save_scope_base;
 	vm->run_stack_base = save_stack_base;
+	vm->pending_op = psave.op;
+	vm->pending_value = psave.value;
+	vm->pending_label = psave.label;
+	vm->pending_pc = psave.pc;
+	vm->pending_saves = psave.prev;
 	return rv;
 }
 
@@ -12509,6 +12849,12 @@ void vm_close(vm_t* vm) {
 
 	var_cache_free(vm);
 	load_ncache_free(vm);
+	/* The C-root stack holds no references of its own (it only shields vars its
+	 * owners still hold), so dropping the array is enough. */
+	mario_free(vm->gc.c_roots);
+	vm->gc.c_roots = NULL;
+	vm->gc.c_roots_top = 0;
+	vm->gc.c_roots_cap = 0;
 
 	// Pop and free all scopes
 	while(vm->scope_stack_top > 0) {

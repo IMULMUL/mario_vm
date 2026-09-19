@@ -17,7 +17,6 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH_BUILTIN)/ArrayBuffer/native_ArrayBuffer.o  \
 	$(NATIVES_PATH_BUILTIN)/DataView/native_DataView.o  \
 	$(NATIVES_PATH_BUILTIN)/TypedArray/native_TypedArray.o  \
-	$(NATIVES_PATH_BUILTIN)/Console/native_Console.o \
 	$(NATIVES_PATH_BUILTIN)/String/native_String.o \
 	$(NATIVES_PATH_BUILTIN)/Array/native_Array.o \
 	$(NATIVES_PATH_BUILTIN)/Promise/native_Promise.o \
@@ -31,11 +30,19 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH_BUILTIN)/SharedArrayBuffer/native_SharedArrayBuffer.o \
 	$(NATIVES_PATH_BUILTIN)/Atomics/native_Atomics.o \
 	$(NATIVES_PATH_BUILTIN)/RegExp/native_RegExp.o \
-	$(NATIVES_PATH_BUILTIN)/TextEncoder/native_TextEncoder.o \
-	$(NATIVES_PATH_BUILTIN)/Stream/native_Stream.o \
+	$(NATIVES_PATH_BUILTIN)/Math/native_Math.o \
+	$(NATIVES_PATH_BUILTIN)/Date/native_Date.o \
+	$(NATIVES_PATH_BUILTIN)/JSON/JSON.o \
+	$(NATIVES_PATH_BUILTIN)/JSON/native_JSON.o \
 	\
 	$(NATIVES_PATH)/natives.o  \
-	$(NATIVES_PATH)/JSON/JSON.o \
-	$(NATIVES_PATH)/JSON/native_JSON.o \
-	$(NATIVES_PATH)/Date/native_Date.o \
-	$(NATIVES_PATH)/Math/native_Math.o
+	$(NATIVES_PATH)/Console/native_Console.o \
+	$(NATIVES_PATH)/TextEncoder/native_TextEncoder.o \
+	$(NATIVES_PATH)/Stream/native_Stream.o \
+	$(NATIVES_PATH)/Process/native_Process.o \
+	$(NATIVES_PATH)/Buffer/native_Buffer.o \
+	$(NATIVES_PATH)/URL/native_URL.o \
+	$(NATIVES_PATH)/EventTarget/native_EventTarget.o \
+	$(NATIVES_PATH)/AbortController/native_AbortController.o \
+	$(NATIVES_PATH)/EventEmitter/native_EventEmitter.o \
+	$(NATIVES_PATH)/Web/native_Web.o

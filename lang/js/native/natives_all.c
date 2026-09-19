@@ -54,7 +54,11 @@ static inline void load_basic_classes(vm_t* vm) {
 
 void reg_all_natives(vm_t* vm) {
 	reg_builtin_natives(vm);
-	load_basic_classes(vm);
-
+	/* reg_natives must run before load_basic_classes: Console/TextEncoder/URL/
+	 * EventTarget and the rest of the platform classes now live here, and
+	 * load_basic_classes instantiates `console` via new_obj(vm, "Console", 0).
+	 * Registering the class after that point would leave the global `console`
+	 * detached from its prototype (silent no-op for console.log). */
 	reg_natives(vm);
+	load_basic_classes(vm);
 }

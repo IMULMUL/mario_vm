@@ -337,8 +337,8 @@ var_t* native_StringSplit(vm_t* vm, var_t* env, void* data) {
 			var_t* lv = get_obj(env, "limit");
 			if(lv != NULL && lv->type == V_INT) {
 				limit = var_get_int(lv);
-				if(limit <= 0)
-					limit = -1;
+				if(limit < 0)
+					limit = -1;   /* negative → ToUint32 huge → effectively none */
 			}
 			return str_re_split(vm, env, sepv, limit);
 		}
@@ -642,8 +642,12 @@ var_t* native_StringSearch(vm_t* vm, var_t* env, void* data) {
 	return var_new_int(vm, hit ? caps[0] : -1);
 }
 
-/* Regexp split path used by native_StringSplit(). Capture groups are not
- * spliced into the result (rarely relied on). */
+/* Regexp split path used by native_StringSplit(), implementing ES
+ * RegExp.prototype[Symbol.split] (22.2.6.12): capture groups are spliced into
+ * the result, an empty match at the piece start does not split, and an empty
+ * subject returns [] when the regexp matches "" (else [""]). limit<0 means no
+ * limit, limit==0 returns []. re_match()'s leftmost-at-or-after search is
+ * equivalent to the spec's sticky scan (q walks up to each match start). */
 static var_t* str_re_split(vm_t* vm, var_t* env, var_t* re, int limit) {
 	const char* s = get_str(env, THIS);
 	int slen = (int)strlen(s);
@@ -654,25 +658,52 @@ static var_t* str_re_split(vm_t* vm, var_t* env, var_t* re, int limit) {
 		var_array_add(result, var_new_str(vm, s));
 		return result;
 	}
+	int ngroups = re_ngroups(p);
 	int caps[RE_CAPS_MAX];
-	int pos = 0, start = 0, count = 0;
-	while(pos <= slen && (limit < 0 || count < limit)) {
-		if(!re_match(p, s, slen, pos, caps))
+	int lengthA = 0;
+
+	/* limit 0 → empty result (spec step 11). */
+	if(limit == 0) {
+		re_free(p);
+		return result;
+	}
+
+	/* Empty subject (spec step 13): [] if the regexp matches "", else [""]. */
+	if(slen == 0) {
+		if(!re_match(p, s, 0, 0, caps))
+			var_array_add(result, var_new_str2(vm, s, 0));
+		re_free(p);
+		return result;
+	}
+
+	int pieceStart = 0, scanPos = 0;
+	while(scanPos < slen) {
+		if(!re_match(p, s, slen, scanPos, caps))
 			break;
-		if(caps[1] == caps[0] && caps[0] >= slen)
-			break;
-		if(caps[1] == caps[0] && caps[0] == start) {
-			/* empty match at the piece start: step over one char */
-			pos = caps[0] + 1;
+		int matchStart = caps[0], matchEnd = caps[1];
+		if(matchEnd == pieceStart) {
+			/* empty match at the piece start: advance and retry (spec 18.d.iii). */
+			scanPos = matchStart + 1;
 			continue;
 		}
-		var_array_add(result, var_new_str2(vm, s + start, (uint32_t)(caps[0] - start)));
-		count++;
-		start = caps[1];
-		pos = caps[1] > caps[0] ? caps[1] : caps[1] + 1;
+		var_array_add(result, var_new_str2(vm, s + pieceStart, (uint32_t)(matchStart - pieceStart)));
+		lengthA++;
+		if(limit > 0 && lengthA == limit) { re_free(p); return result; }
+		int g;
+		for(g = 1; g <= ngroups; g++) {
+			int gs = caps[2 * g], ge = caps[2 * g + 1];
+			if(gs >= 0 && ge >= gs)
+				var_array_add(result, var_new_str2(vm, s + gs, (uint32_t)(ge - gs)));
+			else
+				var_array_add(result, var_new(vm));   /* undefined capture */
+			lengthA++;
+			if(limit > 0 && lengthA == limit) { re_free(p); return result; }
+		}
+		pieceStart = matchEnd;
+		scanPos = matchEnd;
 	}
-	if(limit < 0 || count < limit)
-		var_array_add(result, var_new_str2(vm, s + start, (uint32_t)(slen - start)));
+	/* trailing piece S[pieceStart..slen] (spec step 19). */
+	var_array_add(result, var_new_str2(vm, s + pieceStart, (uint32_t)(slen - pieceStart)));
 	re_free(p);
 	return result;
 }

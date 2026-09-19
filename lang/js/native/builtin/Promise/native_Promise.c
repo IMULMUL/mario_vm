@@ -6,9 +6,11 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Reactions run as 0-ms tasks on the DOM bridge timer table (the engine's
- * microtask pump). Forward-declared: js_dom.o lives in the same archive. */
+/* Reactions run as microtasks on the DOM bridge timer table (the engine's
+ * microtask pump), drained ahead of every 0-ms macrotask. Forward-declared:
+ * js_dom.o lives in the same archive. */
 int js_dom_add_timer(vm_t* vm, var_t* cb, uint32_t ms, bool repeat);
+int js_dom_add_microtask(vm_t* vm, var_t* cb);
 
 #define CLS_PROMISE "Promise"
 
@@ -454,16 +456,28 @@ static void promise_add_reaction(vm_t* vm, promise_data* pd, var_t* onF, var_t* 
 }
 
 /* Queue the reaction drain as a 0-ms task (the engine microtask pump). The
- * trampoline is anchored by the timer table's @@timers array, and it carries
- * its own ref on the promise so the promise outlives the settling scope. */
+ * trampoline is anchored by the timer table's @@timers array and carries a
+ * refcount on the promise, but the GC mark phase IGNORES refcounts and does
+ * not follow func->data (a raw void*), so that ref alone does NOT keep the
+ * promise reachable: an unrooted promise swept between settle and drain left
+ * the trampoline pointing at a recycled var_t (its ->value reused as a small
+ * integer / string byte), and native_promise_drain then wrote pd->drain_armed
+ * through a wild pointer (SIGSEGV). This happens whenever a drain is (re)
+ * scheduled for a promise that is no longer in @@pend_prom - notably a .then()
+ * on an already-settled-and-drained promise, whose first drain unrooted it.
+ * Root it here so it stays gc-reachable until promise_drain_unroot() (which is
+ * drain_armed-guarded, so a re-arm from inside the loop keeps it rooted for the
+ * next drain too). promise_root_pending() is idempotent, so the normal settle
+ * path - where the promise has been rooted since it was pending - is a no-op. */
 static void promise_schedule_drain(vm_t* vm, var_t* promise) {
     promise_data* pd = (promise_data*)promise->value;
     if (pd == NULL || pd->drain_armed)
         return;
     pd->drain_armed = true;
+    promise_root_pending(vm, promise);
     var_t* tr = var_new_native_func(vm, native_promise_drain, var_ref(promise));
-    int id = js_dom_add_timer(vm, tr, 0, false);
-    if (id == 0) {   /* table full: never lose reactions - run them now */
+    int id = js_dom_add_microtask(vm, tr);
+    if (id == 0) {   /* table full / CLI: never lose reactions - run them now */
         var_unref(tr);
         native_promise_drain(vm, NULL, promise);
     }
@@ -494,6 +508,14 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
         return NULL;
     if (promise->status <= V_ST_GC_FREE) { var_unref(promise); return NULL; }
     promise_data* pd = (promise_data*)promise->value;
+    /* Defensive net (the promise_schedule_drain rooting fix makes this
+     * unreachable in practice): if the captured var was swept and its slot
+     * recycled, ->value is no longer a promise_data heap pointer but reused
+     * payload (a small integer, a string byte, ...). Never write through it -
+     * and never var_unref() either, since the refcount now belongs to whatever
+     * the recycled var_t became. Just drop the reaction. */
+    if ((uintptr_t)pd < 0x10000u)
+        return NULL;
     if (pd == NULL) { promise_drain_unroot(vm, promise, NULL); var_unref(promise); return NULL; }
     pd->drain_armed = false;
     int fulfilled = (pd->state == PROMISE_STATE_FULFILLED);
@@ -516,6 +538,16 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
     pd->fulfilled_promises  = var_ref(var_new_array(vm));
     pd->rejected_promises   = var_ref(var_new_array(vm));
     promise_anchor(vm, promise, pd);
+    /* The detach above replaced this promise's hidden @@keep array, so the two
+     * lists we are about to iterate are reachable ONLY from these C locals -
+     * the collector walks the var graph, the value stack, the scope stack and
+     * the caches, none of which contain a C frame. Reactions run arbitrary page
+     * JS, and an explicit gc() (or a forced collection) fired from inside one
+     * ignores gc_defer, sweeps these arrays and the trailing var_unref() then
+     * reads freed memory. Park them as C-side roots for the whole loop. */
+    vm_push_c_root(vm, promise);
+    vm_push_c_root(vm, cbs);
+    vm_push_c_root(vm, prs);
     uint32_t n = var_array_size(cbs);
     if (getenv("MARIO_RSDBG") != NULL) {
         fprintf(stderr, "[rsdbg] drain promise=%p fulfilled=%d n=%u value=%p vtype=%d vrefs=%d\n",
@@ -586,6 +618,7 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
             var_unref(result);
         }
     }
+    vm_pop_c_roots(vm, 3);
     var_unref(cbs);
     var_unref(prs);
     promise_drain_unroot(vm, promise, pd);
@@ -1034,6 +1067,13 @@ var_t* native_PromiseAny(vm_t* vm, var_t* env, void* data) {
             pd->state = PROMISE_STATE_REJECTED;
             pd->value = var_ref(aggErr); /* pd owns one ref, matching Promise.all reject */
         }
+    } else {
+        /* An input fulfilled, so the loop broke early: `errors` may already hold
+         * refs on reasons collected from earlier rejections, but it is never
+         * adopted into an AggregateError on this path. Release it (which also
+         * drops the refs it took on those reasons) instead of leaking a refs=0
+         * array that the collector would later sweep out from under nothing. */
+        var_unref(errors);
     }
 
     var_t* proto = get_promise_proto(vm);
