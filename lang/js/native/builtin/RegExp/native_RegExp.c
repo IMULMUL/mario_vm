@@ -51,6 +51,7 @@ struct re_prog {
 	reinst_t* code;
 	int       ncode;
 	int       ngroups;   /* capture groups excluding group 0 */
+	char*     names[RE_MAXGROUPS]; /* (?<name>...) per group index, NULL if unnamed */
 	bool      icase, mline, dotall, global, sticky;
 };
 
@@ -76,6 +77,7 @@ typedef struct {
 	const char* p;
 	int pos, len;
 	int ngroups;
+	char* names[RE_MAXGROUPS];
 	bool icase;
 	const char* err;
 	int depth;
@@ -277,6 +279,7 @@ static renode_t* rp_class(reparse_t* r) {
 }
 
 static renode_t* rp_alt(reparse_t* r);
+static bool rp_braces(reparse_t* r, int* mn, int* mx);
 
 static renode_t* rp_atom(reparse_t* r) {
 	int c = rp_next(r);
@@ -284,19 +287,32 @@ static renode_t* rp_atom(reparse_t* r) {
 	case '(': {
 		uint8_t la_neg = 0;
 		bool capture = true, lookahead = false;
+		char* gname = NULL;
 		if(rp_peek(r) == '?') {
 			rp_next(r);
 			int k = rp_next(r);
 			if(k == ':') capture = false;
 			else if(k == '=') { lookahead = true; }
 			else if(k == '!') { lookahead = true; la_neg = 1; }
-			else if(k == '<') { r->err = "lookbehind not supported"; return NULL; }
+			else if(k == '<') {
+				if(rp_peek(r) == '=' || rp_peek(r) == '!') { r->err = "lookbehind not supported"; return NULL; }
+				/* named capture group (?<name>...) */
+				int ns = r->pos;
+				while(rp_peek(r) >= 0 && rp_peek(r) != '>') rp_next(r);
+				if(rp_peek(r) != '>' || r->pos == ns) { r->err = "bad group name"; return NULL; }
+				gname = (char*)malloc((size_t)(r->pos - ns + 1));
+				if(gname == NULL) { r->err = "oom"; return NULL; }
+				memcpy(gname, r->p + ns, (size_t)(r->pos - ns));
+				gname[r->pos - ns] = 0;
+				rp_next(r); /* '>' */
+			}
 			else { r->err = "bad group"; return NULL; }
 		}
 		int gidx = 0;
 		if(capture && !lookahead) {
-			if(r->ngroups + 1 >= RE_MAXGROUPS) { r->err = "too many groups"; return NULL; }
+			if(r->ngroups + 1 >= RE_MAXGROUPS) { free(gname); r->err = "too many groups"; return NULL; }
 			gidx = ++r->ngroups;
+			r->names[gidx] = gname;
 		}
 		if(++r->depth > RE_MAXDEPTH) { r->err = "pattern too deep"; return NULL; }
 		renode_t* body = rp_alt(r);
@@ -326,6 +342,23 @@ static renode_t* rp_atom(reparse_t* r) {
 			n->gidx = nc - '0';
 			return n;
 		}
+		if(nc == 'k' && r->pos + 1 < r->len && r->p[r->pos + 1] == '<') {
+			/* \k<name> back-reference to a named group declared earlier */
+			rp_next(r); rp_next(r);
+			int ns = r->pos;
+			while(rp_peek(r) >= 0 && rp_peek(r) != '>') rp_next(r);
+			if(rp_peek(r) != '>') { r->err = "bad named reference"; return NULL; }
+			int g, hit = 0, nl = r->pos - ns;
+			for(g = 1; g <= r->ngroups; g++) {
+				if(r->names[g] != NULL && (int)strlen(r->names[g]) == nl && strncmp(r->names[g], r->p + ns, (size_t)nl) == 0) { hit = g; break; }
+			}
+			rp_next(r); /* '>' */
+			if(hit == 0) { r->err = "unknown group name"; return NULL; }
+			renode_t* n = rn_new(N_BREF);
+			if(n == NULL) { r->err = "oom"; return NULL; }
+			n->gidx = hit;
+			return n;
+		}
 		int sh = 0;
 		int v = rp_escape(r, &sh);
 		if(sh != 0) {
@@ -343,7 +376,18 @@ static renode_t* rp_atom(reparse_t* r) {
 		n->ch = (uint32_t)v;
 		return n;
 	}
-	case ')': case '|': case '*': case '+': case '?': case '{':
+	case '{': {
+		/* Annex B: a '{' that does not start a valid quantifier is a literal
+		 * (e.g. /{(\d+)}/ used by vscode's nls formatter); one that does has
+		 * nothing to repeat. */
+		int mn, mx;
+		if(rp_braces(r, &mn, &mx)) { r->err = "nothing to repeat"; return NULL; }
+		renode_t* n = rn_new(N_CHAR);
+		if(n == NULL) { r->err = "oom"; return NULL; }
+		n->ch = (uint32_t)'{';
+		return n;
+	}
+	case ')': case '|': case '*': case '+': case '?':
 		r->err = "unexpected metacharacter";
 		return NULL;
 	default: {
@@ -621,10 +665,13 @@ re_prog_t* re_compile(const char* pattern, const char* flags, char* err, int err
 		if(err != NULL)
 			snprintf(err, errlen, "%s", r.err != NULL ? r.err : "unbalanced pattern");
 		rn_free(ast);
+		int g;
+		for(g = 0; g < RE_MAXGROUPS; g++) free(r.names[g]);
 		free(p);
 		return NULL;
 	}
 	p->ngroups = r.ngroups;
+	memcpy(p->names, r.names, sizeof(p->names)); /* ownership moves to prog */
 
 	reemit_t e;
 	memset(&e, 0, sizeof(e));
@@ -639,7 +686,7 @@ re_prog_t* re_compile(const char* pattern, const char* flags, char* err, int err
 	if(e.oom) {
 		if(err != NULL) snprintf(err, errlen, "oom");
 		free(e.code);
-		free(p);
+		re_free(p);
 		return NULL;
 	}
 	p->code = e.code;
@@ -656,10 +703,24 @@ void re_free(re_prog_t* p) {
 			free(p->code[i].cls);
 	}
 	free(p->code);
+	for(i = 0; i < RE_MAXGROUPS; i++)
+		free(p->names[i]);
 	free(p);
 }
 
 int re_ngroups(re_prog_t* p) { return p != NULL ? p->ngroups : 0; }
+const char* re_group_name(re_prog_t* p, int g) {
+	return (p != NULL && g > 0 && g < RE_MAXGROUPS) ? p->names[g] : NULL;
+}
+int re_group_by_name(re_prog_t* p, const char* name, int namelen) {
+	int g;
+	if(p == NULL) return 0;
+	for(g = 1; g <= p->ngroups; g++) {
+		if(p->names[g] != NULL && (int)strlen(p->names[g]) == namelen && strncmp(p->names[g], name, (size_t)namelen) == 0)
+			return g;
+	}
+	return 0;
+}
 bool re_flag_global(re_prog_t* p) { return p != NULL && p->global; }
 bool re_flag_sticky(re_prog_t* p) { return p != NULL && p->sticky; }
 
@@ -938,21 +999,48 @@ var_t* native_RegExpTest(vm_t* vm, var_t* env, void* data) {
 	return var_new_bool(vm, hit);
 }
 
-/* Build the exec()/match() result array: [full, g1..gn] + index/input. */
+/* Build the exec()/match() result array: [full, g1..gn] + index/input
+ * (+ groups when the pattern has named captures). */
+var_t* js_regexp_result_array2(vm_t* vm, const char* s, int* caps, re_prog_t* p) {
+	int ngroups = re_ngroups(p);
+	var_t* arr = var_new_array(vm);
+	var_t* groups = NULL;
+	int g;
+	for(g = 0; g <= ngroups; g++) {
+		int gs = caps[g * 2], ge = caps[g * 2 + 1];
+		var_t* v;
+		if(gs >= 0 && ge >= gs)
+			v = var_new_str2(vm, s + gs, (uint32_t)(ge - gs));
+		else
+			v = var_new(vm);   /* undefined */
+		var_array_add(arr, v);
+		const char* nm = re_group_name(p, g);
+		if(nm != NULL) {
+			if(groups == NULL) {
+				groups = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
+				var_add(arr, "groups", groups);
+			}
+			var_add(groups, nm, v);
+		}
+	}
+	if(groups == NULL)
+		var_add(arr, "groups", var_new(vm));
+	var_add(arr, "index", var_new_int(vm, caps[0]));
+	var_add(arr, "input", var_new_str(vm, s));
+	return arr;
+}
+
 var_t* js_regexp_result_array(vm_t* vm, const char* s, int* caps, int ngroups) {
 	var_t* arr = var_new_array(vm);
 	int g;
 	for(g = 0; g <= ngroups; g++) {
 		int gs = caps[g * 2], ge = caps[g * 2 + 1];
-		if(gs >= 0 && ge >= gs) {
-			mstr_t* sub = mstr_new("");
-			mstr_ncpy(sub, s + gs, (uint32_t)(ge - gs));
-			var_array_add(arr, var_new_str(vm, sub->cstr));
-			mstr_free(sub);
-		}
+		if(gs >= 0 && ge >= gs)
+			var_array_add(arr, var_new_str2(vm, s + gs, (uint32_t)(ge - gs)));
 		else
 			var_array_add(arr, var_new(vm));   /* undefined */
 	}
+	var_add(arr, "groups", var_new(vm));
 	var_add(arr, "index", var_new_int(vm, caps[0]));
 	var_add(arr, "input", var_new_str(vm, s));
 	return arr;
@@ -976,7 +1064,7 @@ var_t* native_RegExpExec(vm_t* vm, var_t* env, void* data) {
 		re_free(p);
 		return var_new_null(vm);
 	}
-	var_t* arr = js_regexp_result_array(vm, s, caps, re_ngroups(p));
+	var_t* arr = js_regexp_result_array2(vm, s, caps, p);
 	re_free(p);
 	return arr;
 }

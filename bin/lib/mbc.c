@@ -92,7 +92,7 @@ static bool load_mbc(int fd, vm_t* vm) {
 			return false;
 		}		
 		s[len] = 0;
-		array_add(&vm->bc.mstr_table, s);
+		bc_addstr(&vm->bc, s);
 		//mario_free(s);
 	}
 

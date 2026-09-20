@@ -197,6 +197,11 @@ int main(int argc, char** argv) {
 				}
 				else  {
 					vm_run(vm);
+					/* A throw that reaches the script top ends vm_run with the
+					 * error still pending; report it like the embedders do,
+					 * otherwise the run just ends silently with exit 0. */
+					if(vm->propagating_err != NULL)
+						vm_report_uncaught(vm);
 					host_task_drain(vm);
 				}
 			}

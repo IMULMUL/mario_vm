@@ -31,8 +31,12 @@ typedef void (*free_func_t)(void* p);
 
 typedef struct st_array {
 	void**     items;
-	uint32_t   max: 16;
-	uint32_t   size: 16;
+	/* Full 32-bit counts. The former 16-bit bitfields wrapped silently at 65535
+	 * entries: the bytecode string table of a large bundle (and any JS array
+	 * past 64K elements) overwrote slot 0 and corrupted the table. Same struct
+	 * size as before (8 + 4 + 4). */
+	uint32_t   max;
+	uint32_t   size;
 } m_array_t;
 
 m_array_t*  array_new(void);
@@ -84,8 +88,11 @@ void        hash_map_iterate(hash_map_t* map, void (*callback)(const char* key, 
 
 typedef struct st_mstr {
 	char*               cstr;
-	uint32_t            max: 16;
-	uint32_t            len: 16;
+	/* Full 32-bit lengths: the old 16-bit bitfields silently capped every mstr at
+	 * 64 KB (module sources fetched through _load_m_func, large var_to_str
+	 * results). Same struct size as before (8 + 4 + 4). */
+	uint32_t            max;
+	uint32_t            len;
 } mstr_t;
 
 void        mstr_reset(mstr_t* str);
@@ -158,9 +165,17 @@ typedef uint16_t opr_code_t;
 typedef struct st_bytecode {
 	PC                  cindex;
 	m_array_t           mstr_table;
+	hash_map_t          mstr_index;    /* string -> (index+1); O(1) dedup for bc_getstrindex */
 	PC                 *code_buf;
 	uint32_t            buf_size;
 	PC                  jmptgt_marked; /* code_buf[0..jmptgt_marked) scanned for jump targets */
+	/* Opt-in (MARIO_SRCMAP=1) statement-level pc -> source-offset map used by
+	 * the uncaught-error report to point into minified bundles. */
+	struct st_bc_srcmap_ent { PC pc; uint32_t pos; uint32_t src; } *srcmap;
+	uint32_t            srcmap_size, srcmap_max;
+	m_array_t           srcs;          /* private copies of every compiled source (char*) */
+	uint32_t            srcmap_cur;    /* id of the source being compiled */
+	bool                srcmap_on;
 } bytecode_t;
 
 /*
@@ -353,8 +368,11 @@ typedef struct st_bytecode {
 #define INSTR_FINALLY_END  0x099 // FINALLY_END : end of a `finally` block; resumes a return/break/continue that was deferred to run this finally (see vm_t.pending_op)
 #define INSTR_FUNC_NAMED   0x09A // FUNC_NAMED name : define a NAMED function EXPRESSION; the operand is the function's own name, bound to itself in its per-call scope so the body can self-reference it (ES named-function-expression semantics), while staying invisible outside
 #define INSTR_LOADV        0x09B // LOADV x : like LOAD, but pushes the binding's CURRENT VALUE (a snapshot) instead of the binding node. Source-level rvalue reads of a bare identifier use this so an operand already on the value stack is not aliased by a later reassignment of the same binding (e.g. `f(m, m++, m)` must pass m's pre-increment value as the first argument). Write targets keep the node form (LOADW).
+#define INSTR_MODULE_V     0x09C // MODULE_V : pop a specifier string (dynamic `import(expr)`), ensure that module is loaded/evaluated, push its namespace object
+#define INSTR_IMPORT_META  0x09D // IMPORT_META : push the `import.meta` object of the running module ({url}); a fresh object for a non-module script
+#define INSTR_STATIC_BLK   0x09E // STATIC_BLK : pop a hidden zero-arg function (class `static { ... }` body) and run it once with `this` = the class under definition
 
-#define INSTR_MAX          0x09C // Maximum instruction opcode value
+#define INSTR_MAX          0x09F // Maximum instruction opcode value
 
 /* vm_t.pending_op: the kind of control transfer parked while a `finally` block
  * runs (see the pending_value comment in the vm struct). */
@@ -376,6 +394,11 @@ PC          bc_gen_short(bytecode_t* bc, opr_code_t instr, int32_t i);
 void        bc_set_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 void        bc_remove_instr(bytecode_t* bc, PC from, uint32_t num);
 uint32_t    bc_getstrindex(bytecode_t* bc, const char* str);
+uint32_t    bc_addstr(bytecode_t* bc, char* owned_str); /* append (takes ownership) + index */
+/* pc -> source map (no-ops unless MARIO_SRCMAP is set in the environment) */
+void        bc_srcmap_begin(bytecode_t* bc, const char* src);       /* new source being compiled */
+void        bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos);     /* statement starts at pos */
+bool        bc_srcmap_locate(bytecode_t* bc, PC pc, mstr_t* out);   /* "src#n line:col | snippet" */
 PC          bc_add_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 PC          bc_reserve(bytecode_t* bc);
 
@@ -827,6 +850,12 @@ typedef struct st_vm {
 	 * Both are borrowed pointers - the registry member owns the only reference. */
 	var_t*              modules;
 	var_t*              cur_module;
+	/* Specifier (resolved, e.g. an absolute URL) of the module whose body is
+	 * running; NULL for the top-level script unless the embedder sets it. The
+	 * module resolver hook reads it as the base for relative specifiers and
+	 * `import.meta.url` reports it. Borrowed: points into the registry key of
+	 * cur_module, or at embedder-owned storage for the top-level script. */
+	const char*         cur_module_spec;
 
 	void                (*on_init)(struct st_vm* vm);
 	m_array_t           init_natives;
@@ -895,6 +924,12 @@ typedef struct st_vm {
 
 typedef mstr_t* (*load_m_func_t)(struct st_vm *, const char* jsname);
 extern load_m_func_t _load_m_func;
+/* Optional module specifier resolver: maps `spec` as written in the importing
+ * module (whose own specifier is `base`, may be NULL) to the canonical key the
+ * registry and the loader use (an absolute URL in a browser embedding). Returns
+ * a new mstr_t owned by the caller, or NULL to keep `spec` as-is. */
+typedef mstr_t* (*resolve_m_func_t)(struct st_vm *, const char* spec, const char* base);
+extern resolve_m_func_t _resolve_m_func;
 
 node_t*     node_new(vm_t* vm, const char* name, var_t* var);
 void        node_free(void* p);
@@ -962,6 +997,7 @@ func_t*     var_get_func(var_t* var);
  * Returns a baseline refs==0 var, the same contract var-returning natives obey.
  * Used by Function.prototype.bind to mint a bound-function object. */
 var_t*      var_new_native_func(vm_t* vm, native_func_t native, void* data);
+bool        var_make_native_func(vm_t* vm, var_t* var, native_func_t native, void* data);
 var_t*      var_get_prototype(var_t* var);
 void        var_set_prototype(var_t* var, var_t* proto);
 /* Object.setPrototypeOf on a function/class: record the [[Prototype]] in the

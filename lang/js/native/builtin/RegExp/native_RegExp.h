@@ -22,6 +22,8 @@ re_prog_t* re_compile(const char* pattern, const char* flags, char* err, int err
 void       re_free(re_prog_t* p);
 
 int  re_ngroups(re_prog_t* p);      /* number of capture groups (excl. group 0) */
+const char* re_group_name(re_prog_t* p, int g);   /* (?<name>) of group g, or NULL */
+int  re_group_by_name(re_prog_t* p, const char* name, int namelen); /* 0 if unknown */
 bool re_flag_global(re_prog_t* p);
 bool re_flag_sticky(re_prog_t* p);
 
@@ -36,6 +38,8 @@ bool js_regexp_is(var_t* v);
 /* Build the exec()-shaped result array [full, g1..gn] + index/input from a
  * successful re_match(). Shared with String.match(). */
 var_t* js_regexp_result_array(vm_t* vm, const char* s, int* caps, int ngroups);
+/* Same, plus a `groups` object when the program has named captures. */
+var_t* js_regexp_result_array2(vm_t* vm, const char* s, int* caps, re_prog_t* p);
 
 void reg_native_RegExp(vm_t* vm);
 

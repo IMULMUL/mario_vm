@@ -271,7 +271,20 @@ void lex_get_reserved_word(lex_t* lex) {
     } else if (strcmp(lex->tk_str->cstr, "instanceof") == 0) {
         lex->tk = LEX_R_INSTANCEOF;
     } else if (strcmp(lex->tk_str->cstr, "async") == 0) {
-        lex->tk = LEX_R_ASYNC;
+        /* `async` is a contextual keyword, not reserved: `function f(a, async)`,
+         * `{async: 1}` and `x.async` all use it as a plain name. Treat it as the
+         * keyword only when the same line continues with something an async
+         * function/arrow head starts with: `function`, a parameter name, a
+         * `(` parameter list, `*` (async generator method) or `[` (computed
+         * method key). Read head invariant: curr_ch == data[data_pos-2]. */
+        int32_t p = lex->data_pos - 2;
+        while (p < lex->data_end && (lex->data[p] == ' ' || lex->data[p] == '\t')) {
+            p++;
+        }
+        char c = (p < lex->data_end) ? lex->data[p] : 0;
+        if (is_alpha((unsigned char)c) || c == '_' || c == '$' || c == '(' || c == '*' || c == '[') {
+            lex->tk = LEX_R_ASYNC;
+        }
     } else if (strcmp(lex->tk_str->cstr, "await") == 0) {
         lex->tk = LEX_R_AWAIT;
     } else if (strcmp(lex->tk_str->cstr, "delete") == 0) {
@@ -861,6 +874,14 @@ static bool compile_captured_expr(const char* src, bytecode_t* bc) {
     return ok;
 }
 
+/* Destructuring assignment in expression position (defined with the other
+ * destructuring helpers below; used by factor()). */
+static bool destructure_assign_ex(lex_t* l, bytecode_t* bc, opr_code_t op, bool leave_value);
+static bool peek_is_destr_assign(lex_t* l);
+
+/* Source buffer of the js_compile() currently running (MARIO_SRCMAP keying). */
+static const char* g_srcmap_data = NULL;
+
 /** Non-zero while compiling the body of an `async` function. Used by
  *  stmt_return / func_params_and_body to wrap the returned value in a
  *  resolved Promise (Promise.resolve). Entering any function body resets it
@@ -871,6 +892,16 @@ static int g_async_depth = 0;
  * consumed by factor_def_func / factor_def_afunc to establish g_async_depth
  * for that body and then cleared, so nested definitions default to sync. */
 static int g_async_pending = 0;
+
+/* Set to 1 when the class-body parser has already consumed a `static`
+ * keyword (needed to look past it for `async` / `{`); factor_def_func
+ * consumes it exactly like an in-place `static` token. */
+static int g_static_pending = 0;
+
+/* Set to 1 when the class-body parser consumed the `*` of a generator method
+ * ahead of a computed key (`*[Symbol.iterator]() {}`); factor_def_func
+ * consumes it exactly like an in-place `*` token. */
+static int g_gen_pending = 0;
 
 /* Set to 1 while defining a function EXPRESSION (base()). factor_def_func then
  * emits INSTR_FUNC_NAMED carrying the expression's own name so the VM can bind
@@ -1187,7 +1218,8 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
     int saved_async = g_async_depth;
     g_async_depth = g_async_pending;
     g_async_pending = 0;
-    bool is_static = false;
+    bool is_static = g_static_pending != 0;
+    g_static_pending = 0;
     lex_skip_empty(l);
 
     if (l->tk == LEX_R_STATIC) {
@@ -1199,7 +1231,8 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
 
     /* ES6 generator: `function*` or a `*method()` shorthand. The star precedes
      * the (optional) name, so detect it here before reading the name. */
-    bool is_gen = false;
+    bool is_gen = g_gen_pending != 0;
+    g_gen_pending = 0;
     lex_skip_empty(l);
     if (l->tk == '*') {
         if (!lex_chkread(l, '*')) {
@@ -1225,17 +1258,20 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
             return false;
         }
     }
-    if (l->tk == LEX_ID) { //class get/set token
+    if (l->tk == LEX_ID || (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END &&
+                            (strcmp(name->cstr, "get") == 0 || strcmp(name->cstr, "set") == 0))) {
+        /* class get/set token; the accessor name may itself be a reserved
+         * word (`get class(){}`, `set default(v){}`). */
+        int ntk = l->tk;
         if (strcmp(name->cstr, "get") == 0) {
             mstr_cpy(name, l->tk_str->cstr);
-            if (!lex_chkread(l, LEX_ID)) {
+            if (!lex_chkread(l, ntk)) {
                 return false;
             }
             bc_gen(bc, INSTR_FUNC_GET);
-        }
-        if (strcmp(name->cstr, "set") == 0) {
+        } else if (strcmp(name->cstr, "set") == 0) {
             mstr_cpy(name, l->tk_str->cstr);
-            if (!lex_chkread(l, LEX_ID)) {
+            if (!lex_chkread(l, ntk)) {
                 return false;
             }
             bc_gen(bc, INSTR_FUNC_SET);
@@ -1480,6 +1516,85 @@ bool factor_def_class(lex_t* l, bytecode_t* bc) {
              * the method value; INSTR_MEMBERV pops (value, key) and defines the
              * member with the runtime key. */
             bool computed_name = false;
+            bool static_member = false;
+            /* `static` is consumed here (not in factor_def_func) so the class
+             * body can look past it for `static async m(){}`, `static [k](){}`
+             * and the ES2022 static initialization block `static { ... }`. */
+            if (l->tk == LEX_R_STATIC) {
+                if (!lex_chkread(l, LEX_R_STATIC)) {
+                    mstr_free(name);
+                    return false;
+                }
+                lex_skip_empty(l);
+                if (l->tk == '{') {
+                    /* Static block: compile the body as a hidden zero-arg
+                     * function and run it once, right now, with `this` bound
+                     * to the class (INSTR_STATIC_BLK). */
+                    static uint32_t sblk_id = 0;
+                    char fnn[40];
+                    snprintf(fnn, sizeof(fnn), "@static$%u", sblk_id++);
+                    bc_gen_str(bc, INSTR_FUNC, fnn);
+                    PC pc = bc_reserve(bc);
+                    int saved_async = g_async_depth;
+                    g_async_depth = 0;
+                    bool ok = stmt_block(l, bc, true);
+                    g_async_depth = saved_async;
+                    if (!ok) {
+                        mstr_free(name);
+                        return false;
+                    }
+                    bc_gen(bc, INSTR_RETURN);
+                    bc_set_instr(bc, pc, INSTR_JMP, ILLEGAL_PC);
+                    bc_gen(bc, INSTR_STATIC_BLK);
+                    lex_skip_empty(l);
+                    if (l->tk == ';') {
+                        lex_chkread(l, ';');
+                        lex_skip_empty(l);
+                    }
+                    continue;
+                }
+                static_member = true;
+            }
+            /* ES async class method: `async foo() {...}` / `async *gen() {...}`.
+             * Consumed here so a computed key (`async [k]()`) can follow. */
+            bool async_member = false;
+            if (l->tk == LEX_R_ASYNC) {
+                if (!lex_chkread(l, LEX_R_ASYNC)) {
+                    mstr_free(name);
+                    return false;
+                }
+                lex_skip_empty(l);
+                if (l->tk == '(') {
+                    /* A method literally named `async` (`async(){...}`): the
+                     * lexer keyworded it because `(` follows. Define it as a
+                     * plain method of that name. */
+                    mstr_cpy(name, "async");
+                    int saved_async = g_async_depth;
+                    g_async_depth = 0;
+                    bc_gen(bc, static_member ? INSTR_FUNC_STC : INSTR_FUNC);
+                    bool ok = func_params_and_body(l, bc);
+                    g_async_depth = saved_async;
+                    if (!ok) {
+                        mstr_free(name);
+                        return false;
+                    }
+                    lex_skip_empty(l);
+                    bc_gen_str(bc, INSTR_MEMBERN, name->cstr);
+                    continue;
+                }
+                async_member = true;
+            }
+            /* Generator method with a computed key: `*[Symbol.iterator]() {}`.
+             * A `*` before a plain name is handled by factor_def_func itself. */
+            bool gen_member = false;
+            if (l->tk == '*') {
+                if (!lex_chkread(l, '*')) {
+                    mstr_free(name);
+                    return false;
+                }
+                lex_skip_empty(l);
+                gen_member = true;
+            }
             /* `get [expr]() {}` / `set [expr](v) {}`: accessor keyword followed
              * by a computed key - the accessor marker must be emitted before
              * the key so the stack ends up (key, fn) for INSTR_MEMBERV. */
@@ -1524,17 +1639,13 @@ bool factor_def_class(lex_t* l, bytecode_t* bc) {
                 lex_skip_empty(l);
                 computed_name = true;
             }
-            /* ES async class method: `async foo() {...}`. */
-            if (l->tk == LEX_R_ASYNC) {
-                if (!lex_chkread(l, LEX_R_ASYNC)) {
-                    mstr_free(name);
-                    return false;
-                }
-                lex_skip_empty(l);
-                g_async_pending = 1;
-            }
+            g_async_pending = async_member ? 1 : 0;
+            g_gen_pending = gen_member ? 1 : 0;
+            g_static_pending = static_member ? 1 : 0;
             if (!factor_def_func(l, bc, name)) {
                 g_async_pending = 0;
+                g_gen_pending = 0;
+                g_static_pending = 0;
                 mstr_free(name);
                 return false;
             }
@@ -1941,10 +2052,11 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
 
         /* ES6 accessor in an object literal: `get name() {...}` /
          * `set name(v) {...}`. Told apart from a method or property literally
-         * named get/set by requiring a property-name token (ID or string) to
-         * follow the keyword. */
+         * named get/set by requiring a property-name token (ID, string,
+         * number or reserved word) to follow the keyword. */
         if ((strcmp(id->cstr, "get") == 0 || strcmp(id->cstr, "set") == 0) &&
-            (l->tk == LEX_ID || l->tk == LEX_STR)) {
+            (l->tk == LEX_ID || l->tk == LEX_STR || l->tk == LEX_INT || l->tk == LEX_FLOAT ||
+             (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END))) {
             bool is_get = (strcmp(id->cstr, "get") == 0);
             mstr_t* prop = mstr_new(l->tk_str->cstr);
             LEX_TYPES kt = (LEX_TYPES)l->tk;
@@ -2198,47 +2310,35 @@ bool factor_template(lex_t* l, bytecode_t* bc) {
     return true;
 }
 
-/* Skip a `${...}` substitution at the character level (no compilation),
- * tracking brace nesting and string/template literals. Assumes l->curr_ch is
- * the '$'. On return l->curr_ch is the char just past the matching '}'. */
+/* Skip a `${...}` substitution (no compilation). Assumes l->curr_ch is the '$'.
+ * On return l->curr_ch is the char just past the matching '}'.
+ * Token-based on purpose: the former character-level scan treated any quote
+ * inside the substitution as a string opener, so a regex literal holding a bare
+ * quote (`${s.replace(/'/g,"''")}`) swallowed the rest of the clause and the
+ * two-pass switch compiler desynced, failing far away from the real cause.
+ * skip_advance() already knows regex-vs-division context, strings and nested
+ * templates, so the lexer decides what a quote means. */
+static bool skip_advance(lex_t* l, uint32_t* prev);
 static void skip_template_subst(lex_t* l) {
     lex_get_nextch(l); // consume '$' -> curr_ch == '{'
     lex_get_nextch(l); // consume '{' -> curr_ch == first char inside
+    lex_get_next_token(l); // first token of the substitution
     int depth = 1;
-    while (l->curr_ch && depth > 0) {
-        char c = l->curr_ch;
-        if (c == '"' || c == '\'' || c == '`') {
-            char q = c;
-            lex_get_nextch(l);
-            while (l->curr_ch && l->curr_ch != q) {
-                if (l->curr_ch == '\\') {
-                    lex_get_nextch(l);
-                    if (l->curr_ch) {
-                        lex_get_nextch(l);
-                    }
-                    continue;
-                }
-                if (q == '`' && l->curr_ch == '$' && l->next_ch == '{') {
-                    skip_template_subst(l);
-                    continue;
-                }
-                lex_get_nextch(l);
-            }
-            if (l->curr_ch == q) {
-                lex_get_nextch(l);
-            }
-            continue;
-        }
-        if (c == '{') {
+    uint32_t prev = 0; // regex context: a leading '/' is a regex literal
+    while (l->tk != LEX_EOF && depth > 0) {
+        if (l->tk == '{') {
             depth++;
-        } else if (c == '}') {
+        } else if (l->tk == '}') {
             depth--;
             if (depth <= 0) {
-                lex_get_nextch(l); // consume the closing '}'
+                /* The '}' token is consumed; the lexer already advanced
+                 * curr_ch to the character right after it. */
                 return;
             }
         }
-        lex_get_nextch(l);
+        if (!skip_advance(l, &prev)) {
+            return;
+        }
     }
 }
 
@@ -2652,10 +2752,79 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         factor_def_func(l, bc, fname);
         g_func_selfname = 0;
         mstr_free(fname);
+    } else if (l->tk == LEX_R_IMPORT && !member) {
+        /* `import` in expression position: dynamic `import(spec)` or
+         * `import.meta`. Declarative import statements never reach factor()
+         * (statement() routes them to stmt_import), so anything else here is
+         * a syntax error. */
+        if (!lex_chkread(l, LEX_R_IMPORT)) {
+            return false;
+        }
+        if (l->tk == '(') {
+            /* import(spec) => Promise.resolve(<MODULE_V spec>): the module is
+             * loaded synchronously by the loader hook; wrapping keeps the
+             * caller's .then()/await contract. Stack shape for CALLO: the
+             * receiver (Promise) below the single argument. */
+            if (!lex_chkread(l, '(')) {
+                return false;
+            }
+            lex_skip_empty(l);
+            bc_gen_str(bc, INSTR_LOAD, "Promise");
+            if (!base(l, bc)) {
+                return false;
+            }
+            lex_skip_empty(l);
+            if (l->tk == ',') { /* import(spec, options): options ignored */
+                if (!lex_chkread(l, ',')) {
+                    return false;
+                }
+                lex_skip_empty(l);
+                if (l->tk != ')') {
+                    if (!base(l, bc)) {
+                        return false;
+                    }
+                    bc_gen(bc, INSTR_POP);
+                    lex_skip_empty(l);
+                }
+            }
+            if (!lex_chkread(l, ')')) {
+                return false;
+            }
+            bc_gen(bc, INSTR_MODULE_V);
+            bc_gen_str(bc, INSTR_CALLO, "resolve$1");
+        } else if (l->tk == '.') {
+            if (!lex_chkread(l, '.')) {
+                return false;
+            }
+            if (l->tk != LEX_ID || strcmp(l->tk_str->cstr, "meta") != 0) {
+                if (!g_hoist_quiet) {
+                    mario_printf("import: expected 'meta' or '('! ");
+                    compile_error_pos(l, -1);
+                }
+                return false;
+            }
+            if (!lex_chkread(l, LEX_ID)) {
+                return false;
+            }
+            bc_gen(bc, INSTR_IMPORT_META);
+        } else {
+            if (!g_hoist_quiet) {
+                mario_printf("import: expected 'meta' or '('! ");
+                compile_error_pos(l, -1);
+            }
+            return false;
+        }
     } else if (l->tk == LEX_R_CLASS) { //define class
         factor_def_class(l, bc);
     } else if (l->tk == LEX_R_NEW) { //new object
         if (!factor_new(l, bc)) {
+            return false;
+        }
+    } else if ((l->tk == '{' || l->tk == '[') && peek_is_destr_assign(l)) {
+        /* `({a, b} = obj)` / `x && ([a, b] = pair)`: destructuring assignment
+         * used as an expression (an object/array literal can never be directly
+         * followed by `=`). Bind the leaves and leave the RHS value on the stack. */
+        if (!destructure_assign_ex(l, bc, 0, true)) {
             return false;
         }
     } else if (l->tk == '{') { // JSON-style object definition
@@ -2747,13 +2916,34 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             if (!lex_chkread(l, LEX_OPTCHAIN)) {
                 return false;
             }
-            if (l->tk == LEX_ID) {
+            if (l->tk == LEX_ID || (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END)) {
+                /* A reserved word is a legal member name here too (`x?.import`,
+                 * `x?.default`); its source text is still in tk_str. */
                 mstr_t* name = mstr_new(l->tk_str->cstr);
-                if (!lex_chkread(l, LEX_ID)) {
+                int tk = l->tk;
+                if (!lex_chkread(l, tk)) {
                     mstr_free(name);
                     return false;
                 }
-                bc_gen_str(bc, INSTR_OPT_GET, name->cstr);
+                if (l->tk == '(') {
+                    /* Optional method call `base?.m(args)`. The base stays on
+                     * the stack as the receiver so `this` binds like `base.m()`
+                     * (CALLO); a nullish base short-circuits to undefined
+                     * without evaluating the arguments. Same guard layout as
+                     * the `?.(` / `?.[` forms below. */
+                    PC pc_guard = bc_reserve(bc);
+                    bc_gen(bc, INSTR_UNDEF);
+                    PC pc_skip = bc_reserve(bc);
+                    PC pc_body = bc->cindex;
+                    if (!factor_call_func(l, bc, name, true)) {
+                        mstr_free(name);
+                        return false;
+                    }
+                    bc_set_instr(bc, pc_skip, INSTR_JMP, ILLEGAL_PC);
+                    bc_set_instr(bc, pc_guard, INSTR_NULLISH, pc_body);
+                } else {
+                    bc_gen_str(bc, INSTR_OPT_GET, name->cstr);
+                }
                 mstr_free(name);
             } else if (l->tk == '(' || l->tk == '[') {
                 /* ES2020 optional call `base?.(args)` and optional index
@@ -3570,6 +3760,99 @@ static bool skip_balanced_pattern(lex_t* l) {
     }
 }
 
+/* Assignment-form destructuring may target any member expression:
+ * `[this._a, o.b.value, arr[i]] = f()`. The leading identifier token has
+ * already been read into l->tk_str; capture the rest of the target text up to
+ * the element terminator (`,` / closing bracket / a single `=` starting the
+ * default) at nesting depth 0. Returns false if the target is a plain
+ * identifier (nothing captured). Strings and computed keys are carried over
+ * verbatim so `a["x"]` / `a[i+1]` survive. */
+static bool scan_member_target(lex_t* l, mstr_t* out) {
+    if (l->curr_ch != '.' && l->curr_ch != '[' && !(l->curr_ch == '?' && l->next_ch == '.')) {
+        return false;
+    }
+    mstr_cpy(out, l->tk_str->cstr);
+    int depth = 0;
+    while (l->curr_ch) {
+        char c = l->curr_ch;
+        if (c == '"' || c == '\'' || c == '`') {
+            char q = c;
+            mstr_add(out, c);
+            lex_get_nextch(l);
+            while (l->curr_ch && l->curr_ch != q) {
+                if (l->curr_ch == '\\') {
+                    mstr_add(out, l->curr_ch);
+                    lex_get_nextch(l);
+                }
+                if (l->curr_ch) {
+                    mstr_add(out, l->curr_ch);
+                    lex_get_nextch(l);
+                }
+            }
+            if (l->curr_ch == q) {
+                mstr_add(out, l->curr_ch);
+                lex_get_nextch(l);
+            }
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            if (depth == 0) {
+                break;
+            }
+            depth--;
+        } else if (depth == 0 && (c == ',' || (c == '=' && l->next_ch != '='))) {
+            break;
+        }
+        mstr_add(out, c);
+        lex_get_nextch(l);
+    }
+    lex_get_next_token(l); // l->tk becomes the terminator token
+    return true;
+}
+
+/* Emit `<target_ex> = <rhs_src>` for a member-expression leaf target by
+ * compiling the assignment text through base(), so the member write goes via
+ * the regular WANCHOR/WTARGET (setter-aware) path instead of a raw GET+ASIGN,
+ * which does not resolve a fetched member as a write target. */
+static bool destr_assign_member(bytecode_t* bc, mstr_t* target_ex, const char* rhs_src) {
+    mstr_t* asg = mstr_new(target_ex->cstr);
+    mstr_append(asg, "=(");
+    mstr_append(asg, rhs_src);
+    mstr_append(asg, ")");
+    bool ok = compile_captured_expr(asg->cstr, bc);
+    mstr_free(asg);
+    if (ok) {
+        bc_gen(bc, INSTR_POP);
+    }
+    return ok;
+}
+
+/* Build the source-text accessor `<src>[idx]` / `<src>[<comp_var>]` /
+ * `<src>["key"]` used as the RHS of a member-target binding. */
+static void destr_rhs_text(mstr_t* out, const char* src, bool is_array, int idx,
+                           const char* comp_var, const char* keyname) {
+    mstr_cpy(out, src);
+    mstr_add(out, '[');
+    if (is_array) {
+        mstr_append(out, mstr_from_int(idx, 10));
+    } else if (comp_var[0]) {
+        mstr_append(out, comp_var);
+    } else {
+        mstr_add(out, '"');
+        const char* p;
+        for (p = keyname; *p; p++) {
+            if (*p == '"' || *p == '\\') {
+                mstr_add(out, '\\');
+            }
+            mstr_add(out, *p);
+        }
+        mstr_add(out, '"');
+    }
+    mstr_add(out, ']');
+}
+
 /* Recursively parse a destructuring pattern and emit bindings that read from
  * the variable named `src` (already declared and holding the source value).
  * `decl_op` is the declaration instruction for leaf targets (INSTR_VAR /
@@ -3716,6 +3999,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
         bool nested = false;
         char target[64];
         target[0] = 0;
+        mstr_t* target_ex = NULL; /* member-expression target (assignment form) */
 
         if (is_array) {
             /* the element itself is the target */
@@ -3724,7 +4008,14 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
             } else if (l->tk == LEX_ID) {
                 strncpy(target, l->tk_str->cstr, sizeof(target) - 1);
                 target[sizeof(target) - 1] = 0;
-                if (!lex_chkread(l, LEX_ID)) {
+                if (decl_op == 0) {
+                    target_ex = mstr_new("");
+                    if (!scan_member_target(l, target_ex)) {
+                        mstr_free(target_ex);
+                        target_ex = NULL;
+                    }
+                }
+                if (target_ex == NULL && !lex_chkread(l, LEX_ID)) {
                     return false;
                 }
             } else {
@@ -3741,7 +4032,14 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
             } else if (l->tk == LEX_ID) {
                 strncpy(target, l->tk_str->cstr, sizeof(target) - 1);
                 target[sizeof(target) - 1] = 0;
-                if (!lex_chkread(l, LEX_ID)) {
+                if (decl_op == 0) {
+                    target_ex = mstr_new("");
+                    if (!scan_member_target(l, target_ex)) {
+                        mstr_free(target_ex);
+                        target_ex = NULL;
+                    }
+                }
+                if (target_ex == NULL && !lex_chkread(l, LEX_ID)) {
                     return false;
                 }
             } else {
@@ -3830,6 +4128,42 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
                 mstr_free(skipex);
                 lex_get_next_token(l);
             }
+        } else if (target_ex != NULL) {
+            /* member-expression target (assignment form only) */
+            mstr_t* rhs = mstr_new("");
+            destr_rhs_text(rhs, src, is_array, my_idx, comp_var, keyname);
+            bool ok = destr_assign_member(bc, target_ex, rhs->cstr);
+            mstr_free(rhs);
+            if (!ok) {
+                mstr_free(target_ex);
+                return false;
+            }
+
+            /* per-element default: <target> = <expr> */
+            lex_skip_empty(l);
+            if (l->tk == '=') {
+                mstr_t* ex = mstr_new("");
+                if (scan_param_expr(l, ex) == 0) {
+                    mstr_free(ex);
+                    mstr_free(target_ex);
+                    return false;
+                }
+                lex_get_next_token(l);
+                ok = compile_captured_expr(target_ex->cstr, bc);
+                bc_gen(bc, INSTR_TYPEOF);
+                bc_gen_str(bc, INSTR_STR, "undefined");
+                bc_gen(bc, INSTR_TEQ);
+                PC pj = bc_reserve(bc);
+                ok = ok && destr_assign_member(bc, target_ex, ex->cstr);
+                mstr_free(ex);
+                if (!ok) {
+                    mstr_free(target_ex);
+                    return false;
+                }
+                bc_set_instr(bc, pj, INSTR_NJMP, ILLEGAL_PC);
+            }
+            mstr_free(target_ex);
+            target_ex = NULL;
         } else {
             if (decl_op) {
                 bc_gen_str(bc, decl_op, target);
@@ -3891,7 +4225,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
     return true;
 }
 
-static bool stmt_var_destructure(lex_t* l, bytecode_t* bc, opr_code_t op) {
+static bool destructure_assign_ex(lex_t* l, bytecode_t* bc, opr_code_t op, bool leave_value) {
     lex_t saved = *l;                 // pattern-start state (tk_str shared)
     mstr_t* saved_tk = l->tk_str;     // preserve caller token text
 
@@ -3927,8 +4261,35 @@ static bool stmt_var_destructure(lex_t* l, bytecode_t* bc, opr_code_t op) {
     bool ok = destructure_pattern(&pl, bc, op, tmp);
     mstr_free(pl.tk_str);
 
+    if (ok && leave_value) {
+        /* expression form: the assignment's value is the RHS itself */
+        bc_gen_str(bc, INSTR_LOAD, tmp);
+    }
     mstr_free(tmpm);
     return ok;
+}
+
+static bool stmt_var_destructure(lex_t* l, bytecode_t* bc, opr_code_t op) {
+    return destructure_assign_ex(l, bc, op, false);
+}
+
+/* Peek: does the `{`/`[` at the current token open a destructuring pattern that
+ * is followed by a single `=` (i.e. a destructuring ASSIGNMENT rather than an
+ * object/array literal)? The lexer is restored either way. */
+static bool peek_is_destr_assign(lex_t* l) {
+    lex_t saved = *l;
+    mstr_t* saved_str = mstr_new(l->tk_str->cstr);
+    bool is_destr = false;
+    if (skip_balanced_pattern(l)) {
+        lex_skip_empty(l);
+        if (l->tk == '=') {
+            is_destr = true;
+        }
+    }
+    *l = saved;
+    mstr_cpy(l->tk_str, saved_str->cstr);
+    mstr_free(saved_str);
+    return is_destr;
 }
 
 bool stmt_var(lex_t* l, bytecode_t* bc) {
@@ -4469,6 +4830,63 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             is_for_of = true;
             lex_chkread(l, LEX_ID); // consume "of"
             lex_skip_empty(l);
+        } else if (loop_destr) {
+            /* C-style for with a destructuring FIRST declarator, e.g.
+             *   for (var [r, d, c] = pair, o = 1, b = 0; ...; ...)
+             * The in/of probe above skipped the pattern as a throwaway for-of
+             * element temp; for a plain C-style loop that temp is wrong - the
+             * pattern's leaf variables would never be bound (they read back as
+             * undefined) and calling one as a function aborts the VM. Rewind
+             * the lexer to the pattern start and emit real leaf bindings the
+             * same way stmt_var() does, then finish any remaining declarators. */
+            mstr_free(loop_var);
+            loop_var = NULL;      // no element temp, no per-iteration binding
+            var_op = INSTR_VAR;   // suppress the per-iteration block emitted below
+            *l = pd_saved;        // rewind to the pattern's '[' / '{'
+            if (!stmt_var_destructure(l, bc, destr_op)) {
+                return false;
+            }
+            lex_skip_empty(l);
+            /* Remaining comma-separated declarators (patterns or plain names). */
+            while (l->tk == ',') {
+                if (!lex_chkread(l, ',')) {
+                    return false;
+                }
+                lex_skip_empty(l);
+                if (l->tk == '[' || l->tk == '{') {
+                    if (!stmt_var_destructure(l, bc, destr_op)) {
+                        return false;
+                    }
+                    lex_skip_empty(l);
+                    continue;
+                }
+                if (l->tk != LEX_ID) {
+                    return false;
+                }
+                mstr_t* extra = mstr_new(l->tk_str->cstr);
+                lex_chkread(l, LEX_ID);
+                bc_gen_str(bc, destr_op, extra->cstr);
+                if (g_vardecl_bc != NULL && destr_op == INSTR_VAR) {
+                    bc_gen_str(g_vardecl_bc, INSTR_VAR, extra->cstr); // ES5 var hoisting
+                }
+                if (l->tk == '=') {
+                    lex_chkread(l, '=');
+                    bc_gen_str(bc, INSTR_LOAD, extra->cstr);
+                    if (!base(l, bc)) {
+                        mstr_free(extra);
+                        return false;
+                    }
+                    bc_gen(bc, INSTR_ASIGN);
+                    bc_gen(bc, INSTR_POP);
+                }
+                mstr_free(extra);
+                lex_skip_empty(l);
+            }
+            if (l->tk != ';') {
+                return false;
+            }
+            lex_chkread(l, ';');
+            lex_skip_empty(l);
         } else {
             // Standard for loop variable initialization
             // Generate variable declaration bytecode
@@ -4906,6 +5324,20 @@ static void emit_import_binding(bytecode_t* bc, const char* spec, const char* sr
     bc_gen_str(bc, INSTR_IMPORT_BIND, dst);
 }
 
+/* True when the `import` token under the lexer starts an expression form
+ * (`import(` or `import.`) rather than a declaration. Peeks one token on a
+ * scratch copy and restores the lexer. */
+static bool import_is_expression(lex_t* l) {
+    lex_t saved = *l;
+    mstr_t* saved_str = mstr_new(l->tk_str->cstr);
+    lex_get_next_token(l); // consume 'import'
+    bool expr = (l->tk == '(' || l->tk == '.');
+    *l = saved;
+    mstr_cpy(l->tk_str, saved_str->cstr);
+    mstr_free(saved_str);
+    return expr;
+}
+
 bool stmt_import(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, LEX_R_IMPORT)) {
         return false;
@@ -5110,6 +5542,9 @@ static bool stmt_export_var(lex_t* l, bytecode_t* bc) {
         if (!is_stmt_end(l->tk)) {
             if (l->tk == ',') {
                 if (!lex_chkread(l, ',')) return false;
+            } else if (lex_had_newline(l) && !tk_continues_expr(l->tk)) {
+                /* ASI, as in stmt_var: `export var f = function(){}\nexport ..`. */
+                return true;
             } else {
                 return false;
             }
@@ -5142,6 +5577,33 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
         if (!lex_chkread(l, LEX_R_FUNCTION)) return false;
         mstr_t* fname = mstr_new("");
         if (!factor_def_func(l, dbc, fname)) {
+            mstr_free(fname);
+            return false;
+        }
+        bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);
+        bc_gen_str(bc, INSTR_EXPORT, fname->cstr);
+        mstr_free(fname);
+        return true;
+    }
+
+    /* export async function f(){} : same hoisting path as the plain form,
+     * with g_async_pending marking the body async. */
+    if (l->tk == LEX_R_ASYNC) {
+        if (!lex_chkread(l, LEX_R_ASYNC)) return false;
+        lex_skip_empty(l);
+        if (l->tk != LEX_R_FUNCTION) {
+            if (!g_hoist_quiet) {
+                mario_printf("export: expected 'function' after 'async'! ");
+                compile_error_pos(l, -1);
+            }
+            return false;
+        }
+        bytecode_t* dbc = (g_funcdecl_bc != NULL) ? g_funcdecl_bc : bc;
+        if (!lex_chkread(l, LEX_R_FUNCTION)) return false;
+        mstr_t* fname = mstr_new("");
+        g_async_pending = 1;
+        if (!factor_def_func(l, dbc, fname)) {
+            g_async_pending = 0;
             mstr_free(fname);
             return false;
         }
@@ -5572,7 +6034,9 @@ static bool compile_switch_body(lex_t* l, bytecode_t* bc) {
     return l->tk != LEX_EOF;
 }
 
-#define SWITCH_MAX_CASES 128
+/* Generated code (e.g. a CSS named-colour table) routinely has a few hundred
+ * cases in one switch; the anchor arrays are per-switch stack storage. */
+#define SWITCH_MAX_CASES 1024
 
 /* `switch (expr) { case E: ... default: ... }`.
  *
@@ -5847,6 +6311,13 @@ bool stmt_with(lex_t* l, bytecode_t* bc) {
 bool statement(lex_t* l, bytecode_t* bc) {
     bool pop = false;
 
+    /* MARIO_SRCMAP: record where this statement's code starts. Only the main
+     * source lexer counts - sub-lexers over captured text (default initialisers,
+     * rewritten fragments) have offsets that mean nothing in the file. */
+    if (bc->srcmap_on && l->data == g_srcmap_data && l->tk != '\n' && l->tk != ';') {
+        bc_srcmap_add(bc, bc->cindex, (uint32_t)l->tk_start);
+    }
+
     /* ES labeled statement: `label: <statement>` (checked first, since a label
      * starts with an identifier that would otherwise be an expression statement). */
     if (l->tk == LEX_ID && statement_is_label(l)) {
@@ -5892,6 +6363,19 @@ bool statement(lex_t* l, bytecode_t* bc) {
             /* decl_op = 0: the leaves are existing bindings, not new ones. */
             if (!stmt_var_destructure(l, bc, 0)) {
                 return false;
+            }
+            /* `[t,o]=f(o),e.push(t)`: the destructuring assignment may be the
+             * first operand of a comma sequence (common as a one-line loop
+             * body). Compile the remaining operands as an ordinary expression
+             * sequence and discard its value. */
+            if (l->tk == ',') {
+                if (!lex_chkread(l, ',')) {
+                    return false;
+                }
+                if (!expr_seq(l, bc)) {
+                    return false;
+                }
+                pop = true;
             }
             if (is_stmt_end(l->tk)) {
                 if (!lex_chkread_stmt_end(l)) {
@@ -5984,7 +6468,19 @@ bool statement(lex_t* l, bytecode_t* bc) {
             return false;
         }
     } else if (l->tk == LEX_R_IMPORT) {
-        if (!stmt_import(l, bc)) {
+        if (import_is_expression(l)) {
+            /* `import(spec).then(..)` / `import.meta.x` as an expression
+             * statement: factor() handles the import form. */
+            if (!expr_seq(l, bc)) {
+                return false;
+            }
+            if (is_stmt_end(l->tk)) {
+                if (!lex_chkread_stmt_end(l)) {
+                    return false;
+                }
+            }
+            pop = true;
+        } else if (!stmt_import(l, bc)) {
             return false;
         }
     } else if (l->tk == LEX_R_EXPORT) {
@@ -6044,6 +6540,9 @@ bool js_compile(bytecode_t *bc, const char* input) {
     lex_t lex;
     lex_init(&lex, input);
     lex_get_next_token(&lex);
+    const char* saved_srcmap_data = g_srcmap_data;
+    g_srcmap_data = input;
+    bc_srcmap_begin(bc, input);
 
     /* Hoist top-level function declarations (ES5 semantics). */
     bytecode_t scratch;
@@ -6068,6 +6567,7 @@ bool js_compile(bytecode_t *bc, const char* input) {
         }
     }
     hoist_end(&scratch, saved_redirect, saved_vardecl);
+    g_srcmap_data = saved_srcmap_data;
     
     if (ret) {
         bc_gen(bc, INSTR_END);

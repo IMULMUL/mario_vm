@@ -189,13 +189,21 @@ var_t* native_StringSubstr(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 
 	const char* s = get_str(env, THIS);
+	int len = (int)strlen(s);
 	int start = get_int(env, "start");
 	if(start < 0)
+		start += len;      /* negative start counts from the end */
+	if(start < 0)
 		start = 0;
+	if(start > len)
+		start = len;
 
-	int length = get_int(env, "length");
-	int sl = (int)strlen(s) - start;
-	if(sl <= 0)
+	int sl = len - start;
+	int length = sl;       /* omitted/undefined length: to the end */
+	var_t* lenVar = get_obj(env, "length");
+	if(lenVar != NULL && lenVar->type != V_UNDEF)
+		length = var_get_int(lenVar);
+	if(length <= 0 || sl <= 0)
 		return var_new_str(vm, "");
 	if(length > sl) 
 		length = sl;
@@ -466,10 +474,11 @@ static void str_re_append_n(mstr_t* out, const char* s, int n) {
 		mstr_add(out, s[i]);
 }
 
-/* Expand a replacement template: $$ $& $` $' $1..$99. An out-of-range or
- * unset group expands to "" (JS leaves the literal text only for $0/$-less
+/* Expand a replacement template: $$ $& $` $' $1..$99 $<name>. An out-of-range
+ * or unset group expands to "" (JS leaves the literal text only for $0/$-less
  * digits; keeping it simple and predictable here). */
-static void str_re_expand(mstr_t* out, const char* repl, const char* s, int slen, int* caps, int ng) {
+static void str_re_expand(mstr_t* out, const char* repl, const char* s, int slen, int* caps, re_prog_t* rp) {
+	int ng = re_ngroups(rp);
 	const char* p = repl;
 	while(*p != 0) {
 		if(*p == '$' && p[1] != 0) {
@@ -478,6 +487,16 @@ static void str_re_expand(mstr_t* out, const char* repl, const char* s, int slen
 			if(c == '&') { str_re_append_n(out, s + caps[0], caps[1] - caps[0]); p += 2; continue; }
 			if(c == '`') { str_re_append_n(out, s, caps[0]); p += 2; continue; }
 			if(c == '\'') { str_re_append_n(out, s + caps[1], slen - caps[1]); p += 2; continue; }
+			if(c == '<') {
+				const char* close = strchr(p + 2, '>');
+				if(close != NULL) {
+					int g = re_group_by_name(rp, p + 2, (int)(close - (p + 2)));
+					if(g > 0 && caps[g * 2] >= 0)
+						str_re_append_n(out, s + caps[g * 2], caps[g * 2 + 1] - caps[g * 2]);
+					p = close + 1;
+					continue;
+				}
+			}
 			if(c >= '1' && c <= '9') {
 				int g = c - '0';
 				int adv = 2;
@@ -498,22 +517,34 @@ static void str_re_expand(mstr_t* out, const char* repl, const char* s, int slen
 	}
 }
 
-/* Call a function replacement f(match, p1..pn, offset, string) and append its
- * string value. Runs inside a gc_defer window (transient args are unrooted,
- * same contract as the Array callback natives). */
+/* Call a function replacement f(match, p1..pn, offset, string[, groups]) and
+ * append its string value. Runs inside a gc_defer window (transient args are
+ * unrooted, same contract as the Array callback natives). */
 static void str_re_call_repl(vm_t* vm, var_t* env, var_t* f, mstr_t* out,
-		const char* s, int* caps, int ng) {
+		const char* s, int* caps, re_prog_t* rp) {
+	int ng = re_ngroups(rp);
 	vm->gc.gc_defer++;
 	var_t* args = var_new_array(vm);
+	var_t* groups = NULL;
 	int g;
 	for(g = 0; g <= ng; g++) {
+		var_t* v;
 		if(caps[g * 2] >= 0)
-			var_array_add(args, var_new_str2(vm, s + caps[g * 2], (uint32_t)(caps[g * 2 + 1] - caps[g * 2])));
+			v = var_new_str2(vm, s + caps[g * 2], (uint32_t)(caps[g * 2 + 1] - caps[g * 2]));
 		else
-			var_array_add(args, var_new(vm));
+			v = var_new(vm);
+		var_array_add(args, v);
+		const char* nm = re_group_name(rp, g);
+		if(nm != NULL) {
+			if(groups == NULL)
+				groups = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
+			var_add(groups, nm, v);
+		}
 	}
 	var_array_add(args, var_new_int(vm, caps[0]));
 	var_array_add(args, var_new_str(vm, s));
+	if(groups != NULL)
+		var_array_add(args, groups);
 	var_array_reverse(args);
 	var_t* res = call_m_func(vm, env, f, args);
 	var_unref(args);
@@ -540,7 +571,6 @@ static var_t* str_re_replace(vm_t* vm, var_t* env, var_t* re, bool force_all) {
 	var_t* replv = get_obj(env, "replacement");
 	bool is_fn = replv != NULL && replv->is_func != 0;
 	const char* repl = is_fn ? "" : get_str(env, "replacement");
-	int ng = re_ngroups(p);
 	int caps[RE_CAPS_MAX];
 	mstr_t* out = mstr_new("");
 	int pos = 0;
@@ -549,9 +579,9 @@ static var_t* str_re_replace(vm_t* vm, var_t* env, var_t* re, bool force_all) {
 			break;
 		str_re_append_n(out, s + pos, caps[0] - pos);
 		if(is_fn)
-			str_re_call_repl(vm, env, replv, out, s, caps, ng);
+			str_re_call_repl(vm, env, replv, out, s, caps, p);
 		else
-			str_re_expand(out, repl, s, slen, caps, ng);
+			str_re_expand(out, repl, s, slen, caps, p);
 		if(caps[1] > caps[0])
 			pos = caps[1];
 		else {
@@ -600,7 +630,7 @@ var_t* native_StringMatch(vm_t* vm, var_t* env, void* data) {
 			re_free(p);
 			return var_new_null(vm);
 		}
-		var_t* arr = js_regexp_result_array(vm, s, caps, re_ngroups(p));
+		var_t* arr = js_regexp_result_array2(vm, s, caps, p);
 		re_free(p);
 		return arr;
 	}

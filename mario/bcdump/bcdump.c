@@ -125,6 +125,9 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_EXPORT_VALUE : return "EXPORTV";
 		case INSTR_EXPORT_STAR  : return "EXPORTS";
 		case INSTR_IMPORT_BIND  : return "IMPBIND";
+		case INSTR_MODULE_V     : return "MODULEV";
+		case INSTR_IMPORT_META  : return "IMPMETA";
+		case INSTR_STATIC_BLK   : return "STATICBLK";
 		case INSTR_FIELDN       : return "FIELDN";
 		case INSTR_STATICN      : return "STATICN";
 		default                 : return "";

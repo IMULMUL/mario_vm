@@ -58,9 +58,49 @@ var_t* native_Array_constructor(vm_t* vm, var_t* env, void* data) {
 }
     
 
+/* Receiver of an Array.prototype method. Generic methods are routinely applied
+ * to strings and array-likes through .call/.apply (`Array.prototype.slice.call
+ * ("abc")` in the js-base64 shim vscode.dev loads, `forEach.call(nodeList)`).
+ * Materialise such a receiver into a temporary real array owned by the call env
+ * (freed with it), so every method below may treat `this` as an array. A
+ * genuine array is returned as-is. Mutators applied to an array-like therefore
+ * only touch the temporary copy, which the ES spec permits us to tolerate. */
+static var_t* array_recv(vm_t* vm, var_t* env) {
+var_t* t = get_obj(env, THIS);
+if(t == NULL || t->is_array)
+return t;
+var_t* tmp = var_new_array(vm);
+if(t->type == V_STRING || var_is_string_obj(t)) {
+const char* s = var_get_str(t);
+int len = (s != NULL) ? (int)strlen(s) : 0;
+int idx = 0;
+while(idx < len) {
+unsigned char c = (unsigned char)s[idx];
+int n = (c < 0x80) ? 1 : ((c >> 5) == 0x6) ? 2 : ((c >> 4) == 0xE) ? 3 : ((c >> 3) == 0x1E) ? 4 : 1;
+if(idx + n > len) n = len - idx;
+var_t* ch = var_new_str2(vm, s + idx, (uint32_t)n);
+var_array_add(tmp, ch);
+idx += n;
+}
+} else if(t->type == V_OBJECT) {
+var_t* lenv = var_find_member_var(t, "length");
+int32_t n = (lenv != NULL) ? (int32_t)var_get_float(lenv) : 0;
+int32_t i;
+for(i=0; i<n; ++i) {
+char key[32];
+snprintf(key, sizeof(key), "%d", i);
+var_t* val = var_find_member_var(t, key);
+var_array_add(tmp, val != NULL ? val : var_new(vm));
+}
+}
+node_t* nd = var_add(env, "@@arecv", tmp);
+if(nd != NULL) { nd->invisable = 1; nd->be_unenumerable = 1; }
+return tmp;
+}
+
 var_t* native_Array_toString(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	mstr_t* ret = mstr_new("");
 
 	mstr_t* str = mstr_new("");
@@ -84,7 +124,7 @@ var_t* native_Array_toString(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_join(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	/* ES2015 22.1.3.12: an omitted or undefined separator is ",", not "".
 	 * Minified bundles call join() with no argument constantly, so dropping the
 	 * comma silently corrupts every query string / class list / template they
@@ -186,7 +226,7 @@ static void array_flatten_into(vm_t* vm, var_t* src, var_t* ret, int depth) {
 
 var_t* native_Array_forEach(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	if(f == NULL || f->type == V_UNDEF)
 		return NULL;
@@ -208,7 +248,7 @@ var_t* native_Array_forEach(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_map(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	var_t* ret = var_new_array(vm);
 	if(f == NULL || f->type == V_UNDEF) {
@@ -235,7 +275,7 @@ var_t* native_Array_map(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_filter(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	var_t* ret = var_new_array(vm);
 	if(f == NULL || f->type == V_UNDEF) {
@@ -263,7 +303,7 @@ var_t* native_Array_filter(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_reduce(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	uint32_t sz = var_array_size(arr);
 
@@ -320,14 +360,14 @@ var_t* native_Array_reduce(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_reverse(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_array_reverse(arr);
 	return arr;
 }
 
 var_t* native_Array_concat(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	uint32_t args_num = get_func_args_num(env);
 	uint32_t i;
 	for(i=0; i<args_num; ++i) {
@@ -351,7 +391,7 @@ var_t* native_Array_concat(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_push(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	/* A dangling/freed `arr` (refcount underflow via nested bound-call chains)
 	 * must not be returned: the caller var_ref()s and pushes it, resurrecting a
 	 * freed var. The is_array identity bit also rejects recycled garbage whose
@@ -372,7 +412,7 @@ var_t* native_Array_push(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_unshift(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	uint32_t args_num = get_func_args_num(env);
 	uint32_t sz = var_array_size(arr);
 	uint32_t i;
@@ -403,7 +443,7 @@ var_t* native_Array_unshift(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_pop(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* ret = NULL;
 	uint32_t sz = var_array_size(arr);
 	if(sz == 0)
@@ -431,7 +471,7 @@ var_t* native_Array_pop(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_shift(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	uint32_t sz = var_array_size(arr);
 	if(sz == 0)
 		return NULL;
@@ -464,7 +504,7 @@ var_t* native_Array_shift(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_slice(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	int32_t sz = (int32_t)var_array_size(arr);
 	int32_t start = get_int(env, "start");
 	if(start < 0) 
@@ -498,7 +538,7 @@ var_t* native_Array_slice(vm_t* vm, var_t* env, void* data) {
 			var_array_add(ret, n->var);
 		}
 	}
-	var_instance_from(ret, get_obj(env, THIS));
+	var_instance_from(ret, arr);
 	return ret;
 }
 
@@ -509,7 +549,7 @@ var_t* native_Array_slice(vm_t* vm, var_t* env, void* data) {
  * (last element instead of first) differ. */
 var_t* native_Array_reduceRight(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	int32_t sz = (int32_t)var_array_size(arr);
 
@@ -573,7 +613,7 @@ var_t* native_Array_reduceRight(vm_t* vm, var_t* env, void* data) {
  * allocations below. */
 var_t* native_Array_splice(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	if(arr == NULL || !arr->is_array)
 		return var_new_array(vm);
 	int32_t sz = (int32_t)var_array_size(arr);
@@ -646,7 +686,7 @@ var_t* native_Array_isArray(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_length(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	uint32_t sz = var_array_size(arr);
 	return var_new_int(vm, sz);
 }
@@ -763,7 +803,7 @@ var_t* native_Array_of(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_find(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	if(f == NULL || f->type == V_UNDEF)
 		return NULL;
@@ -787,7 +827,7 @@ var_t* native_Array_find(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_findIndex(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	if(f == NULL || f->type == V_UNDEF)
 		return var_new_int(vm, -1);
@@ -811,7 +851,7 @@ var_t* native_Array_findIndex(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_includes(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* search = get_obj(env, "search");
 	int32_t sz = (int32_t)var_array_size(arr);
 	int32_t from = array_rel_index(get_obj(env, "fromIndex"), sz, 0);
@@ -825,7 +865,7 @@ var_t* native_Array_includes(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_indexOf(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* search = get_obj(env, "search");
 	int32_t sz = (int32_t)var_array_size(arr);
 	int32_t from = array_rel_index(get_obj(env, "fromIndex"), sz, 0);
@@ -839,7 +879,7 @@ var_t* native_Array_indexOf(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_lastIndexOf(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* search = get_obj(env, "search");
 	int32_t sz = (int32_t)var_array_size(arr);
 	var_t* fromv = get_obj(env, "fromIndex");
@@ -855,7 +895,7 @@ var_t* native_Array_lastIndexOf(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_fill(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* value = get_obj(env, "value");
 	int32_t sz = (int32_t)var_array_size(arr);
 	int32_t start = array_rel_index(get_obj(env, "start"), sz, 0);
@@ -870,7 +910,7 @@ var_t* native_Array_fill(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_copyWithin(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	int32_t sz = (int32_t)var_array_size(arr);
 	int32_t target = array_rel_index(get_obj(env, "target"), sz, 0);
 	int32_t start = array_rel_index(get_obj(env, "start"), sz, 0);
@@ -901,7 +941,7 @@ var_t* native_Array_copyWithin(vm_t* vm, var_t* env, void* data) {
  * through vm_get_iterator, which resolves the self-returning @@iterator. */
 var_t* native_Array_entries(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	uint32_t sz = var_array_size(arr);
 	var_t* ret = var_new_array(vm);
 	uint32_t i;
@@ -919,7 +959,7 @@ var_t* native_Array_entries(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_keys(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	uint32_t sz = var_array_size(arr);
 	var_t* ret = var_new_array(vm);
 	uint32_t i;
@@ -932,7 +972,7 @@ var_t* native_Array_keys(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_values(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	uint32_t sz = var_array_size(arr);
 	var_t* ret = var_new_array(vm);
 	uint32_t i;
@@ -948,7 +988,7 @@ var_t* native_Array_values(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_flat(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* depthv = get_obj(env, "depth");
 	int depth = 1;
 	if(depthv != NULL && depthv->type != V_UNDEF) {
@@ -966,7 +1006,7 @@ var_t* native_Array_flat(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_flatMap(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	var_t* ret = var_new_array(vm);
 	if(f == NULL || f->type == V_UNDEF) {
@@ -1005,7 +1045,7 @@ var_t* native_Array_flatMap(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_some(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	if(f == NULL || f->type == V_UNDEF)
 		return var_new_bool(vm, false);
@@ -1029,7 +1069,7 @@ var_t* native_Array_some(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_every(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	var_t* f = get_obj(env, "f");
 	if(f == NULL || f->type == V_UNDEF)
 		return var_new_bool(vm, true);
@@ -1093,7 +1133,7 @@ static int array_sort_compare(vm_t* vm, var_t* env, var_t* f, var_t* x, var_t* y
  * failed and it force-installed its own polyfill over the working native. */
 var_t* native_Array_sort(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	/* Strict method: `this` must be coercible to an object. core-js's
 	 * arrayMethodIsStrict('sort') calls [].sort.call(null, fn, 1) and requires a
 	 * throw, else it forces its polyfill. */
@@ -1155,7 +1195,7 @@ var_t* native_Array_iterator(vm_t* vm, var_t* env, void* data) {
  * yields undefined when the resolved index falls outside [0, length). */
 var_t* native_Array_at(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
-	var_t* arr = get_obj(env, THIS);
+	var_t* arr = array_recv(vm, env);
 	int32_t sz = (int32_t)var_array_size(arr);
 	var_t* idx_v = get_obj(env, "index");
 	int32_t i = (idx_v == NULL || idx_v->type == V_UNDEF) ? 0 : (int32_t)var_get_float(idx_v);

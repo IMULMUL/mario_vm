@@ -422,7 +422,7 @@ char* mstr_ncpy(mstr_t* str, const char* src, uint32_t l) {
 }
 
 char* mstr_cpy(mstr_t* str, const char* src) {
-	mstr_ncpy(str, src, 0x0FFFF);
+	mstr_ncpy(str, src, 0xFFFFFFFFu); // no cap: mstr_ncpy bounds by strlen(src)
 	return str->cstr;
 }
 
@@ -1424,24 +1424,41 @@ void bn_to_mstr(const bignum_t* b, int radix, mstr_t* out) {
 #define BC_BUF_SIZE  3232
 
 
-uint32_t bc_getstrindex(bytecode_t* bc, const char* str) {
+/* Append an (already heap-owned) string to the table and index it. The 20-bit
+ * instruction operand caps the table at OFF_MASK entries; report loudly instead
+ * of emitting aliased operands (which surface later as calls to the wrong
+ * function name). */
+uint32_t bc_addstr(bytecode_t* bc, char* owned_str) {
 	uint32_t sz = bc->mstr_table.size;
-	uint32_t i;
+	if(sz >= OFF_MASK) {
+		static bool warned = false;
+		if(!warned) {
+			warned = true;
+			mario_printf("Error: bytecode string table overflow (>%u entries)!\n", (unsigned)OFF_MASK);
+		}
+		mario_free(owned_str);
+		return OFF_MASK;
+	}
+	array_add(&bc->mstr_table, owned_str);
+	hash_map_add(&bc->mstr_index, owned_str, (void*)(uintptr_t)(sz + 1));
+	return sz;
+}
+
+uint32_t bc_getstrindex(bytecode_t* bc, const char* str) {
 	if(str == NULL || str[0] == 0)
 		return OFF_MASK;
 
-	for(i=0; i<sz; ++i) {
-		char* s = (char*)bc->mstr_table.items[i];
-		if(s != NULL && strcmp(s, str) == 0)
-			return i;
-	}
+	/* O(1) lookup: the linear strcmp scan this replaced made compiling a
+	 * multi-megabyte bundle quadratic in its distinct-string count. */
+	void* hit = hash_map_get(&bc->mstr_index, str);
+	if(hit != NULL)
+		return (uint32_t)((uintptr_t)hit - 1);
 
 	uint32_t len = (uint32_t)strlen(str);
 	char* p = (char*)mario_malloc(len + 1);
 	memcpy(p, str, len+1);
-	array_add(&bc->mstr_table, p);
-	return sz;
-}	
+	return bc_addstr(bc, p);
+}
 
 void bc_init(bytecode_t* bc) {
 	bc->cindex = 0;
@@ -1449,13 +1466,102 @@ void bc_init(bytecode_t* bc) {
 	bc->buf_size = 0;
 	bc->jmptgt_marked = 0;
 	array_init(&bc->mstr_table);
+	hash_map_init(&bc->mstr_index);
+	bc->srcmap = NULL;
+	bc->srcmap_size = bc->srcmap_max = 0;
+	bc->srcmap_cur = 0;
+	array_init(&bc->srcs);
+	bc->srcmap_on = (getenv("MARIO_SRCMAP") != NULL);
 }
 
 void bc_release(bytecode_t* bc) {
 	array_clean(&bc->mstr_table, NULL);
+	hash_map_clean(&bc->mstr_index, mario_free, NULL);
 	bc->jmptgt_marked = 0;
 	if(bc->code_buf != NULL)
 		mario_free(bc->code_buf);
+	if(bc->srcmap != NULL)
+		mario_free(bc->srcmap);
+	bc->srcmap = NULL;
+	bc->srcmap_size = bc->srcmap_max = 0;
+	array_clean(&bc->srcs, NULL);
+}
+
+/* ---- pc -> source map (debug aid, MARIO_SRCMAP=1) ----
+ * The bytecode carries no line info, so a runtime failure deep inside a
+ * multi-MB minified bundle is otherwise unlocatable. When enabled, every
+ * compiled source is copied and the compiler records (pc, offset) at each
+ * statement start; bc_srcmap_locate maps a pc back to "src#n line:col" plus a
+ * snippet of the statement. Entries are appended in increasing pc order. */
+void bc_srcmap_begin(bytecode_t* bc, const char* src) {
+	if(!bc->srcmap_on || src == NULL)
+		return;
+	size_t n = strlen(src);
+	char* copy = (char*)mario_malloc(n + 1);
+	memcpy(copy, src, n + 1);
+	array_add(&bc->srcs, copy);
+	bc->srcmap_cur = bc->srcs.size - 1;
+}
+
+void bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos) {
+	if(!bc->srcmap_on || bc->srcs.size == 0)
+		return;
+	if(bc->srcmap_size > 0 && bc->srcmap[bc->srcmap_size - 1].pc == pc) {
+		bc->srcmap[bc->srcmap_size - 1].pos = pos; /* same pc: keep the innermost statement */
+		return;
+	}
+	if(bc->srcmap_size >= bc->srcmap_max) {
+		uint32_t nmax = bc->srcmap_max == 0 ? 4096 : bc->srcmap_max * 2;
+		struct st_bc_srcmap_ent* ne = (struct st_bc_srcmap_ent*)mario_malloc(nmax * sizeof(*ne));
+		if(bc->srcmap != NULL) {
+			memcpy(ne, bc->srcmap, bc->srcmap_size * sizeof(*ne));
+			mario_free(bc->srcmap);
+		}
+		bc->srcmap = ne;
+		bc->srcmap_max = nmax;
+	}
+	bc->srcmap[bc->srcmap_size].pc = pc;
+	bc->srcmap[bc->srcmap_size].pos = pos;
+	bc->srcmap[bc->srcmap_size].src = bc->srcmap_cur;
+	bc->srcmap_size++;
+}
+
+bool bc_srcmap_locate(bytecode_t* bc, PC pc, mstr_t* out) {
+	if(!bc->srcmap_on || bc->srcmap_size == 0 || pc == ILLEGAL_PC)
+		return false;
+	/* Function bodies compiled while hoisting interleave with the top-level
+	 * stream, so pcs are not globally sorted: take the greatest entry pc <= pc
+	 * by a linear scan (debug path, cost is irrelevant). */
+	uint32_t best = 0xFFFFFFFFu;
+	for(uint32_t i = 0; i < bc->srcmap_size; i++) {
+		if(bc->srcmap[i].pc <= pc && (best == 0xFFFFFFFFu || bc->srcmap[i].pc > bc->srcmap[best].pc))
+			best = i;
+	}
+	if(best == 0xFFFFFFFFu)
+		return false;
+	struct st_bc_srcmap_ent* e = &bc->srcmap[best];
+	if(e->src >= bc->srcs.size)
+		return false;
+	const char* src = (const char*)bc->srcs.items[e->src];
+	size_t len = strlen(src);
+	uint32_t pos = e->pos < len ? e->pos : (uint32_t)len;
+	int line = 1, col = 1;
+	for(uint32_t i = 0; i < pos; i++) {
+		if(src[i] == '\n') { line++; col = 1; }
+		else col++;
+	}
+	char head[96];
+	snprintf(head, sizeof head, "src#%u %d:%d pc=%u (+%u) | ", e->src, line, col, (unsigned)pc, (unsigned)(pc - e->pc));
+	mstr_cpy(out, head);
+	uint32_t from = pos > 40 ? pos - 40 : 0;
+	uint32_t to = pos + 160 < len ? pos + 160 : (uint32_t)len;
+	for(uint32_t i = from; i < to; i++) {
+		if(i == pos)
+			mstr_append(out, ">>>");
+		char c = src[i];
+		mstr_add(out, (c == '\n' || c == '\r' || c == '\t') ? ' ' : c);
+	}
+	return true;
 }
 
 void bc_add(bytecode_t* bc, PC ins) {
@@ -1811,6 +1917,7 @@ static void load_ncache(vm_t* vm, node_t* node, PC instr_pc) {
 
 /**======var functions======*/
 load_m_func_t _load_m_func = NULL;
+resolve_m_func_t _resolve_m_func = NULL;
 
 static var_t* var_clone(var_t* v) {
 	switch(v->type) { //basic types
@@ -4913,6 +5020,38 @@ static scope_t* vm_find_inrange_finally(vm_t* vm) {
 	return NULL;
 }
 
+/* MARIO_SRCMAP: source location of the most recent throw (the throwing pc plus
+ * the enclosing function bodies), captured while the frames are still live and
+ * printed only if the error ends up uncaught. */
+static mstr_t* s_throw_loc = NULL;
+static void vm_capture_throw_loc(vm_t* vm) {
+	if(!vm->bc.srcmap_on)
+		return;
+	if(s_throw_loc == NULL)
+		s_throw_loc = mstr_new("");
+	mstr_reset(s_throw_loc);
+	mstr_t* one = mstr_new("");
+	if(bc_srcmap_locate(&vm->bc, vm->pc, one)) {
+		mstr_append(s_throw_loc, "  at ");
+		mstr_append(s_throw_loc, one->cstr);
+		mstr_add(s_throw_loc, '\n');
+	}
+	scope_t* sc = vm_get_scope(vm);
+	int hop = 0;
+	while(sc != NULL && hop < 12) {
+		if(sc->is_func && sc->func != NULL) {
+			hop++;
+			if(bc_srcmap_locate(&vm->bc, sc->func->pc, one)) {
+				mstr_append(s_throw_loc, "  in ");
+				mstr_append(s_throw_loc, one->cstr);
+				mstr_add(s_throw_loc, '\n');
+			}
+		}
+		sc = sc->prev;
+	}
+	mstr_free(one);
+}
+
 /* Start propagating `err` (adopts the reference): every vm_run frame unwinds
  * until one catches it in-range or the script top reports it. */
 static void vm_propagate(vm_t* vm, var_t* err) {
@@ -4920,6 +5059,7 @@ static void vm_propagate(vm_t* vm, var_t* err) {
 		var_unref(vm->propagating_err);
 	vm->propagating_err = err;
 	vm->abort_run = true;
+	vm_capture_throw_loc(vm);
 	{
 		mstr_t* ds = mstr_new("");
 		var_to_str(err, ds);
@@ -4985,6 +5125,10 @@ void vm_report_uncaught(vm_t* vm) {
 	char tagsfx[160] = {0};
 	if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
 	mario_printf("Uncaught %s%s\n", es->cstr, tagsfx);
+	if(s_throw_loc != NULL && s_throw_loc->len > 0) {
+		mario_printf("%s", s_throw_loc->cstr);
+		mstr_reset(s_throw_loc);
+	}
 	mstr_free(es);
 	var_unref(err);
 }
@@ -5159,8 +5303,9 @@ inline node_t* vm_load_node(vm_t* vm, const char* name, bool create) {
 	 * (via the prototype-inclusive var_find_member below) shadows any real binding
 	 * whose name is also a builtin method - e.g. `{id: keys[i]}` resolved the
 	 * global array `keys` to Object.prototype.keys (a function), so keys[i] read
-	 * undefined. Skip the literal scope and let vm_find_in_scopes resolve outward. */
-	var_t* var = (sc != NULL && !sc->is_objlit) ? vm_get_scope_var(vm) : NULL;
+	 * undefined. Skip the literal scope and let vm_find_in_scopes resolve outward.
+	 * With NO scope pushed at all (script/module top level) the env is root. */
+	var_t* var = (sc == NULL || !sc->is_objlit) ? vm_get_scope_var(vm) : NULL;
 
 	node_t* n = NULL;
 	if(var != NULL)
@@ -5304,6 +5449,26 @@ var_t* var_new_native_func(vm_t* vm, native_func_t native, void* data) {
 	func->native = native;
 	func->data = data;
 	return var_new_func(vm, func);
+}
+
+/* Turn an existing plain object into a native function in place (keeps its
+ * members and prototype). Used for Function.prototype, which per spec is
+ * itself callable (returns undefined) - lodash/octokit-style checks do
+ * `Function.prototype.call(x)` and `Function.prototype.toString.call(x)`. */
+bool var_make_native_func(vm_t* vm, var_t* var, native_func_t native, void* data) {
+	(void)vm;
+	if(var == NULL || var->is_func || var->type != V_OBJECT || var->value != NULL)
+		return false;
+	func_t* func = func_new();
+	if(func == NULL)
+		return false;
+	func->native = native;
+	func->data = data;
+	func->owner_var = var;
+	var->is_func = 1;
+	var->free_func = func_free;
+	var->value = func;
+	return true;
 }
 
 static var_t* find_func(vm_t* vm, var_t* obj, const char* fname) {
@@ -7426,7 +7591,7 @@ static void do_include(vm_t* vm, const char* jsname) {
  * onto the value stack, vm_push takes the balancing reference. On a loader
  * failure an empty namespace is returned so the importer still binds undefined
  * rather than crashing. */
-static var_t* do_module(vm_t* vm, const char* spec) {
+static var_t* do_module(vm_t* vm, const char* spec_in) {
 	if(vm->modules == NULL) {
 		vm->modules = var_new_obj_no_proto(vm, NULL, NULL);
 		node_t* mn = var_add(vm->root, "@@modules", vm->modules);
@@ -7436,33 +7601,53 @@ static var_t* do_module(vm_t* vm, const char* spec) {
 		}
 	}
 
+	/* Canonicalize the specifier first so `./a.js` written in two different
+	 * modules maps to two registry keys, and the same absolute URL reached via
+	 * different relative paths shares one evaluation. */
+	mstr_t* resolved = NULL;
+	const char* spec = spec_in;
+	if(_resolve_m_func != NULL) {
+		resolved = _resolve_m_func(vm, spec_in, vm->cur_module_spec);
+		if(resolved != NULL)
+			spec = resolved->cstr;
+	}
+
 	node_t* hit = var_find_own_member(vm->modules, spec);
-	if(hit != NULL && hit->var != NULL)
+	if(hit != NULL && hit->var != NULL) {
+		if(resolved != NULL) mstr_free(resolved);
 		return hit->var; // already loaded, or in-progress (circular import)
+	}
 
 	if(_load_m_func == NULL) {
 		mario_printf("Error: no module loader, can not import '%s'!\n", spec);
+		if(resolved != NULL) mstr_free(resolved);
 		return var_new_obj_no_proto(vm, NULL, NULL); // empty, unregistered
 	}
 
 	/* Create + register the namespace first (circular-import safe). var_add takes
 	 * the reference, so the freshly-created (refs==0) var is owned by the registry
-	 * afterwards and must NOT be unref'd here. */
+	 * afterwards and must NOT be unref'd here. The registry node's name doubles
+	 * as the stable storage behind cur_module_spec while the body runs. */
 	var_t* ns = var_new_obj_no_proto(vm, NULL, NULL);
-	var_add(vm->modules, spec, ns);
+	node_t* reg = var_add(vm->modules, spec, ns);
+	const char* reg_spec = (reg != NULL && reg->name != NULL) ? reg->name : spec_in;
 
 	mstr_t* js = _load_m_func(vm, spec);
+	if(resolved != NULL) mstr_free(resolved);
 	if(js == NULL) {
-		mario_printf("Error: module '%s' not found!\n", spec);
+		mario_printf("Error: module '%s' not found!\n", reg_spec);
 		return ns; // registered but empty
 	}
 
 	var_t* saved_mod = vm->cur_module;
+	const char* saved_spec = vm->cur_module_spec;
 	PC saved_pc = vm->pc;
 	vm->cur_module = ns;
+	vm->cur_module_spec = reg_spec;
 	vm_load_run(vm, js->cstr);
 	mstr_free(js);
 	vm->cur_module = saved_mod;
+	vm->cur_module_spec = saved_spec;
 	vm->pc = saved_pc;
 	return ns;
 }
@@ -11068,12 +11253,37 @@ static inline void handle_staticn(vm_t* vm, PC ins, opr_code_t instr, uint32_t o
 	}
 }
 
+/* ES2022 class static initialization block: the compiler pushed a hidden
+ * zero-arg function holding the block body. Run it once, now, with `this`
+ * bound to the class under definition and discard the result. */
+static inline void handle_static_blk(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* fn = vm_pop2(vm);
+	scope_t* sc = vm_get_scope(vm);
+	var_t* cls = (sc != NULL) ? sc->class_var : NULL;
+	if(fn != NULL && fn->is_func && cls != NULL) {
+		func_t* func = (func_t*)fn->value;
+		if(func != NULL)
+			func->owner = cls;
+		func_call(vm, cls, fn, 0);
+		var_t* rv = vm_pop2(vm);
+		if(rv != NULL)
+			var_unref(rv);
+	}
+	if(fn != NULL)
+		var_unref(fn);
+}
+
 static inline void handle_instof(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	var_t* v2 = vm_pop2(vm);
 	var_t* v1 = vm_pop2(vm);
 	bool res = false;
 	if(v1 != NULL && v2 != NULL) {
 		res = var_instanceof(v1, v2);
+		/* a function's [[Prototype]] slot doubles as its `.prototype` object here,
+		 * so the chain never reaches Function.prototype: answer `f instanceof
+		 * Function` directly. */
+		if(!res && v1->is_func && v2 == vm->builtin_vars.var_Function)
+			res = true;
 	}
 	vm->gc.gc_defer++; //v1/v2 are bare C pointers: the first unref may gc-sweep the second (see vm_step_op)
 	if(v2 != NULL) var_unref(v2);
@@ -12145,6 +12355,49 @@ static inline void handle_module(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 	vm_push(vm, ns);
 }
 
+/* INSTR_MODULE_V: dynamic `import(expr)`. The specifier is a runtime value on
+ * the stack; the module is loaded and evaluated synchronously (the loader hook
+ * blocks) and its namespace pushed. The compiler wraps the result in
+ * Promise.resolve(), so callers still observe a promise. */
+static inline void handle_module_v(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* sv = vm_pop2(vm);
+	mstr_t* spec = mstr_new("");
+	if(sv != NULL) {
+		var_to_str(sv, spec);
+		var_unref(sv);
+	}
+	var_t* ns = (spec->len > 0) ? do_module(vm, spec->cstr) : NULL;
+	mstr_free(spec);
+	if(ns == NULL)
+		ns = var_new_obj_no_proto(vm, NULL, NULL);
+	vm_push(vm, ns);
+}
+
+/* INSTR_IMPORT_META: `import.meta`. Cached per module as a hidden "@@meta"
+ * member of the namespace so repeated reads see one object; a non-module
+ * script gets a fresh {url} each time. url is the module's resolved specifier
+ * (an absolute URL under a browser embedding). */
+static inline void handle_import_meta(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
+	var_t* meta = NULL;
+	if(vm->cur_module != NULL) {
+		node_t* n = var_find_own_member(vm->cur_module, "@@meta");
+		if(n != NULL && n->var != NULL)
+			meta = n->var;
+	}
+	if(meta == NULL) {
+		meta = var_new_obj(vm, NULL, NULL, NULL);
+		var_add(meta, "url", var_new_str(vm, vm->cur_module_spec != NULL ? vm->cur_module_spec : ""));
+		if(vm->cur_module != NULL) {
+			node_t* mn = var_add(vm->cur_module, "@@meta", meta);
+			if(mn != NULL) {
+				mn->invisable = 1;
+				mn->be_unenumerable = 1;
+			}
+		}
+	}
+	vm_push(vm, meta);
+}
+
 /* INSTR_EXPORT name: copy the current scope binding `name` into the module
  * namespace under the same key (`export function f`, `export class C`,
  * `export const x`, `export { a }`). Shares the binding's var (a reference), so
@@ -12422,6 +12675,7 @@ static void init_instr_table(void) {
 	instr_table[INSTR_CLASS_END] = handle_class_end;
 	instr_table[INSTR_FIELDN] = handle_fieldn;
 	instr_table[INSTR_STATICN] = handle_staticn;
+	instr_table[INSTR_STATIC_BLK] = handle_static_blk;
 	instr_table[INSTR_EXTENDS_V] = handle_extends_v;
 	instr_table[INSTR_MEMBER] = handle_member;
 	instr_table[INSTR_MEMBERN] = handle_member;
@@ -12548,6 +12802,8 @@ static void init_instr_table(void) {
 	instr_table[INSTR_EXPORT_VALUE] = handle_export_value;
 	instr_table[INSTR_EXPORT_STAR] = handle_export_star;
 	instr_table[INSTR_IMPORT_BIND] = handle_import_bind;
+	instr_table[INSTR_MODULE_V] = handle_module_v;
+	instr_table[INSTR_IMPORT_META] = handle_import_meta;
 
 	instr_table_initialized = true;
 }

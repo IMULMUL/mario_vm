@@ -189,6 +189,11 @@ var_t* native_Function_toString(vm_t* vm, var_t* env, void* data) {
 	return var_new_str(vm, buf);
 }
 
+static var_t* native_Function_protoCall(vm_t* vm, var_t* env, void* data) {
+(void)vm; (void)env; (void)data;
+return NULL;
+}
+
 void reg_native_Function(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_FUNCTION);
 	vm->builtin_vars.var_Function = cls;
@@ -197,6 +202,8 @@ void reg_native_Function(vm_t* vm) {
 	vm_reg_native(vm, cls, "bind(thisArg)", native_Function_bind, NULL);
 	vm_reg_native(vm, cls, "toString()", native_Function_toString, NULL);
 	vm_reg_var(vm, cls, SYMKEY_TOSTRINGTAG, var_new_str(vm, "Function"), true);
+	/* Function.prototype is itself a callable that returns undefined. */
+	var_make_native_func(vm, var_get_prototype(cls), native_Function_protoCall, NULL);
 }
 
 #ifdef __cplusplus

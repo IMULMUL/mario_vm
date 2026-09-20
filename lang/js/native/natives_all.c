@@ -32,13 +32,6 @@ static var_t* native_Boolean_call(vm_t* vm, var_t* env, void* data) {
 }
 
 static inline void load_basic_classes(vm_t* vm) {
-	vm->builtin_vars.var_Object = vm_load_var(vm, "Object", false);
-	vm->builtin_vars.var_String = vm_load_var(vm, "String", false);
-	vm->builtin_vars.var_Number = vm_load_var(vm, "Number", false);
-	vm->builtin_vars.var_BigInt = vm_load_var(vm, "BigInt", false);
-	vm->builtin_vars.var_Error = vm_load_var(vm, "Error", false);
-	vm->builtin_vars.var_Array = vm_load_var(vm, "Array", false);
-
 	var_t* console = new_obj(vm, "Console", 0);
 	var_add(vm->root, "console", console);
 
@@ -54,6 +47,16 @@ static inline void load_basic_classes(vm_t* vm) {
 
 void reg_all_natives(vm_t* vm) {
 	reg_builtin_natives(vm);
+	/* Cache the builtin classes right away: var_new_str()/var_new_obj() attach
+	 * String/Object prototypes from builtin_vars, so any string built by the
+	 * platform natives below (e.g. process.version) would otherwise come out
+	 * with an empty prototype and "can not find function 'substr'". */
+	vm->builtin_vars.var_Object = vm_load_var(vm, "Object", false);
+	vm->builtin_vars.var_String = vm_load_var(vm, "String", false);
+	vm->builtin_vars.var_Number = vm_load_var(vm, "Number", false);
+	vm->builtin_vars.var_BigInt = vm_load_var(vm, "BigInt", false);
+	vm->builtin_vars.var_Error = vm_load_var(vm, "Error", false);
+	vm->builtin_vars.var_Array = vm_load_var(vm, "Array", false);
 	/* reg_natives must run before load_basic_classes: Console/TextEncoder/URL/
 	 * EventTarget and the rest of the platform classes now live here, and
 	 * load_basic_classes instantiates `console` via new_obj(vm, "Console", 0).
