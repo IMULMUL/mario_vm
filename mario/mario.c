@@ -48,6 +48,14 @@ static inline void dout(const char* s) {
 
 #define BUF_SIZE 512
 
+/* Diagnostic env probes sit on the VM's hottest paths (var_add, subscript
+ * access, the member cache check, GC). A raw getenv() walks environ under a lock
+ * on every call and showed up at ~10% of var_add in profiles of key-heavy pages.
+ * The environment does not change while a VM runs, so resolve each probe once
+ * per call site and reuse the cached pointer. Same value as getenv(name). */
+#define getenv(name) ({ static const char* _dbg_v; static int _dbg_i; \
+	if(!_dbg_i) { _dbg_i = 1; _dbg_v = (getenv)(name); } _dbg_v; })
+
 inline void mario_debug(const char *format, ...) {
 #if MARIO_DEBUG
 	char buf[BUF_SIZE+1] = {0};
@@ -1972,7 +1980,9 @@ node_t* node_new(vm_t* vm, const char* name, var_t* var) {
  * located. Remove with the rest of the temp diagnostics. */
 static int s_wild_dbg = -1;
 static inline bool mario_ptr_wild(const void* p) {
-	return p != NULL && ((uintptr_t)p >> 48) != 0;
+	if(p == NULL) return false;
+	uintptr_t a = (uintptr_t)p;
+	return a < 0x10000u || (a >> 48) != 0 || (a & (sizeof(void*) - 1)) != 0;
 }
 static void mario_wild_report(const char* where, const void* p) {
 	if(s_wild_dbg < 0)
@@ -1994,6 +2004,14 @@ static inline bool var_empty(var_t* var) {
 		mario_wild_report("var_empty", var);
 		return true;
 	}
+	/* Every live var has magic==0, a known type/status and an owning VM. A stale
+	 * node can outlive a var reclaimed by an earlier cycle-GC pass; the allocator
+	 * may then reuse that block for text such as "prototype". Treat that memory as
+	 * dead before following its value/children/vm fields during a later mark or
+	 * teardown pass. */
+	if(var->magic != 0 || var->type > V_BIGINT || var->status > V_ST_REF ||
+			var->vm == NULL)
+		return true;
 	if(var->status <= V_ST_GC_FREE)
 		return true;
 	return false;
@@ -2015,13 +2033,31 @@ static void mario_throw_trace(vm_t* vm, const char* kind, const char* message) {
 		snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
 	fprintf(stderr, "[THROWALL] %s pc=%u msg=%s%s\n", kind, (unsigned)vm->pc,
 		message != NULL ? message : "(null)", tagsfx);
+	if(message != NULL && strcmp(message, "Error: va") == 0 && vm->scope_stack_top > 0) {
+		scope_t* top = vm->scope_stack[vm->scope_stack_top - 1];
+		static const char* names[] = {"a", "b", "c", "d"};
+		for(int i = 0; i < 4; ++i) {
+			var_t* v = (top != NULL && !var_empty(top->var))
+				? var_find_own_member_var(top->var, names[i]) : NULL;
+			fprintf(stderr, "[THROWALL]   local %s=%p type=%u str=[%s]\n", names[i],
+				(void*)v, (unsigned)(v ? v->type : 99u),
+				(v != NULL && v->type == V_STRING) ? var_get_str(v) : "-");
+		}
+	}
 	{ /* caller chain: func-entry pcs up the scope stack, so a swallowed
 	   * polyfill throw can be mapped back to the app frame that invoked it. */
 		scope_t* sc = (vm->scope_stack_top > 0) ? vm->scope_stack[vm->scope_stack_top - 1] : NULL;
 		int hop = 0;
 		while(sc != NULL && hop++ < 12) {
-			if(sc->is_func && sc->func != NULL)
+			if(sc->is_func && sc->func != NULL) {
 				fprintf(stderr, "[THROWALL]   frame[%d] entrypc=%u\n", hop, (unsigned)sc->func->pc);
+				if(vm->bc.srcmap_on) {
+					mstr_t* loc = mstr_new("");
+					if(bc_srcmap_locate(&vm->bc, sc->func->pc, loc))
+						fprintf(stderr, "[THROWALL]     %s\n", loc->cstr);
+					mstr_free(loc);
+				}
+			}
 			sc = sc->prev;
 		}
 	}
@@ -2036,14 +2072,10 @@ void node_free(void* p) {
 	 * faulted inside var_remove_all's teardown walk. Skip the deref but still
 	 * release the node's own allocations. */
 	if(mario_ptr_wild(node)) { mario_wild_report("node_free.node", node); return; }
-	if(!mario_ptr_wild(node->var)) {
-		if(node->var != NULL && node->var->vm != NULL) {
-			load_ncache_invalidate(node->var->vm, node);
-		}
-		if(!var_empty(node->var) && node->var->vm != NULL) {
-			var_unref(node->var);
-		}
-	} else {
+	if(!var_empty(node->var)) {
+		load_ncache_invalidate(node->var->vm, node);
+		var_unref(node->var);
+	} else if(mario_ptr_wild(node->var)) {
 		mario_wild_report("node_free.node_var", node->var);
 	}
 	mario_free(node->name);
@@ -2438,28 +2470,59 @@ node_t* var_get(var_t* var, int32_t index) {
 	return NULL;
 }
 
+/* Largest run of holes a single sparse write may materialize. Array length is
+ * hash_map_size of the element store, so a write past the end fills the gap
+ * with undefined so that length/for-in stay right; but `a[1e9] = x` must not
+ * allocate a billion nodes (it wedged the engine thread for minutes and ate
+ * GBs). Past the cap only the addressed slot is created - length is then
+ * short, which is a far cheaper lie than an OOM. */
+#define ARRAY_HOLE_FILL_MAX (1 << 20)
+
 node_t* var_array_get(var_t* var, int32_t index) {
+	if(var_empty(var))
+		return NULL;
 	var_t* arr_var = var;
-	if(var->is_array)
-	arr_var = var_find_own_member_var(var, "_ARRAY_");
+	if(var->is_array) {
+		/* A negative index is not an element; it never was writable here and the
+		 * element store must not grow a "-1" key that would inflate length. */
+		if(index < 0)
+			return NULL;
+		arr_var = var_find_own_member_var(var, "_ARRAY_");
+	}
 	if(arr_var == NULL)
 		return NULL;
 
 	// Convert index to string key
 	char key[32];
 	snprintf(key, sizeof(key), "%d", index);
-	
-	// Check if the key exists, if not add empty nodes up to the index
-	int32_t i;
-	for(i=0; i<=index; i++) {
-		char current_key[32];
-		snprintf(current_key, sizeof(current_key), "%d", i);
-		if(hash_map_get(&arr_var->children, current_key) == NULL) {
-			var_add(arr_var, current_key, NULL);
-		}
-	}
 
+	/* Fast path: the slot already exists (every read-modify-write, every
+	 * in-range store). */
 	node_t* node = (node_t*)hash_map_get(&arr_var->children, key);
+	if(node == NULL) {
+		if(var->is_array) {
+			/* Array store: fill holes from the current end up to the index so the
+			 * dense invariant (keys 0..size-1 present) and hence `length` hold.
+			 * Starting at size rather than 0 keeps a sequential `a[i] = x` fill
+			 * O(n) overall instead of O(n^2). */
+			uint32_t start = hash_map_size(&arr_var->children);
+			if((uint32_t)index >= start && (uint32_t)index - start <= (uint32_t)ARRAY_HOLE_FILL_MAX) {
+				uint32_t i;
+				for(i = start; i < (uint32_t)index; i++) {
+					char current_key[32];
+					snprintf(current_key, sizeof(current_key), "%u", i);
+					if(hash_map_get(&arr_var->children, current_key) == NULL)
+						var_add(arr_var, current_key, NULL);
+				}
+			}
+		}
+		/* A plain object indexed by a number (`cache[1758355200000] = v`) is an
+		 * ordinary property write: create exactly that key. Filling 0..index here
+		 * invented millions of phantom own properties on keyed maps, which
+		 * Object.keys() then spent minutes enumerating. */
+		var_add(arr_var, key, NULL);
+		node = (node_t*)hash_map_get(&arr_var->children, key);
+	}
 	if(node_empty(node)) {
 		if(getenv("MARIO_ARRDBG")) { /* DIAG (temp): why did the index read miss? */
 			var_t* sub = var->is_array ? var_find_own_member_var(var, "_ARRAY_") : NULL;
@@ -3755,51 +3818,47 @@ inline var_t* var_set_str(var_t* var, const char* v) {
 	return var;
 }
 
+/* ECMAScript ToBoolean. Native built-ins (Array.filter/find/some/every) and
+ * bytecode conditions share this helper, so object-valued predicates must be
+ * truthy just like `if (object)`. Reading an object's first payload word as an
+ * int made `{}` falsy and emptied apple.com's SVG image list during hydration. */
 inline bool var_get_bool(var_t* var) {
-	if(var == NULL || var->value == NULL)
+	if(var == NULL)
 		return false;
 	switch(var->type) {
-		case V_INT64:   return *(int64_t*)var->value != 0;
-		case V_FLOAT:   return *(float*)var->value != 0.0f;
-		case V_FLOAT64: return *(double*)var->value != 0.0;
-		case V_BIGINT:  return ((bignum_t*)var->value)->sign != 0;
-		default:        return *(int*)var->value != 0; // V_BOOL / V_INT
-	}
-}
-
-/* JS ToBoolean for the logical-assignment operators (`||= &&=`) and any place
- * that needs real truthiness rather than the raw int-slot test var_get_bool()
- * does. Empty string / 0 / NaN / null / undefined / false are falsy; every
- * object (array, function) is truthy. */
-static inline bool var_truthy(var_t* v) {
-	if(v == NULL || v->value == NULL) {
-		// null/undefined carry no value buffer; a live object always has one.
-		return (v != NULL && v->type == V_OBJECT);
-	}
-	switch(v->type) {
 		case V_UNDEF:
 		case V_NULL:
 			return false;
+		case V_OBJECT:
+			return true;
+		case V_STRING: {
+			const char* s = var_get_str(var);
+			return s != NULL && s[0] != 0;
+		}
 		case V_BOOL:
 		case V_INT:
-			return *(int*)v->value != 0;
+			return var->value != NULL && *(int*)var->value != 0;
 		case V_INT64:
-			return *(int64_t*)v->value != 0;
+			return var->value != NULL && *(int64_t*)var->value != 0;
 		case V_FLOAT: {
-			float f = *(float*)v->value;
+			if(var->value == NULL) return false;
+			float f = *(float*)var->value;
 			return f != 0.0f && f == f; // NaN is falsy
 		}
 		case V_FLOAT64: {
-			double d = *(double*)v->value;
+			if(var->value == NULL) return false;
+			double d = *(double*)var->value;
 			return d != 0.0 && d == d; // NaN is falsy
 		}
 		case V_BIGINT:
-			return ((bignum_t*)v->value)->sign != 0; // 0n is falsy
-		case V_STRING:
-			return var_get_str(v)[0] != 0;
-		default: // V_OBJECT and friends
-			return true;
+			return var->value != NULL && ((bignum_t*)var->value)->sign != 0;
+		default:
+			return var->value != NULL;
 	}
+}
+
+static inline bool var_truthy(var_t* v) {
+	return var_get_bool(v);
 }
 
 static inline bool var_is_nullish(var_t* v) {
@@ -4587,7 +4646,22 @@ node_t* vm_find_in_class(var_t* var, const char* name) {
 			ret->be_inherited = 1;
 			return ret;
 		}
-		proto = var_get_prototype(proto);
+		/* The next link of a callable is its own [[Prototype]], not its public
+		 * `.prototype` instance template. After `setPrototypeOf(Sub, Base)`, static
+		 * lookup must walk Sub -> Base -> Function.prototype; walking into
+		 * Base.prototype incorrectly exposes instance accessors as static ones. */
+		if(proto->is_func || proto->is_class) {
+			var_t* next = var_get_callable_proto(proto);
+			if(next == NULL && proto->vm != NULL) {
+				var_t* fp = proto->vm->builtin_vars.var_Function != NULL
+					? var_get_prototype(proto->vm->builtin_vars.var_Function) : NULL;
+				next = (proto == fp && proto->vm->builtin_vars.var_Object != NULL)
+					? var_get_prototype(proto->vm->builtin_vars.var_Object) : fp;
+			}
+			proto = next;
+		} else {
+			proto = var_get_prototype(proto);
+		}
 	}
 	if(proto != NULL) {
 		static int chain_warned = 0;
@@ -5471,7 +5545,7 @@ bool var_make_native_func(vm_t* vm, var_t* var, native_func_t native, void* data
 	return true;
 }
 
-static var_t* find_func(vm_t* vm, var_t* obj, const char* fname) {
+static var_t* find_func(vm_t* vm, var_t* obj, const char* fname, bool allow_scope_fallback) {
 	//try full name with arg_num
 	node_t* node = NULL;
 	if(obj != NULL) {
@@ -5502,7 +5576,10 @@ static var_t* find_func(vm_t* vm, var_t* obj, const char* fname) {
 				node = fn;
 		}
 	}
-	if(node == NULL) {
+	/* A named bare call may resolve through lexical/global scope. A member call
+	 * must not: `obj.m()` is a property reference, so a missing `m` throws instead
+	 * of silently invoking an unrelated lexical/global function with that name. */
+	if(node == NULL && allow_scope_fallback) {
 		node = vm_find_in_scopes(vm, fname);
 	}
 
@@ -5518,7 +5595,28 @@ static var_t* find_func(vm_t* vm, var_t* obj, const char* fname) {
 		fprintf(stderr, "\n");
 		if(obj != NULL) {
 			var_t* AP = vm->builtin_vars.var_Array != NULL ? var_get_prototype(vm->builtin_vars.var_Array) : NULL;
-			fprintf(stderr, "[FINDDBG]   builtin Array.prototype=%p\n", (void*)AP);
+			var_t* EC = var_find_own_member_var(vm->root, "Element");
+			var_t* EP = EC != NULL ? var_get_prototype(EC) : NULL;
+			fprintf(stderr, "[FINDDBG]   builtin Array.prototype=%p obj.value=%p obj.free=%p Element=%p Element.prototype=%p\n",
+				(void*)AP, obj->value, (void*)obj->free_func, (void*)EC, (void*)EP);
+			node_t* an = vm_find_in_scopes(vm, "a");
+			var_t* av = an != NULL ? an->var : NULL;
+			node_t* amn = av != NULL ? var_find_raw(av, "m") : NULL;
+			var_t* am = amn != NULL ? amn->var : NULL;
+			var_t* am_any = av != NULL ? var_find_member_var(av, "m") : NULL;
+			node_t* zn = vm_find_in_scopes(vm, "Z");
+			var_t* zv = zn != NULL ? zn->var : NULL;
+			fprintf(stderr, "[FINDDBG]   local a=%p raw-m-node=%p a.m=%p a.m-any=%p a.proto=%p Z=%p Z.prototype=%p a.m.proto=%p a.m.value=%p a.m.free=%p empty=%d\n",
+				(void*)av, (void*)amn, (void*)am, (void*)am_any,
+				(void*)(av ? var_get_prototype(av) : NULL), (void*)zv,
+				(void*)(zv ? var_get_prototype(zv) : NULL),
+				(void*)(am ? var_get_prototype(am) : NULL), am ? am->value : NULL,
+				(void*)(am ? am->free_func : NULL), am ? (int)var_empty(am) : -1);
+			if(av != NULL && av->children.buckets != NULL) {
+				for(uint32_t bi = 0; bi < av->children.capacity; ++bi)
+					for(hash_entry_t* he = av->children.buckets[bi]; he != NULL; he = he->next)
+						fprintf(stderr, "[FINDDBG]     a.own[%s]=%p\n", he->key ? he->key : "(null)", (void*)he->value);
+			}
 			var_t* p = var_get_prototype(obj);
 			int h = 0;
 			while(p != NULL && h++ < 8) {
@@ -5579,9 +5677,10 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 	if(getenv("MARIO_FPCDBG") != NULL) { /* DIAG (temp): dump entry args of one func pc */
 		func_t* pf = (func_var != NULL) ? var_get_func(func_var) : NULL;
 		if(pf != NULL && (PC)atoi(getenv("MARIO_FPCDBG")) == pf->pc) {
-			fprintf(stderr, "[fpcdbg] enter fpc=%u argc=%d vpc=%u obj=%p(t%u)\n",
-				(unsigned)pf->pc, arg_num, (unsigned)vm->pc,
-				(void*)obj, (unsigned)(obj != NULL ? obj->type : 999u));
+			PC callw = (vm->pc > 0) ? vm->bc.code_buf[vm->pc - 1] : 0;
+			fprintf(stderr, "[fpcdbg] enter fpc=%u argc=%d vpc=%u callop=%02x obj=%p(t%u) root=%p\n",
+				(unsigned)pf->pc, arg_num, (unsigned)vm->pc, (unsigned)OP(callw),
+				(void*)obj, (unsigned)(obj != NULL ? obj->type : 999u), (void*)vm->root);
 			for(int ai = arg_num - 1; ai >= 0; --ai) {
 				int idx = vm->stack_top - 1 - ai;
 				if(idx < 0) break;
@@ -5642,6 +5741,15 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		vm_push(vm, var_new(vm));
 		return false;
 	}
+	/* Arrow functions ignore every call-site receiver (`obj.m()`, call/apply,
+	 * timer/promise/native callbacks) and always use the exact lexical `this`
+	 * captured on their function object by handle_func(). Keeping this rule at
+	 * the common call boundary covers every invocation path uniformly. */
+	if(func->is_arrow) {
+		var_t* lexical_this = var_find_own_member_var(func_var, ARROW_THIS);
+		if(lexical_this != NULL)
+			obj = lexical_this;
+	}
 	if(getenv("MARIO_FENTRY") != NULL) { /* DIAG (temp): JS func-entry trace lo:hi:max */
 		static int fe_lo = -1, fe_hi = -1, fe_max = 0, fe_n = 0, fe_init = 0;
 		if(!fe_init) { fe_init = 1; sscanf(getenv("MARIO_FENTRY"), "%d:%d:%d", &fe_lo, &fe_hi, &fe_max); }
@@ -5651,12 +5759,15 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 				(unsigned)func->pc, (unsigned)vm->pc, arg_num, (int)vm->call_depth);
 		}
 	}
-	if(obj == NULL) {
-		//obj = vm->root;
-	}
-	else {
+	/* A plain call enters a sloppy function with globalThis as `this`. The
+	 * directive prologue may later mark the callee strict; default_this lets
+	 * handle_strict replace only this implicit binding with undefined without
+	 * disturbing an explicit method/call/apply receiver. */
+	bool default_this = (obj == NULL);
+	if(default_this)
+		obj = vm->root;
+	if(obj != NULL)
 		var_add(env, THIS, obj);
-	}
 
 	/* env/args are freshly built and not yet rooted on the stack (that happens
 	 * with vm_push(env) below). A gc triggered while collecting arguments would
@@ -5895,6 +6006,7 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 		scope_t* sc = scope_new(env);
 		sc->pc = vm->pc;
 		sc->is_func = true;
+		sc->default_this = default_this;
 		sc->func = func;
 		sc->func_var = var_ref(func_var); //root the function object so its func_t survives gc AND refcount drops during the body
 		sc->stack_top = vm->stack_top; //frame baseline (env already pushed): a throw truncates leaked operands down to here
@@ -6248,6 +6360,8 @@ static void wslot_push(vm_t* vm, var_t* obj, var_t* key) {
  * node and return true (the caller frees the sentinel with node_free instead of
  * node_replace). The hidden @@wobj/@@wkey back-refs are dropped afterwards so the
  * receiver/key references are released once the sentinel is freed. */
+static bool subscript_index(var_t* v2, int32_t* out);
+
 static bool wslot_write(vm_t* vm, node_t* n, var_t* val) {
 	if(!is_wslot(n))
 		return false;
@@ -6259,6 +6373,7 @@ static bool wslot_write(vm_t* vm, node_t* n, var_t* val) {
 		 * receiver - writing through a prototype-chain node would mutate the
 		 * ancestor (the `Sub.prototype.constructor = Sub` clobbering bug). */
 		const char* wk = NULL;
+		int32_t at = 0;
 		if(var_is_symbol(key))
 			wk = var_symbol_key(key);
 		else if(key->type == V_STRING)
@@ -6267,14 +6382,17 @@ static bool wslot_write(vm_t* vm, node_t* n, var_t* val) {
 			tn = var_find_own_member(obj, wk);
 			if(tn == NULL) tn = var_add(obj, wk, NULL);
 		}
-		else if(obj->is_array) {
-			tn = var_array_get(obj, var_get_int(key));
+		else if(subscript_index(key, &at)) {
+			/* Same index rule as array_at_push: an element slot for arrays, the
+			 * single named key for a plain object (no hole fill). */
+			tn = var_array_get(obj, at);
 		}
 		else {
-			char kb[32];
-			snprintf(kb, sizeof(kb), "%d", var_get_int(key));
-			tn = var_find_own_member(obj, kb);
-			if(tn == NULL) tn = var_add(obj, kb, NULL);
+			mstr_t* ks = mstr_new("");
+			var_to_str(key, ks);
+			tn = var_find_own_member(obj, ks->cstr);
+			if(tn == NULL) tn = var_add(obj, ks->cstr, NULL);
+			mstr_free(ks);
 		}
 		if(tn != NULL)
 			node_replace(tn, val);      /* write through the receiver's real node (refs val) */
@@ -6929,6 +7047,15 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		return;
 
 	node_t* n = var_find_member(v, name);
+	if(getenv("MARIO_LMDBG") != NULL && strcmp(name, "lm") == 0) {
+		fprintf(stderr, "[lmdbg] GET base=%p type=%u refs=%d own=%p found=%p value=%p type=%u str=[%s] pc=%u\n",
+			(void*)v, (unsigned)v->type, (int)v->refs,
+			(void*)var_find_own_member(v, name), (void*)n,
+			(void*)(n != NULL ? n->var : NULL),
+			(unsigned)(n != NULL && n->var != NULL ? n->var->type : 999u),
+			(n != NULL && n->var != NULL && n->var->type == V_STRING) ? var_get_str(n->var) : "-",
+			(unsigned)vm->pc);
+	}
 	/* Function.prototype.toString: functions carry Object.prototype as their
 	 * prototype (see native_Function.c), so `fn.toString` would resolve to
 	 * Object.prototype.toString ("[object Function]") and core-js's
@@ -7453,8 +7580,28 @@ var_t* call_m_func(vm_t* vm, var_t* obj, var_t* func, var_t* args) {
 	}
 
 	while(vm->gc.is_doing_gc);
-	func_call(vm, obj, func, arg_num);
-	var_t* ret = vm_pop2(vm);
+	var_t* ret;
+	/* Native builtin constructors are represented as is_class objects rather than
+	 * is_func values. A direct JS call already routes them through
+	 * new_obj_with_ctor(..., plain_call=true), but callbacks invoked from native
+	 * code (Array#map, Promise handlers, timers, etc.) arrive here. Preserve the
+	 * same plain-call semantics so `array.map(Number)` returns converted values
+	 * instead of func_call treating Number as a missing func_t and yielding
+	 * undefined. The shared constructor path consumes the arguments pushed above. */
+	if(func != NULL && func->is_class && !func->is_func && !var_is_proxy(func)) {
+		var_t* name_var = var_find_own_member_var(func, "@@fname");
+		const char* name = (name_var != NULL && name_var->type == V_STRING)
+			? var_get_str(name_var) : "";
+		ret = new_obj_with_ctor(vm, func, name, arg_num, true);
+		/* call_m_func returns an owned result; new_obj_with_ctor returns at the
+		 * VM's baseline refs contract, so acquire the caller's reference here. */
+		if(ret != NULL)
+			var_ref(ret);
+	}
+	else {
+		func_call(vm, obj, func, arg_num);
+		ret = vm_pop2(vm);
+	}
 	if(vm->propagating_err != NULL) {
 		/* The callee aborted: discard its placeholder result so the native caller
 		 * sees NULL; propagation continues when that native returns. */
@@ -7741,8 +7888,11 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool r
 			loaded = true;
 		}
 		else {
-			// this is NULL, push undefined
-			vm_push(vm, var_new(vm));
+			/* Browser global code always observes `this === window`, including when
+			 * the script has a strict directive. Strict receiver-less functions have
+			 * an explicit undefined THIS binding installed by handle_strict, so only
+			 * the genuinely binding-less top-level path falls back to globalThis. */
+			vm_push(vm, vm->root);
 			loaded = true;
 		}
 	}
@@ -7879,6 +8029,12 @@ static inline void handle_strict(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 	scope_t* sc = vm_get_scope(vm);
 	if(sc != NULL) {
 		sc->is_strict = true;
+		/* func_call provisionally supplies globalThis for a receiver-less call so
+		 * sloppy code gets browser semantics. A strict directive is the first
+		 * executable instruction, so replace that implicit binding before the
+		 * body can observe `this`; explicit receivers remain untouched. */
+		if(sc->is_func && sc->default_this && !var_empty(sc->var))
+			var_add(sc->var, THIS, var_new(vm));
 	}
 }
 
@@ -9325,7 +9481,7 @@ static var_t* vm_with_owner_for(vm_t* vm, const char* name) {
 		if(++guard > VM_SCOPE_STACK_MAX)
 			break;
 		if(sc->is_with && !var_empty(sc->var)) {
-			var_t* f = find_func(vm, sc->var, name);
+			var_t* f = find_func(vm, sc->var, name, false);
 			if(f != NULL)
 				return sc->var;
 		}
@@ -9353,7 +9509,7 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		 * for the real `this` (keeping the ref/unref contract balanced). */
 		var_t* sup = vm_super_in_scopes(vm);
 		if(sup != NULL && obj == sup) {
-			func = find_func(vm, sup, name->cstr);
+			func = find_func(vm, sup, name->cstr, false);
 			var_t* realthis = vm_this_in_scopes(vm);
 			if(realthis != NULL) {
 				var_unref(obj);
@@ -9366,11 +9522,11 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		var_t* wobj = vm_with_owner_for(vm, name->cstr);
 		if(wobj != NULL) {
 			obj = wobj;
-			func = find_func(vm, wobj, name->cstr);
+			func = find_func(vm, wobj, name->cstr, false);
 		}
 		else {
 			obj = vm_this_in_scopes(vm);
-			func = find_func(vm, sc_var, name->cstr);
+			func = find_func(vm, sc_var, name->cstr, true);
 		}
 		/* DIAG (temp): trace how `Error` resolves inside constructor frames. */
 		if(getenv("MARIO_ERRDBG") && strcmp(name->cstr, "Error") == 0) {
@@ -9382,7 +9538,30 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	}
 
 	if(func == NULL && obj != NULL)
-		func = find_func(vm, obj, name->cstr);
+		func = find_func(vm, obj, name->cstr, instr != INSTR_CALLO);
+
+	if(getenv("MARIO_CALLCHAIN") != NULL &&
+	   vm->pc == (PC)atoi(getenv("MARIO_CALLCHAIN"))) {
+		fprintf(stderr, "[callchain] name=%s pc=%u obj=%p type=%u resolved=%p fpc=%u\n",
+			name->cstr, (unsigned)vm->pc, (void*)obj,
+			(unsigned)(obj != NULL ? obj->type : 999u), (void*)func,
+			(unsigned)(func != NULL && func->is_func && func->value != NULL
+				? ((func_t*)func->value)->pc : 0u));
+		var_t* walk = obj;
+		for(int hop = 0; walk != NULL && hop < 32; ++hop) {
+			node_t* own = var_find_own_member(walk, name->cstr);
+			var_t* proto = var_get_prototype(walk);
+			fprintf(stderr,
+				"[callchain]   hop=%d var=%p own=%p value=%p type=%u fpc=%u proto=%p\n",
+				hop, (void*)walk, (void*)own,
+				(void*)(own != NULL ? own->var : NULL),
+				(unsigned)(own != NULL && own->var != NULL ? own->var->type : 999u),
+				(unsigned)(own != NULL && own->var != NULL && own->var->is_func &&
+					own->var->value != NULL ? ((func_t*)own->var->value)->pc : 0u),
+				(void*)proto);
+			walk = proto;
+		}
+	}
 
 	if(func != NULL && !func->is_func && !var_is_proxy(func)) {
 		/* A class value invoked as a plain call: `Array(3)`, `Object(x)`,
@@ -9502,6 +9681,46 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 			if(obj != NULL && obj->type == V_STRING) {
 				const char* cs = var_get_str(obj);
 				fprintf(stderr, "[DIAGCNF]   str=%.60s\n", cs ? cs : "(null)");
+			}
+			if(strcmp(name->cstr, "search") == 0 || strcmp(name->cstr, "indexOf") == 0) {
+				var_t* host = var_find_own_member_var(vm->root,
+					strcmp(name->cstr, "search") == 0 ? "location" : "navigator");
+				const char* prop = strcmp(name->cstr, "search") == 0 ? "href" : "userAgent";
+				node_t* pn = host != NULL ? var_find_member(host, prop) : NULL;
+				fprintf(stderr, "[DIAGCNF]   root=%p root.%s=%p type=%u status=%u proto=%p %s=%p v=%p type=%u func=%u\n",
+					(void*)vm->root, strcmp(name->cstr, "search") == 0 ? "location" : "navigator",
+					(void*)host, host ? (unsigned)host->type : 99u,
+					host ? (unsigned)host->status : 99u,
+					(void*)(host ? var_get_prototype(host) : NULL), prop, (void*)pn,
+					(void*)(pn ? pn->var : NULL), (unsigned)(pn && pn->var ? pn->var->type : 99u),
+					(unsigned)(pn && pn->var ? pn->var->is_func : 0u));
+				if(strcmp(name->cstr, "search") == 0) {
+					for(int32_t si = vm->scope_stack_top - 1, depth = 0; si >= 0 && depth < 12; --si, ++depth) {
+						scope_t* ds = vm->scope_stack[si];
+						var_t* dv = (ds != NULL && !var_empty(ds->var)) ? var_find_own_member_var(ds->var, "d") : NULL;
+						var_t* wv = (ds != NULL && !var_empty(ds->var)) ? var_find_own_member_var(ds->var, "window") : NULL;
+						var_t* cw = (ds != NULL && ds->func != NULL && !var_empty(ds->func->closure.var))
+							? var_find_own_member_var(ds->func->closure.var, "window") : NULL;
+						fprintf(stderr, "[DIAGCNF]   scope[%d] env=%p fpc=%u d=%p(t%u) window=%p(t%u) closure=%p cfpc=%u closure.window=%p(t%u)\n",
+							depth, (void*)(ds ? ds->var : NULL), (unsigned)(ds && ds->func ? ds->func->pc : 0), (void*)dv,
+							(unsigned)(dv ? dv->type : 99u), (void*)wv, (unsigned)(wv ? wv->type : 99u),
+							(void*)(ds && ds->func ? ds->func->closure.var : NULL),
+							(unsigned)(ds && ds->func && ds->func->closure.func ? ds->func->closure.func->pc : 0),
+							(void*)cw, (unsigned)(cw ? cw->type : 99u));
+						if(ds != NULL && ds->func != NULL && ds->func->pc == 54192) {
+							var_t* cv = ds->func->closure.var;
+							for(int ch = 0; cv != NULL && ch < 8; ++ch) {
+								node_t* ln = var_find_own_member(cv, "@@lex");
+								var_t* lw = var_find_own_member_var(cv, "window");
+								var_t* ll = (lw != NULL) ? var_find_own_member_var(lw, "location") : NULL;
+								fprintf(stderr, "[DIAGCNF]     lex[%d]=%p window=%p(t%u root=%d) location=%p next=%p\n",
+									ch, (void*)cv, (void*)lw, (unsigned)(lw ? lw->type : 99u),
+									lw == vm->root ? 1 : 0, (void*)ll, (void*)(ln ? ln->var : NULL));
+								cv = (ln != NULL) ? ln->var : NULL;
+							}
+						}
+					}
+				}
 			}
 			if(obj != NULL && obj->type == V_OBJECT) {
 				/* SAFE scalar-only dump: the receiver may be a recycled var (internal
@@ -9641,7 +9860,16 @@ static inline void handle_callx(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	mstr_free(name);
 
 	var_t* func = vm_stack_pick(vm, arg_num + 1);
-	var_t* obj = vm_this_in_scopes(vm);
+	/* CALLX is a value call (`fn(...)` / IIFE), so an ordinary function has no
+	 * reference-base receiver. Only arrows inherit lexical `this`; func_call
+	 * supplies globalThis for a receiver-less sloppy function and preserves
+	 * undefined once its strict directive executes. */
+	var_t* obj = NULL;
+	if(func != NULL && func->is_func) {
+		func_t* called = var_get_func(func);
+		if(called != NULL && called->is_arrow)
+			obj = vm_this_in_scopes(vm);
+	}
 
 	/* The pick removed func's only gc-visible owner (its value-stack slot), so
 	 * until the trailing var_unref it lives in a C local the collector can not
@@ -9827,6 +10055,13 @@ static inline void handle_member(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 		v = var_new(vm);
 
 	var_t *var = vm_get_scope_var(vm);
+	if(getenv("MARIO_LMDBG") != NULL && strcmp(s, "lm") == 0) {
+		fprintf(stderr, "[lmdbg] SET target=%p target_type=%u value=%p type=%u str=[%s] refs=%d pc=%u\n",
+			(void*)var, (unsigned)(var != NULL ? var->type : 999u), (void*)v,
+			(unsigned)(v != NULL ? v->type : 999u),
+			(v != NULL && v->type == V_STRING) ? var_get_str(v) : "-",
+			(v != NULL ? (int)v->refs : -1), (unsigned)vm->pc);
+	}
 	if(var->is_array) {
 		var_array_add(var, v);
 	}
@@ -9908,8 +10143,21 @@ static inline void handle_func(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		if(instr == INSTR_FUNC_ARROW || instr == INSTR_FUNC_GEN) {
 			func_t* f = var_get_func(v);
 			if(f != NULL) {
-				if(instr == INSTR_FUNC_ARROW)
+				if(instr == INSTR_FUNC_ARROW) {
 					f->is_arrow = 1;
+					/* Capture lexical `this` at definition time. Store it as a hidden
+					 * child of the function object so the existing refcount and tracing
+					 * GC machinery own and mark it, including cycles such as
+					 * `this.cb = () => this.value`. */
+					var_t* lexical_this = vm_this_in_scopes(vm);
+					if(lexical_this == NULL)
+						lexical_this = var_new(vm); /* lexical undefined */
+					node_t* tn = var_add(v, ARROW_THIS, lexical_this);
+					if(tn != NULL) {
+						tn->invisable = 1;
+						tn->be_unenumerable = 1;
+					}
+				}
 				else
 					f->is_generator = 1;
 			}
@@ -10619,13 +10867,17 @@ static inline void handle_call_spread(vm_t* vm, PC ins, opr_code_t instr, uint32
 	if(instr == INSTR_CALLO_SPREAD) {
 		obj = vm_stack_pick(vm, 1);
 		if(obj != NULL)
-			func = find_func(vm, obj, name->cstr);
+			func = find_func(vm, obj, name->cstr, false);
 	}
 	else if(instr == INSTR_CALLX_SPREAD) {
-		/* call-by-value with spread: the callable sits right below the args
-		 * array on the value stack. */
+		/* Value calls have no receiver; arrows alone inherit lexical `this`. */
 		func = vm_stack_pick(vm, 1);
-		obj = vm_this_in_scopes(vm);
+		obj = NULL;
+		if(func != NULL && func->is_func) {
+			func_t* called = var_get_func(func);
+			if(called != NULL && called->is_arrow)
+				obj = vm_this_in_scopes(vm);
+		}
 	}
 	else if(instr == INSTR_CALLXO_SPREAD) {
 		/* `obj[k](...args)`: below the args array sit the func value then the
@@ -10636,9 +10888,9 @@ static inline void handle_call_spread(vm_t* vm, PC ins, opr_code_t instr, uint32
 	else {
 		var_t* sc_var = vm_get_scope_var(vm);
 		obj = vm_this_in_scopes(vm);
-		func = find_func(vm, sc_var, name->cstr);
+		func = find_func(vm, sc_var, name->cstr, true);
 		if(func == NULL && obj != NULL)
-			func = find_func(vm, obj, name->cstr);
+			func = find_func(vm, obj, name->cstr, true);
 	}
 
 	if(func != NULL && !func->is_func && !var_is_proxy(func)) {
@@ -10834,6 +11086,37 @@ static int64_t ta_key_index(var_t* v2) {
  * subscript READ path shares the exact index rule with the WRITE path. */
 static var_t* array_elem_store(var_t* obj, const char* ks);
 
+/* Numeric subscript -> array-index rule. Only a canonical non-negative int32
+ * addresses an element slot; anything else (a timestamp such as
+ * `cache[1758355200000]`, 1.5, -1, NaN, a bool/null/object key) is an ordinary
+ * property named by ToString(key). var_get_int() truncation used to wrap a
+ * large key to a random int32 so `m[Date.now()] = v` and the later read never
+ * met, and `o[-1] = v` silently vanished. */
+static bool subscript_index(var_t* v2, int32_t* out) {
+	if(v2 == NULL || v2->value == NULL)
+		return false;
+	switch(v2->type) {
+	case V_INT: {
+		int v = *(int*)v2->value;
+		if(v < 0) return false;
+		*out = v; return true;
+	}
+	case V_INT64: {
+		int64_t v = *(int64_t*)v2->value;
+		if(v < 0 || v > INT32_MAX) return false;
+		*out = (int32_t)v; return true;
+	}
+	case V_FLOAT:
+	case V_FLOAT64: {
+		double d = var_get_float64(v2);
+		if(!(d >= 0.0) || d > (double)INT32_MAX || d != floor(d)) return false;
+		*out = (int32_t)d; return true;
+	}
+	default:
+		return false;
+	}
+}
+
 /* Shared post-pop body of the subscript operators: v1 (receiver) and v2 (key)
  * arrive owning their value-stack references and are released here. Pushes the
  * element/member value or, for a persistent receiver, the binding node so a
@@ -10942,10 +11225,21 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 		return;
 	}
 	else {
-		int at = var_get_int(v2);
-		/* var_array_get materializes holes up to `at` (needed for a write target);
-		 * a read peeks so `arr[9]` on a short array leaves length alone. */
-		n = for_write ? var_array_get(v1, at) : var_array_peek(v1, at);
+		int32_t at = 0;
+		if(subscript_index(v2, &at)) {
+			/* var_array_get materializes holes up to `at` (needed for a write target);
+			 * a read peeks so `arr[9]` on a short array leaves length alone. */
+			n = for_write ? var_array_get(v1, at) : var_array_peek(v1, at);
+		}
+		else {
+			/* Non-index key: ToString(key) names an ordinary member (an array's
+			 * outer var, never its element store). Objects stringify through their
+			 * toString, so the depth-capped var_to_str is the right converter. */
+			mstr_t* ks = mstr_new("");
+			var_to_str(v2, ks);
+			n = for_write ? var_find_member_create(v1, ks->cstr) : var_find_member(v1, ks->cstr);
+			mstr_free(ks);
+		}
 	}
 	/* Accessor via computed key (`navigator["userAgent"]`, `obj[k]` where k names
 	 * a getter property): the string/symbol path above resolves the member node
@@ -11113,8 +11407,17 @@ static inline void handle_array_at_m(vm_t* vm, PC ins, opr_code_t instr, uint32_
 		}
 		else if(v2->type == V_STRING)
 			n = var_find_member(v1, var_get_str(v2));
-		else
-			n = var_array_peek(v1, var_get_int(v2));
+		else {
+			int32_t at = 0;
+			if(subscript_index(v2, &at))
+				n = var_array_peek(v1, at);
+			else {
+				mstr_t* ks = mstr_new("");
+				var_to_str(v2, ks);
+				n = var_find_member(v1, ks->cstr);
+				mstr_free(ks);
+			}
+		}
 	}
 	if(v1 != NULL)
 		vm_push(vm, v1); /* receiver stays for `this` */
@@ -11343,14 +11646,19 @@ static inline void handle_delete_at(vm_t* vm, PC ins, opr_code_t instr, uint32_t
 			res = var_delete_own_member(obj, var_get_str(key));
 		}
 		else {
-			/* Numeric/other key: mirrors handle_array_at and is treated as an
-			 * index. Array elements live in the nested _ARRAY_ store; a plain
-			 * object keeps the decimal-keyed member directly on itself. */
-			var_t* cont = obj->is_array ? var_find_own_member_var(obj, "_ARRAY_") : obj;
+			/* Numeric/other key: mirrors handle_array_at. A canonical index on an
+			 * array addresses the nested _ARRAY_ store; every other key (plain
+			 * object, large/negative/fractional number) is ToString(key) on the
+			 * object itself - var_get_int() wrapped large keys so `delete m[ts]`
+			 * missed the entry `m[ts] = v` created. */
+			int32_t at = 0;
+			bool idx = subscript_index(key, &at);
+			var_t* cont = (obj->is_array && idx) ? var_find_own_member_var(obj, "_ARRAY_") : obj;
 			if(cont != NULL) {
-				char k[32];
-				snprintf(k, sizeof(k), "%d", var_get_int(key));
-				res = var_delete_own_member(cont, k);
+				mstr_t* ks = mstr_new("");
+				var_to_str(key, ks);
+				res = var_delete_own_member(cont, ks->cstr);
+				mstr_free(ks);
 			}
 		}
 	}
@@ -11400,9 +11708,11 @@ static inline void handle_in(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset
 			res = var_has_member(obj, var_get_str(key));
 		}
 		else {
-			char k[32];
-			snprintf(k, sizeof(k), "%d", var_get_int(key));
-			res = var_has_member(obj, k);
+			/* ToString(key), not int32 truncation (see handle_delete). */
+			mstr_t* ks = mstr_new("");
+			var_to_str(key, ks);
+			res = var_has_member(obj, ks->cstr);
+			mstr_free(ks);
 		}
 	}
 	if(key != NULL) var_unref(key);
@@ -11449,6 +11759,17 @@ static const char* proxy_key_cstr(var_t* key, char* numbuf, uint32_t sz) {
 		case V_BOOL:  snprintf(numbuf, sz, "%s", var_get_bool(key) ? "true" : "false"); break;
 		case V_NULL:  snprintf(numbuf, sz, "null"); break;
 		case V_UNDEF: numbuf[0] = 0; break;
+		case V_FLOAT:
+		case V_FLOAT64: {
+			/* JS ToString(number): "1.5" stays "1.5" and a whole double such as a
+			 * timestamp keeps every digit - the old %d/var_get_int wrapped both. */
+			double d = var_get_float64(key);
+			if(d == floor(d) && fabs(d) < 9.2e18)
+				snprintf(numbuf, sz, "%lld", (long long)d);
+			else
+				snprintf(numbuf, sz, "%s", mstr_from_float64(d));
+			break;
+		}
 		default:      snprintf(numbuf, sz, "%d", var_get_int(key)); break;
 	}
 	return numbuf;
@@ -11832,10 +12153,8 @@ bool mario_set_var(vm_t* vm, var_t* obj, var_t* key, var_t* value, var_t* receiv
 			var_array_set(obj, (int32_t)strtol(ks, NULL, 10), val);
 			return true;
 		}
-		if(key->type != V_STRING) {
-			var_array_set(obj, var_get_int(key), val);
-			return true;
-		}
+		/* A non-index numeric key (-1, 1.5, a timestamp) is an ordinary own
+		 * member of the array object, written below like any other name. */
 	}
 	node_t* on = var_find_own_member(obj, ks);
 	if(on == NULL)

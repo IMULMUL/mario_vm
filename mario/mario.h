@@ -431,6 +431,9 @@ extern const char* _mario_lang;
 #define V_ST_REF       3 
 
 #define THIS "this"
+/* Hidden own member on an arrow function object. It stores the exact `this`
+ * value visible when the arrow is created, including an explicit undefined. */
+#define ARROW_THIS "@@arrow_this"
 #define PROTOTYPE "prototype"
 /* A callable's [[Prototype]] is stored separately from its `.prototype`
  * own-property (which doubles as the instance prototype read by `new`). See
@@ -704,6 +707,7 @@ typedef struct st_scope {
 	uint32_t is_switch: 4; // switch scope: a `break` stops here, a `continue` does not (it belongs to an enclosing loop)
 	uint32_t is_label: 4;  // labeled-statement scope: only a `break <label>` with a matching label stops here (never an unlabeled break/continue)
 	uint32_t is_strict: 4;
+	uint32_t default_this: 4; // plain call initially binds globalThis in sloppy code; INSTR_STRICT replaces it with undefined
 	uint32_t is_with: 4;   // `with (obj)` scope: sc->var IS the with object; name resolution walks its member/prototype chain even when it carries no own members
 	uint32_t has_finally: 4; // this try (or a try-finally demoted to a block) owns a finally block at pc_finally that a leaving return/break/continue must run
 	uint32_t is_objlit: 4;  // object/array-literal construction scope (handle_obj): sc->var is the literal being built, NOT a lexical env. Free-name resolution must skip it entirely - its own members are properties-under-construction and its prototype chain (Object.prototype / Array.prototype) would otherwise shadow a real binding for any name that is also a builtin method (`keys`, `values`, `length`, ...), e.g. `{id: keys[i]}` resolving the global array `keys` to Object.prototype.keys.

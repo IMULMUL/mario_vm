@@ -77,6 +77,20 @@ var_t* native_Function_call(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* target = get_obj(env, THIS);
 	var_t* thisArg = get_func_arg(env, 0);
+	var_t* target_name = target != NULL ? var_find_own_member_var(target, "@@fname") : NULL;
+	if(target_name != NULL && target_name->type == V_STRING &&
+	   strcmp(var_get_str(target_name), "toString") == 0) {
+		var_t* fn_ts = vm->builtin_vars.var_Function != NULL ? var_find_own_member_var(var_get_prototype(vm->builtin_vars.var_Function), "toString") : NULL;
+		var_t* obj_ts = vm->builtin_vars.var_Object != NULL ? var_find_own_member_var(var_get_prototype(vm->builtin_vars.var_Object), "toString") : NULL;
+		fprintf(stderr, "[Function.call->toString] script=%s target=%p fn=%d obj=%d arg=%p type=%u is_func=%u is_class=%u refs=%u proxy=%u\n",
+			vm->dbg_tag != NULL ? vm->dbg_tag : "-", (void*)target,
+			target == fn_ts, target == obj_ts,
+			(void*)thisArg, (unsigned)(thisArg != NULL ? thisArg->type : 999u),
+			(unsigned)(thisArg != NULL ? thisArg->is_func : 0u),
+			(unsigned)(thisArg != NULL ? thisArg->is_class : 0u),
+			(unsigned)(thisArg != NULL ? thisArg->refs : 0u),
+			(unsigned)(thisArg != NULL && var_is_proxy(thisArg)));
+	}
 	uint32_t n = get_func_args_num(env);
 	var_t* args = var_new_array(vm);
 	for(uint32_t i = 1; i < n; i++) {
@@ -169,6 +183,16 @@ var_t* native_Function_toString(vm_t* vm, var_t* env, void* data) {
 	/* Class values are callable in a real engine (is_class), so accept them:
 	 * core-js's inspectSource/stringifying paths probe classes through here. */
 	if(self == NULL || (!self->is_func && !self->is_class)) {
+		fprintf(stderr, "[Function.toString] script=%s invalid this=%p type=%u is_func=%u is_class=%u refs=%u proxy=%u name=%s fname=%s proto=%p\n",
+			vm->dbg_tag != NULL ? vm->dbg_tag : "-",
+			(void*)self, (unsigned)(self != NULL ? self->type : 999u),
+			(unsigned)(self != NULL ? self->is_func : 0u),
+			(unsigned)(self != NULL ? self->is_class : 0u),
+			(unsigned)(self != NULL ? self->refs : 0u),
+			(unsigned)(self != NULL && var_is_proxy(self)),
+			(self != NULL && var_find_own_member_var(self, "name") != NULL && var_find_own_member_var(self, "name")->type == V_STRING) ? var_get_str(var_find_own_member_var(self, "name")) : "-",
+			(self != NULL && var_find_own_member_var(self, "@@fname") != NULL && var_find_own_member_var(self, "@@fname")->type == V_STRING) ? var_get_str(var_find_own_member_var(self, "@@fname")) : "-",
+			(void*)(self != NULL ? var_get_prototype(self) : NULL));
 		vm_throw_type_native(vm, "TypeError", "Function.prototype.toString requires that 'this' be a Function");
 		return var_new(vm);
 	}

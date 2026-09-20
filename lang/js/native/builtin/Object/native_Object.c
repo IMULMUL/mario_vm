@@ -802,24 +802,18 @@ var_t* native_Object_defineProperties(vm_t* vm, var_t* env, void* data) {
 		return obj;
 	var_t* keys = var_new_array(vm);
 	var_own_keys(vm, descriptors, keys, false);
+	/* obj/keys/descriptors are borrowed C pointers while descriptor accessors may
+	 * run arbitrary JS. Keep collection deferred until every property is applied. */
+	vm->gc.gc_defer++;
 	uint32_t sz = var_array_size(keys), j;
 	for(j = 0; j < sz; j++) {
-		const char* k = var_get_str(var_array_get_var(keys, (int32_t)j));
+		var_t* key = var_array_get_var(keys, (int32_t)j);
+		const char* k = var_get_str(key);
 		var_t* desc = var_find_own_member_var(descriptors, k);
-		if(desc == NULL)
-			continue;
-		var_t* v = var_find_own_member_var(desc, "value");
-		node_t* node = var_add(obj, k, v != NULL ? v : var_new(vm));
-		v = var_find_own_member_var(desc, "writable");
-		if(v != NULL)
-			node->be_const = !var_get_bool(v);
-		v = var_find_own_member_var(desc, "enumerable");
-		if(v != NULL)
-			node->be_unenumerable = !var_get_bool(v);
-		v = var_find_own_member_var(desc, "configurable");
-		if(v != NULL)
-			node->be_const = !var_get_bool(v);
+		if(desc != NULL)
+			mario_define_property_var(vm, obj, key, desc);
 	}
+	vm->gc.gc_defer--;
 	var_unref(keys);
 	return obj;
 }

@@ -409,6 +409,17 @@ section("8. Arrow functions");
     const c = new Counter();
     c.bump(); c.bump();
     eq(c.n, 2, "arrow captures lexical this");
+    const detachedBump = c.bump;
+    detachedBump();
+    eq(c.n, 3, "detached arrow preserves definition-time this");
+    const otherCounter = { n: 100, bump: c.bump };
+    otherCounter.bump.call(otherCounter);
+    eq(c.n, 4, "call cannot replace arrow lexical this");
+    eq(otherCounter.n, 100, "arrow ignores member and call receiver");
+
+    function missingArrowMemberTrap() { return "wrong"; }
+    throws(() => ({}).missingArrowMemberTrap(),
+        "missing member does not fall back to lexical function");
 
     // Arrows have no prototype and are not constructible
     ok(!Object.prototype.hasOwnProperty.call(dbl, "prototype"), "arrow has no prototype property");
@@ -806,6 +817,15 @@ section("15. async / await");
         deepEq(Array.of(7), [7], "Array.of single number (not length)");
 
         const arr = [1, 2, 3, 4, 5];
+        // Callback results use ECMAScript ToBoolean. In particular, every object,
+        // array and function is truthy; empty strings, zero and NaN are falsy.
+        deepEq([{ a: 1 }, {}].filter(x => x), [{ a: 1 }, {}], "filter keeps object-valued predicates");
+        deepEq(["", "x", 0, 2, NaN].filter(x => x), ["x", 2], "filter applies primitive ToBoolean");
+        ok([1].some(() => ({})), "some treats an object result as truthy");
+        ok([1].every(() => []), "every treats an array result as truthy");
+        eq([1].find(() => function () {}), 1, "find treats a function result as truthy");
+        eq([1].findIndex(() => ({})), 0, "findIndex treats an object result as truthy");
+
         // find / findIndex
         eq(arr.find(x => x > 3), 4, "find first match");
         eq(arr.findIndex(x => x > 3), 3, "findIndex first match");
@@ -832,6 +852,8 @@ section("15. async / await");
 
         // classic ES5 methods still present
         eq([1, 2, 3].map(x => x * 2).join(","), "2,4,6", "map");
+        deepEq(["1", "2", "3"].map(Number), [1, 2, 3], "map calls builtin Number converter");
+        deepEq([1, 2, 3].map(String), ["1", "2", "3"], "map calls builtin String converter");
         eq([1, 2, 3].filter(x => x > 1).join(","), "2,3", "filter");
         eq([1, 2, 3].reduce((a, b) => a + b, 0), 6, "reduce");
         ok([1, 2, 3].some(x => x > 2), "some");
@@ -1118,6 +1140,19 @@ section("15. async / await");
         Object.setPrototypeOf(re, proto);
         eq(re.x, 1, "setPrototypeOf rewires the prototype chain");
 
+        function StaticBase() {}
+        let instanceSetterCalls = 0;
+        Object.defineProperties(StaticBase.prototype, {
+            status: { set: function () { instanceSetterCalls++; } }
+        });
+        StaticBase.answer = 42;
+        function StaticChild() {}
+        Object.setPrototypeOf(StaticChild, StaticBase);
+        StaticChild.status = "READY";
+        eq(instanceSetterCalls, 0, "callable static chain skips Base.prototype accessors");
+        eq(StaticChild.status, "READY", "static assignment creates an own property");
+        eq(StaticChild.answer, 42, "callable static chain inherits constructor statics");
+
         const descriptors = Object.getOwnPropertyDescriptors({ a: 1 });
         ok(descriptors.a !== undefined, "getOwnPropertyDescriptors returns per-key descriptors");
 
@@ -1130,9 +1165,14 @@ section("15. async / await");
         eq(Object.isExtensible(nx), false, "isExtensible is false after preventExtensions");
 
         const dp = {};
-        Object.defineProperties(dp, { a: { value: 1 }, b: { value: 2 } });
+        Object.defineProperties(dp, {
+            a: { value: 1 },
+            b: { value: 2 },
+            sum: { get: function () { return this.a + this.b; } }
+        });
         eq(dp.a, 1, "defineProperties sets a");
         eq(dp.b, 2, "defineProperties sets b");
+        eq(dp.sum, 3, "defineProperties installs accessor descriptors");
     })();
 
     // =========================================================================

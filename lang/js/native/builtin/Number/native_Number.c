@@ -581,6 +581,10 @@ var_t* native_global_isFinite(vm_t* vm, var_t* env, void* data) {
 
 void reg_native_Number(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_NUMBER);
+	/* Numeric constants below are created during Number registration. Cache the
+	 * class first so var_new_int64()/var_new_float64() can attach Number.prototype;
+	 * otherwise Number.MIN_SAFE_INTEGER.toString() has no method chain. */
+	vm->builtin_vars.var_Number = cls;
 	vm_reg_native(vm, cls, "toString(radix)", native_Number_toString, NULL); 
 	vm_reg_native(vm, cls, "toFixed(digits)", native_Number_toFixed, NULL);
 	vm_reg_native(vm, cls, "toExponential(fractionDigits)", native_Number_toExponential, NULL);
