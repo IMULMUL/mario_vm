@@ -193,6 +193,10 @@ var_t* native_Function_toString(vm_t* vm, var_t* env, void* data) {
 			(self != NULL && var_find_own_member_var(self, "name") != NULL && var_find_own_member_var(self, "name")->type == V_STRING) ? var_get_str(var_find_own_member_var(self, "name")) : "-",
 			(self != NULL && var_find_own_member_var(self, "@@fname") != NULL && var_find_own_member_var(self, "@@fname")->type == V_STRING) ? var_get_str(var_find_own_member_var(self, "@@fname")) : "-",
 			(void*)(self != NULL ? var_get_prototype(self) : NULL));
+		{
+			void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+			bc_dump_window(&vm->bc, vm->pc, 12);
+		}
 		vm_throw_type_native(vm, "TypeError", "Function.prototype.toString requires that 'this' be a Function");
 		return var_new(vm);
 	}
