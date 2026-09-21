@@ -167,9 +167,14 @@ section("1. let / const");
 })();
 
 (function () {
-    // Temporal Dead Zone: accessing a let/const before initialization throws.
+    // Temporal Dead Zone: mario intentionally has NO true TDZ (see the
+    // re-declaration comment in mario.c: throwing on a read before the
+    // declaration would abort minified bundles that reuse single-letter
+    // lets across loop iterations, e.g. React hydration). The documented
+    // semantics is: the binding exists from scope entry, so an early read
+    // yields undefined instead of throwing.
     function __tdzProbe() { const read = v; let v = 1; return read; }
-    throws(() => __tdzProbe(), "TDZ: read before declaration throws");
+    eq(__tdzProbe(), undefined, "no-TDZ: read before declaration yields undefined");
 })();
 
 (function () {

@@ -5207,6 +5207,8 @@ void vm_report_uncaught(vm_t* vm) {
 	var_unref(err);
 }
 
+static var_t* vm_make_type_error(vm_t* vm, const char* type_name, const char* message);
+
 void vm_throw(vm_t* vm, const char *format, ...) {
 	char message[BUF_SIZE+1] = {0};
 	va_list ap;
@@ -5215,10 +5217,12 @@ void vm_throw(vm_t* vm, const char *format, ...) {
 	va_end(ap);
 
 	mario_throw_trace(vm, "vm_throw", message);
-	var_t* err = var_new_obj(vm, vm->builtin_vars.var_Error, NULL, NULL);
-	var_t* msg = var_find_member_var(err, "message");
-	if(msg != NULL)
-		var_set_str(msg, message);
+	/* Build the instance exactly like vm_throw_type() does: [[Prototype]] must be
+	 * Error.prototype (NOT the Error class var - that put the class's static
+	 * chain, and with it Function.prototype.toString, in every thrown error's
+	 * prototype walk, so err.toString() threw a second TypeError and the
+	 * message member was never reachable). */
+	var_t* err = vm_make_type_error(vm, "Error", message);
 	vm_push(vm, err);
 
 	scope_t* try_sc = vm_find_inrange_try(vm);
@@ -5253,10 +5257,12 @@ void vm_throw_native(vm_t* vm, const char *format, ...) {
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
 
-	var_t* err = var_new_obj(vm, vm->builtin_vars.var_Error, NULL, NULL);
-	var_t* msg = var_find_member_var(err, "message");
-	if(msg != NULL)
-		var_set_str(msg, message);
+	/* Build the instance exactly like vm_throw_type() does: [[Prototype]] must be
+	 * Error.prototype (NOT the Error class var - that put the class's static
+	 * chain, and with it Function.prototype.toString, in every thrown error's
+	 * prototype walk, so err.toString() threw a second TypeError and the
+	 * message member was never reachable). */
+	var_t* err = vm_make_type_error(vm, "Error", message);
 	if(vm->native_thrown != NULL)
 		var_unref(vm->native_thrown);
 	vm->native_thrown = var_ref(err);
@@ -5273,6 +5279,8 @@ static var_t* vm_make_type_error(vm_t* vm, const char* type_name, const char* me
 	node_t* cn = vm_load_node(vm, type_name, false);
 	var_t* cls = (cn != NULL) ? cn->var : NULL;
 	var_t* proto = (cls != NULL) ? var_get_prototype(cls) : NULL;
+	if(proto == NULL && vm->builtin_vars.var_Error != NULL)
+		proto = var_get_prototype(vm->builtin_vars.var_Error);
 	if(proto == NULL)
 		proto = vm->builtin_vars.var_Error;
 
