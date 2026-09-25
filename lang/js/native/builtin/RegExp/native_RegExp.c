@@ -26,7 +26,12 @@ extern "C" {
  *    returning, so no engine state is ever owned by a GC-managed var. */
 
 #define RE_MAXGROUPS   32       /* capture groups incl. group 0 */
-#define RE_MAXREP      64       /* highest allowed {n,m} bound */
+/* Highest allowed {n,m} bound. Real-world bundles use bounds well above the old
+ * 64 (Pinterest ships {1,256}/{0,256} hostname/label quantifiers), which made
+ * those patterns fail with "repetition too large". Bounded repetition is
+ * unrolled into (max-min) SPLIT+atom instructions and tracked in the emit-time
+ * `splits[RE_MAXREP]` stack array, so keep this moderate (512 -> 2 KiB). */
+#define RE_MAXREP      512      /* highest allowed {n,m} bound */
 #define RE_MAXSTEPS    500000   /* VM step budget per re_match() call */
 #define RE_MAXBT       65536    /* backtrack stack entries per run */
 #define RE_MAXDEPTH    16       /* lookahead nesting */
@@ -181,7 +186,23 @@ static int rp_escape(reparse_t* r, int* shorthand) {
 	case 'r': return '\r';
 	case 'f': return '\f';
 	case 'v': return '\v';
-	case '0': return 0;
+	case '0': case '1': case '2': case '3':
+	case '4': case '5': case '6': case '7': {
+		/* Annex B octal escape (`\0`, `\01`, `\001` .. `\377`): email-style
+		 * validators ship classes like `[\001-\010\013-\037]`; reading only
+		 * the first digit turned the range bounds into literal '0'/'1' chars
+		 * and the class failed with "bad class range". Outside a class
+		 * rp_atom intercepts \1-\9 as back-references before reaching here. */
+		int v = c - '0';
+		while(rp_peek(r) >= '0' && rp_peek(r) <= '7') {
+			int nv = v * 8 + (rp_peek(r) - '0');
+			if(nv > 255)
+				break;
+			rp_next(r);
+			v = nv;
+		}
+		return v;
+	}
 	case 'x': return rp_hex(r, 2);
 	case 'u': {
 		/* \uHHHH: BMP code points only; encode > 0x7F as its first UTF-8
@@ -233,13 +254,15 @@ static renode_t* rp_class(reparse_t* r) {
 	if(n == NULL) { r->err = "oom"; return NULL; }
 	bool negate = false;
 	if(rp_peek(r) == '^') { negate = true; rp_next(r); }
-	bool first = true;
+	/* Per ECMA-262 a ']' always terminates the class: `[]` is the empty class
+	 * and `[^]` its negation (matches every character). Treating a leading
+	 * ']' as a literal member (a PCRE-ism) made `/[^]/` fail with
+	 * "unterminated class", which aborted Pinterest's client bundle. */
 	while(true) {
 		int c = rp_next(r);
 		if(c < 0) { r->err = "unterminated class"; rn_free(n); return NULL; }
-		if(c == ']' && !first)
+		if(c == ']')
 			break;
-		first = false;
 		int lo;
 		if(c == '\\') {
 			int sh = 0;
@@ -664,6 +687,12 @@ re_prog_t* re_compile(const char* pattern, const char* flags, char* err, int err
 	if(ast == NULL || r.pos < r.len) {
 		if(err != NULL)
 			snprintf(err, errlen, "%s", r.err != NULL ? r.err : "unbalanced pattern");
+		/* MARIO_REDBG=1: show the offending pattern so a site-killing regex
+		 * (Pinterest's client bundle dies on one class range) is identifiable
+		 * from the log alone. */
+		if(getenv("MARIO_REDBG") != NULL)
+			mario_printf("[redbg] regexp compile failed: %s | pattern=/%s/ flags=%s\n",
+			           err != NULL ? err : "?", pattern, flags);
 		rn_free(ast);
 		int g;
 		for(g = 0; g < RE_MAXGROUPS; g++) free(r.names[g]);

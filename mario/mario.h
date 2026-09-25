@@ -176,6 +176,12 @@ typedef struct st_bytecode {
 	m_array_t           srcs;          /* private copies of every compiled source (char*) */
 	uint32_t            srcmap_cur;    /* id of the source being compiled */
 	bool                srcmap_on;
+	/* Set by the compiler when the source just compiled carries top-level
+	 * import/export syntax, i.e. the chunk is an ES module body: vm_load_run
+	 * then gives it its own module scope (and an export namespace) so two
+	 * bundles' top-level `export const` of the same runtime name never
+	 * collide. Reset by vm_load before every compile. */
+	bool                chunk_is_module;
 } bytecode_t;
 
 /*
@@ -399,6 +405,7 @@ uint32_t    bc_addstr(bytecode_t* bc, char* owned_str); /* append (takes ownersh
 void        bc_srcmap_begin(bytecode_t* bc, const char* src);       /* new source being compiled */
 void        bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos);     /* statement starts at pos */
 bool        bc_srcmap_locate(bytecode_t* bc, PC pc, mstr_t* out);   /* "src#n line:col | snippet" */
+const char* mario_last_throw_loc(void);   /* DIAG: source trace of the most recent throw (MARIO_SRCMAP) */
 PC          bc_add_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 PC          bc_reserve(bytecode_t* bc);
 
@@ -710,7 +717,8 @@ typedef struct st_scope {
 	uint32_t default_this: 4; // plain call initially binds globalThis in sloppy code; INSTR_STRICT replaces it with undefined
 	uint32_t is_with: 4;   // `with (obj)` scope: sc->var IS the with object; name resolution walks its member/prototype chain even when it carries no own members
 	uint32_t has_finally: 4; // this try (or a try-finally demoted to a block) owns a finally block at pc_finally that a leaving return/break/continue must run
-	uint32_t is_objlit: 4;  // object/array-literal construction scope (handle_obj): sc->var is the literal being built, NOT a lexical env. Free-name resolution must skip it entirely - its own members are properties-under-construction and its prototype chain (Object.prototype / Array.prototype) would otherwise shadow a real binding for any name that is also a builtin method (`keys`, `values`, `length`, ...), e.g. `{id: keys[i]}` resolving the global array `keys` to Object.prototype.keys.
+	uint32_t is_objlit: 4;  // object/array-literal construction scope (handle_obj): sc->var IS the literal being built, NOT a lexical env. Free-name resolution must skip it entirely - its own members are properties-under-construction and its prototype chain (Object.prototype / Array.prototype) would otherwise shadow a real binding for any name that is also a builtin method (`keys`, `values`, `length`, ...), e.g. `{id: keys[i]}` resolving the global array `keys` to Object.prototype.keys.
+	uint32_t is_var_env: 4; // ES module body scope: acts as the *variable environment* for `var` declarations, so handle_var hoists to it instead of escaping to the global object. Every rspack/webpack chunk top-levels `var e,a,c,f,d,b={},r={}`; with all module bodies sharing the global var env the chunks clobbered one registry with another, and once the body scope popped the require function's free `b`/`r` resolved to nothing ("can not find function 'call' on undefined").
 	const char* label;     // for a labeled scope: the label name (points into the bytecode string table, valid for the whole run); NULL otherwise
 	func_t*  func;
 	/* The function OBJECT var that owns `func` (func_t). func_call() picks
@@ -882,6 +890,7 @@ typedef struct st_vm {
 		var_t*          var_Object;
 		var_t*          var_String;
 		var_t*          var_Number;
+		var_t*          var_Boolean; // the Boolean function; its .prototype backs boolean primitives' toString/valueOf
 		var_t*          var_BigInt;
 		var_t*          var_Error;
 		var_t*          var_Array;
@@ -1122,6 +1131,12 @@ vm_t*       vm_from(vm_t* vm);
 bool        vm_load(vm_t* vm, const char* s);
 bool        vm_load_run(vm_t* vm, const char* s);
 bool        vm_load_run_native(vm_t* vm, const char* s);
+/* Run a top-level ES module body AND register its namespace in the module
+ * registry under `spec` (its absolute URL), so a later `import` of the same
+ * URL hits the cache and shares this evaluation's state (webpack/rspack keep
+ * per-chunk runtime registries in module scope; a second eval would see an
+ * empty registry). Returns vm_load_run's success flag. */
+bool        vm_load_run_module(vm_t* vm, const char* s, const char* spec);
 bool        vm_run(vm_t* vm);
 void        vm_close(vm_t* vm);
 void        vm_terminate(vm_t* vm);

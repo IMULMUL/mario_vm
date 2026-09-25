@@ -1074,6 +1074,58 @@ var_t* native_String_fromCodePoint(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* String.raw(callSite, ...substitutions) - static tagged-template function.
+ * The compiler hands a tag function the cooked `strings` array carrying a
+ * `.raw` array (see factor_tagged_template / INSTR_TAG_RAW) followed by the
+ * substitution values. String.raw joins the RAW chunks with the JS-ToString'd
+ * substitutions interleaved: raw[0] + String(sub[0]) + raw[1] + ... + raw[n-1],
+ * leaving backslash escapes uninterpreted (so `\b` stays two characters). It is
+ * the idiomatic way to build a regex source from a template; github's bundles
+ * call String.raw`...` and, with the builtin missing, threw "value is not a
+ * function" the moment the template was evaluated. */
+var_t* native_String_raw(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	uint32_t n = get_func_args_num(env);
+	mstr_t* out = mstr_new("");
+	if(n == 0)
+		goto done;
+	var_t* callsite = get_func_arg(env, 0);
+	if(callsite == NULL)
+		goto done;
+	/* Prefer the `.raw` array; if a caller passed a bare array of strings fall
+	 * back to the callSite itself so String.raw([...]) still concatenates. */
+	var_t* rawv = var_find_member_var(callsite, "raw");
+	var_t* arr = (rawv != NULL && rawv->is_array) ? rawv : callsite;
+	if(!arr->is_array)
+		goto done;
+	{
+		uint32_t an = var_array_size(arr);
+		mstr_t* tmp = mstr_new("");
+		for(uint32_t i = 0; i < an; i++) {
+			var_t* chunk = var_array_get_var(arr, (int32_t)i);
+			if(chunk != NULL) {
+				/* var_to_str RESETS tmp, so stringify then append. */
+				var_to_str(chunk, tmp);
+				mstr_append(out, tmp->cstr);
+			}
+			if(i + 1 < an && i + 1 < n) {
+				var_t* sub = get_func_arg(env, i + 1);
+				if(sub != NULL) {
+					var_to_str(sub, tmp);
+					mstr_append(out, tmp->cstr);
+				}
+			}
+		}
+		mstr_free(tmp);
+	}
+done:
+	{
+		var_t* ret = var_new_str(vm, out->cstr);
+		mstr_free(out);
+		return ret;
+	}
+}
+
 /* --- String.prototype.normalize (NFC / NFD over the Latin ranges) -----------
  * Unicode canonical composition pairs {composed, base, combining-mark} for the
  * precomposed characters in Latin-1 Supplement and Latin Extended-A. NFC composes
@@ -1737,7 +1789,9 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_static(vm, cls, "fromCodePoint()", native_String_fromCodePoint, NULL); 
 	/* fromCharCode takes UTF-16 code units; identical to fromCodePoint for the
 	 * BMP, so it reuses the same implementation. */
-	vm_reg_static(vm, cls, "fromCharCode()", native_String_fromCodePoint, NULL); 
+	vm_reg_static(vm, cls, "fromCharCode()", native_String_fromCodePoint, NULL);
+	/* String.raw - tagged template that returns the raw (unescaped) source. */
+	vm_reg_static(vm, cls, "raw()", native_String_raw, NULL); 
 	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_String_iterator, NULL); 
 
 	vm_reg_native(vm, cls, "at(index)", native_StringAt, NULL);

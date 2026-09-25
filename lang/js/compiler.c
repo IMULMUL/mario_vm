@@ -5,6 +5,7 @@
 #include "lex/mario_lex.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -282,7 +283,9 @@ void lex_get_reserved_word(lex_t* lex) {
             p++;
         }
         char c = (p < lex->data_end) ? lex->data[p] : 0;
-        if (is_alpha((unsigned char)c) || c == '_' || c == '$' || c == '(' || c == '*' || c == '[') {
+        /* '#' starts an ES2022 private method name (`async #n(){}`), which is
+         * a valid async-method head just like a plain name. */
+        if (is_alpha((unsigned char)c) || c == '_' || c == '$' || c == '(' || c == '*' || c == '[' || c == '#') {
             lex->tk = LEX_R_ASYNC;
         }
     } else if (strcmp(lex->tk_str->cstr, "await") == 0) {
@@ -570,7 +573,9 @@ static bool call_args_have_spread(lex_t* l) {
     mstr_cpy(l->tk_str, saved_tk_str->cstr);
 
     bool found = false;
-    int depth = 0;
+    int depth = 0;    // call-paren depth: a spread ARGUMENT lives at depth 1
+    int brace = 0;    // { } depth: an arrow/block body or an object literal
+    int bracket = 0;  // [ ] depth: an array literal
     while (true) {
         if (l->tk == LEX_EOF) {
             break;
@@ -582,7 +587,23 @@ static bool call_args_have_spread(lex_t* l) {
             if (depth <= 0) {
                 break;
             }
-        } else if (depth == 1 && l->tk == '.' && l->curr_ch == '.' && l->next_ch == '.') {
+        } else if (l->tk == '{') {
+            brace++;
+        } else if (l->tk == '}') {
+            if (brace > 0) brace--;
+        } else if (l->tk == '[') {
+            bracket++;
+        } else if (l->tk == ']') {
+            if (bracket > 0) bracket--;
+        } else if (depth == 1 && brace == 0 && bracket == 0 &&
+                   l->tk == '.' && l->curr_ch == '.' && l->next_ch == '.') {
+            /* A top-level `...expr` argument only. A spread nested inside an
+             * arrow body (`(e,t)=>{[...a]}`), an object literal (`{...o}`) or an
+             * array literal (`[...a]`) is NOT a call-argument spread. The old
+             * paren-only scan counted those `...` at paren depth 1, so a call
+             * like `o.xI("$ZodType", (e,t)=>{[...x]})` was mis-flagged, sent
+             * down the *_SPREAD codegen path and lost its callee entirely (the
+             * function was never invoked). Require brace/bracket depth 0 too. */
             found = true;
             break;
         }
@@ -999,6 +1020,39 @@ static bool func_parse_params(lex_t* l, bytecode_t* bc, m_array_t* defaults,
             lex_get_nextch(l); // -> 3rd '.'
             lex_get_nextch(l); // -> first char of the rest name
             lex_get_next_token(l);
+            /* ES6 rest + destructuring pattern: `...[a, b]` / `...{a, b}`.
+             * The slice lands in a hidden temp that the pattern then binds
+             * its leaves from, so record it both as the rest target and as a
+             * destructuring parameter sourced from that same temp. The
+             * prelude assigns the slice before running the pattern binds. */
+            if (l->tk == '[' || l->tk == '{') {
+                char rtemp[32];
+                param_destr_t* pd;
+                snprintf(rtemp, sizeof(rtemp), "__pr%d", g_destr_counter++);
+                *rest_name = mstr_new(rtemp);
+                pd = (param_destr_t*)mario_malloc(sizeof(param_destr_t));
+                memset(pd, 0, sizeof(*pd));
+                snprintf(pd->temp, sizeof(pd->temp), "%s", rtemp);
+                pd->saved = *l;                    // pattern-start lexer state
+                if (!skip_balanced_pattern(l)) {
+                    mario_free(pd);
+                    break;
+                }
+                lex_skip_empty(l);
+                if (l->tk == '=') {
+                    mstr_t* ex = mstr_new("");
+                    if (scan_param_expr(l, ex) == 0) {
+                        mstr_free(ex);
+                        mario_free(pd);
+                        break;
+                    }
+                    pd->def = ex;
+                    lex_get_next_token(l);
+                    lex_skip_empty(l);
+                }
+                array_add(pdestrs, pd);
+                continue;
+            }
             if (l->tk != LEX_ID) {
                 break;
             }
@@ -1717,6 +1771,45 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         if (!lex_chkread(l, ')')) {
             return false;
         }
+        /* `new (expr).member(args)`: a parenthesised base followed by a member
+         * chain is still ONE constructor MemberExpression. JS binds the trailing
+         * `.r(700)` to the `new` - i.e. `new ((n(m)).r)(700)`, NOT
+         * `(new (n(m))).r(700)`. Without walking the chain here the compiler
+         * constructed from the parenthesised value with zero args and left
+         * `.r(args)` as a method call on the freshly built instance, which only
+         * carries a `prototype` member ("can not find function 'r' on
+         * object{prototype}" - pinterest's `new (n(845600)).r(700)`). Mirror the
+         * `new A.b.c(args)` member walk below. */
+        while (l->tk == '.' || l->tk == '[') {
+            if (l->tk == '.') {
+                if (!lex_chkread(l, '.')) {
+                    return false;
+                }
+                if (l->tk != LEX_ID &&
+                    !(l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END)) {
+                    return false;
+                }
+                mstr_t* mem = mstr_new(l->tk_str->cstr);
+                int tk = l->tk;
+                if (!lex_chkread(l, tk)) {
+                    mstr_free(mem);
+                    return false;
+                }
+                bc_gen_str(bc, INSTR_GET, mem->cstr);
+                mstr_free(mem);
+            } else {
+                if (!lex_chkread(l, '[')) {
+                    return false;
+                }
+                if (!base(l, bc)) {
+                    return false;
+                }
+                if (!lex_chkread(l, ']')) {
+                    return false;
+                }
+                bc_gen(bc, INSTR_ARRAY_AT);
+            }
+        }
         int arg_num = 0;
         bool has_spread = false;
         if (l->tk == '(') {
@@ -2026,10 +2119,39 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
                 return false;
             }
         } else if (l->tk == LEX_INT || l->tk == LEX_FLOAT) {
-            /* Numeric literal key: {0:"a"}, {1.5:"x"} (common in webpack module
-             * maps). JS uses the number's string form as the property name;
-             * `id` already captured the literal text from tk_str above. */
+            /* Numeric literal key: {0:"a"}, {1.5:"x"}, {529e3:f} (common in
+             * webpack module maps). JS applies ToPropertyKey to the number, i.e.
+             * its CANONICAL string form, not the source text: {529e3:f} keys
+             * "529000", {0x10:f} keys "16". Webpack ids are written in
+             * scientific/hex form (`{529e3(e,t,n){...}}` required via
+             * `n(529e3)`), so keeping the raw token "529e3" left the factory
+             * under a key the float require (`n[529000]` -> "529000") never
+             * matched - the module resolved to undefined and `.call` threw
+             * ("can not find function 'call' on object{}", pinterest www/index).
+             * Canonicalise exactly like bc_gen_str parses the literal and
+             * var_to_str renders the resulting value. */
             int tk = l->tk;
+            char text[128];
+            snprintf(text, sizeof(text), "%s", id->cstr);
+            if (tk == LEX_INT) {
+                if (strstr(text, "0x") != NULL || strstr(text, "0X") != NULL) {
+                    errno = 0;
+                    unsigned long long h = strtoull(text, NULL, 16);
+                    if (errno == ERANGE || h > 0x7FFFFFFFFFFFFFFFULL)
+                        mstr_cpy(id, mstr_from_float64(strtod(text, NULL)));
+                    else
+                        mstr_cpy(id, mstr_from_int64((int64_t)h, 10));
+                } else {
+                    errno = 0;
+                    long long ll = strtoll(text, NULL, 10);
+                    if (errno == ERANGE)
+                        mstr_cpy(id, mstr_from_float64(strtod(text, NULL)));
+                    else
+                        mstr_cpy(id, mstr_from_int64((int64_t)ll, 10));
+                }
+            } else {
+                mstr_cpy(id, mstr_from_float64(strtod(text, NULL)));
+            }
             if (!lex_chkread(l, tk)) {
                 mstr_free(id);
                 return false;
@@ -5342,6 +5464,7 @@ bool stmt_import(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, LEX_R_IMPORT)) {
         return false;
     }
+    bc->chunk_is_module = true;   /* import syntax: this chunk is a module body */
     lex_skip_empty(l);
 
     /* import 'mod' : evaluate for side effects only. */
@@ -5557,6 +5680,7 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, LEX_R_EXPORT)) {
         return false;
     }
+    bc->chunk_is_module = true;   /* export syntax: this chunk is a module body */
     lex_skip_empty(l);
 
     /* export default <assignment-expr> ; (function/class expressions included) */

@@ -607,7 +607,20 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
             result = (value != NULL) ? var_ref(value) : NULL;   /* identity */
         }
         if (npd != NULL) {
+            if (getenv("MARIO_DRAINDBG") != NULL && result != NULL) {
+                promise_data* rpd0 = is_promise(vm, result) ? (promise_data*)result->value : NULL;
+                fprintf(stderr, "[draindbg] pre-unwrap result=%p isprom=%d state=%d inner=%p innertype=%d\n",
+                    (void*)result, is_promise(vm, result) ? 1 : 0,
+                    rpd0 ? (int)rpd0->state : -1,
+                    rpd0 ? (void*)rpd0->value : NULL,
+                    (rpd0 && rpd0->value) ? (int)rpd0->value->type : -1);
+            }
             result = promise_unwrap(vm, result);   /* consumes result's ref */
+            if (getenv("MARIO_DRAINDBG") != NULL) {
+                fprintf(stderr, "[draindbg] post-unwrap result=%p type=%d hasStatus=%d\n",
+                    (void*)result, result ? (int)result->type : -1,
+                    (result && var_find_own_member_var(result, "status") != NULL) ? 1 : 0);
+            }
             var_t* old = npd->value;
             npd->state = PROMISE_STATE_FULFILLED;
             npd->value = (result != NULL) ? result : var_ref(var_new_null(vm));
@@ -805,8 +818,13 @@ var_t* native_PromiseThen(vm_t* vm, var_t* env, void* data) {
     }
 
     promise_data* newPd = promise_data_alloc(vm);
-    newPd->state = pd->state;
-    newPd->value = pd->value ? var_ref(pd->value) : NULL;
+    /* ES: the promise returned by then() starts PENDING and is settled later by
+     * the reaction's result. native_await already handles PENDING by spinning
+     * vm->on_await_pending until it settles, so the synchronous VM does not need
+     * the old copy-the-source-value hack (which made nested adoption deliver a
+     * stale value). */
+    newPd->state = PROMISE_STATE_PENDING;
+    newPd->value = NULL;
     promise_alloc_callbacks(vm, newPd);
 
     var_t* proto = promise_species_proto(vm, promise, var_get_prototype(promise));
@@ -1150,6 +1168,24 @@ var_t* promise_new_rejected(vm_t* vm, var_t* reason) {
     return promise;
 }
 
+/* ES2024 Promise.withResolvers(): a fresh pending promise bundled with its
+ * resolve/reject handles as {promise, resolve, reject}. GitHub's react-app
+ * registration registry defers every app lookup through this, so without it
+ * getRegistration() throws and the whole hydration chain collapses. The
+ * resolve/reject handles from promise_new_deferred close over the promise via
+ * their native data slot, so they settle it regardless of call `this`. */
+static var_t* native_Promise_withResolvers(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* res = NULL;
+    var_t* rej = NULL;
+    var_t* promise = promise_new_deferred(vm, &res, &rej);
+    var_t* out = var_new_obj(vm, NULL, NULL, NULL);
+    var_add(out, "promise", promise);
+    var_add(out, "resolve", res);
+    var_add(out, "reject", rej);
+    return out;
+}
+
 void reg_native_Promise(vm_t* vm) {
     var_t* cls = vm_new_class(vm, CLS_PROMISE);
     s_builtin_promise_proto = var_get_prototype(cls);
@@ -1160,6 +1196,7 @@ void reg_native_Promise(vm_t* vm) {
     vm_reg_static(vm, cls, "allSettled(promises)", native_PromiseAllSettled, NULL);
     vm_reg_static(vm, cls, "race(promises)", native_PromiseRace, NULL);
     vm_reg_static(vm, cls, "any(promises)", native_PromiseAny, NULL);
+    vm_reg_static(vm, cls, "withResolvers()", native_Promise_withResolvers, NULL);
     vm_reg_native(vm, cls, "then(onFulfilled, onRejected)", native_PromiseThen, NULL);
     vm_reg_native(vm, cls, "catch(onRejected)", native_PromiseCatch, NULL);
     vm_reg_native(vm, cls, "finally(onFinally)", native_PromiseFinally, NULL);

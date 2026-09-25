@@ -1509,6 +1509,17 @@ void bc_srcmap_begin(bytecode_t* bc, const char* src) {
 	memcpy(copy, src, n + 1);
 	array_add(&bc->srcs, copy);
 	bc->srcmap_cur = bc->srcs.size - 1;
+	/* MARIO_SRCDBG: a bundle's src#n index is otherwise unrelatable to the
+	 * network script it came from. Print the head (usually the sourcemap
+	 * consumer hint / first statements) and the tail (the trailing
+	 * //# sourceMappingURL=<name>.js.map comment) so an index can be mapped
+	 * back to a downloadable file. */
+	if(getenv("MARIO_SRCDBG") != NULL) {
+		size_t hn = n < 90 ? n : 90;
+		size_t tn = n < 110 ? n : 110;
+		fprintf(stderr, "[srcdbg] src#%u len=%zu head=%.*s\n[srcdbg]   tail=%.*s\n",
+				bc->srcmap_cur, n, (int)hn, copy, (int)tn, copy + (n - tn));
+	}
 }
 
 void bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos) {
@@ -2033,6 +2044,12 @@ static void mario_throw_trace(vm_t* vm, const char* kind, const char* message) {
 		snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
 	fprintf(stderr, "[THROWALL] %s pc=%u msg=%s%s\n", kind, (unsigned)vm->pc,
 		message != NULL ? message : "(null)", tagsfx);
+	if(vm->bc.srcmap_on) { /* TEMP: exact throwing callsite source snapshot */
+		mstr_t* loc = mstr_new("");
+		if(bc_srcmap_locate(&vm->bc, (vm->pc > 0) ? vm->pc - 1 : 0, loc))
+			fprintf(stderr, "[THROWALL]   at %s\n", loc->cstr);
+		mstr_free(loc);
+	}
 	if(message != NULL && strcmp(message, "Error: va") == 0 && vm->scope_stack_top > 0) {
 		scope_t* top = vm->scope_stack[vm->scope_stack_top - 1];
 		static const char* names[] = {"a", "b", "c", "d"};
@@ -3605,7 +3622,22 @@ static const char* get_typeof(var_t* var) {
 		case V_OBJECT: 
 			if(var_is_symbol(var))
 				return "symbol";
-			return (var->is_func || var->is_class) ? "function": "object";
+			if(var->is_func || var->is_class)
+				return "function";
+			/* A Proxy is transparent for typeof: it reports "function" iff its
+			 * target is callable (a proxy has a [[Call]] internal method exactly
+			 * when its target does). Without this, `typeof new Proxy(fn,{})`
+			 * returned "object", so guards like axios/CancelToken's
+			 * `if("function"!=typeof executor) throw TypeError(...)` rejected a
+			 * perfectly good proxied callback. */
+			if(var_is_proxy(var) && !var_proxy_is_revoked(var)) {
+				var_t* tg = var_proxy_target(var);
+				/* target is_func/is_class covers fn & class; var_is_callable
+				 * recurses through a nested proxy-of-function. */
+				if(tg != NULL && (tg->is_func || tg->is_class || var_is_callable(tg)))
+					return "function";
+			}
+			return "object";
 	}
 	return "undefined";
 }
@@ -3714,6 +3746,12 @@ inline var_t* var_new_bool(vm_t* vm, bool b) {
 	var->type = V_BOOL;
 	var->value = mario_malloc(sizeof(int));
 	*((int*)var->value) = b;
+	/* Boolean primitives get Boolean.prototype so `false.toString()` /
+	 * `x.valueOf()` resolve (github's app-runtime does `(0,u.Xl)().toString()`
+	 * on a !! boolean). Guarded: the true/false singletons are built in vm_new
+	 * before the natives register var_Boolean, and are retro-linked there. */
+	if(vm->builtin_vars.var_Boolean != NULL)
+		var_set_prototype(var, var_get_prototype(vm->builtin_vars.var_Boolean));
 	return var;
 }
 
@@ -4621,30 +4659,39 @@ node_t* vm_find(vm_t* vm, const char* name) {
 	return var_find_own_member(var, name);	
 }
 
-node_t* vm_find_in_class(var_t* var, const char* name) {
-	var_t* proto = NULL;
-	/* A callable whose [[Prototype]] was set explicitly (Object.setPrototypeOf)
-	 * resolves its OWN inherited (static) members through that hidden FPROTO link
-	 * first; its `.prototype` member stays the instance prototype for `new`. Only
-	 * callables that went through setPrototypeOf have FPROTO, so everything else
-	 * keeps the existing var_get_prototype() behaviour. */
-	if(var != NULL && (var->is_func || var->is_class))
-		proto = var_get_callable_proto(var);
-	if(proto == NULL)
-		proto = var_get_prototype(var);
+/* Walk one prototype chain looking for `name`. Each hop follows the callable
+ * rule: a callable's next link is its OWN [[Prototype]] (FPROTO, then
+ * Function.prototype / Object.prototype) as ES does for statics, anything else
+ * follows its `.prototype` member - which is how instance prototypes are linked.
+ * A non-function hit is cloned onto `var` and flagged inherited, so the next
+ * lookup is a direct own hit. */
+static node_t* find_in_proto_chain_ex(var_t* var, var_t* start, const char* name, bool static_only) {
 	/* A cyclic prototype chain (a class linked, directly or through a mixin,
 	 * as its own ancestor) would spin here forever; bound the walk so a
 	 * pathological chain degrades to a miss instead of freezing the engine. */
 	int hops = 0;
+	var_t* proto = start;
 	while(proto != NULL && hops++ < 4096) {
-		node_t* ret = NULL;
-		ret = var_find_own_member(proto, name);
+		node_t* ret = var_find_own_member(proto, name);
 		if(ret != NULL) {
-			if(ret->var != NULL && ret->var->is_func)
+			if(!static_only) {
+				if(ret->var != NULL && ret->var->is_func)
+					return ret;
+				ret = var_add(var, name, var_clone(ret->var));
+				ret->be_inherited = 1;
 				return ret;
-			ret = var_add(var, name, var_clone(ret->var));
-			ret->be_inherited = 1;
-			return ret;
+			}
+			/* static_only: this walk climbs a CLASS's instance-prototype chain to
+			 * resolve inherited STATIC methods (mario installs statics on the
+			 * instance prototype, flagged func->is_static). An INSTANCE member
+			 * (method / getter / setter) must never surface as a static: returning
+			 * it made `SomeClass.name` invoke the instance `get name(){ return
+			 * this.getAttribute(...) }` with this=the class, throwing "can not find
+			 * function 'getAttribute' on object{prototype,...}". Only a genuine
+			 * is_static function is accepted; anything else keeps climbing. */
+			func_t* rf = (ret->var != NULL && ret->var->is_func) ? var_get_func(ret->var) : NULL;
+			if(rf != NULL && rf->is_static)
+				return ret;
 		}
 		/* The next link of a callable is its own [[Prototype]], not its public
 		 * `.prototype` instance template. After `setPrototypeOf(Sub, Base)`, static
@@ -4671,6 +4718,36 @@ node_t* vm_find_in_class(var_t* var, const char* name) {
 		}
 	}
 	return NULL;
+}
+
+node_t* vm_find_in_class(var_t* var, const char* name) {
+	if(var == NULL)
+		return NULL;
+	/* A callable whose [[Prototype]] was set explicitly (Object.setPrototypeOf or
+	 * `class Sub extends Base`) resolves its OWN inherited (static) members through
+	 * that hidden FPROTO link first; its `.prototype` member stays the instance
+	 * prototype for `new`. Only callables that went through one of those have FPROTO,
+	 * so everything else keeps the existing var_get_prototype() behaviour. */
+	if(var->is_func || var->is_class) {
+		var_t* fproto = var_get_callable_proto(var);
+		if(fproto != NULL) {
+			node_t* ret = find_in_proto_chain_ex(var, fproto, name, false);
+			if(ret != NULL)
+				return ret;
+			/* mario stores a class's static METHODS on the class var's instance
+			 * prototype while static VALUES (base.foo = ...) live on the class var
+			 * itself, so an `extends` subclass has to consult both chains: the class
+			 * chain above for values, the instance-prototype chain here for methods
+			 * (Sub.prototype -> Base.prototype). Restricted to classes that actually
+			 * carry an @super link so a setPrototypeOf-reparented plain function (e.g.
+			 * core-js's typed-array constructors) never exposes instance accessors as
+			 * statics. */
+			if(var->is_class && var_find_own_member(var, "@super") != NULL)
+				return find_in_proto_chain_ex(var, var_get_prototype(var), name, true);
+			return NULL;
+		}
+	}
+	return find_in_proto_chain_ex(var, var_get_prototype(var), name, false);
 }
 
 bool var_instanceof(var_t* var, var_t* proto) {
@@ -5126,6 +5203,14 @@ static void vm_capture_throw_loc(vm_t* vm) {
 	mstr_free(one);
 }
 
+/* DIAG (temp): expose the most-recent throw's captured source trace so a native
+ * bridge that SUPPRESSES an error (e.g. ce_upgrade_all swallowing a failing
+ * connectedCallback) can still report where it originated. Returns NULL when
+ * MARIO_SRCMAP is off or nothing has thrown yet. */
+const char* mario_last_throw_loc(void) {
+	return (s_throw_loc != NULL) ? s_throw_loc->cstr : NULL;
+}
+
 /* Start propagating `err` (adopts the reference): every vm_run frame unwinds
  * until one catches it in-range or the script top reports it. */
 static void vm_propagate(vm_t* vm, var_t* err) {
@@ -5167,8 +5252,10 @@ static void vm_propagate(vm_t* vm, var_t* err) {
 								if(lv == NULL) continue;
 								if(lv->is_array)
 									fprintf(stderr, "[THROWDBG]     local %s = ARRAY size=%u type=%d\n", ln[li], (unsigned)var_array_size(lv), (int)lv->type);
-								else if(lv->type == V_INT || lv->type == V_FLOAT)
+								else if(lv->type == V_INT || lv->type == V_FLOAT || lv->type == V_INT64)
 									fprintf(stderr, "[THROWDBG]     local %s = NUM %lld type=%d\n", ln[li], (long long)var_get_int64(lv), (int)lv->type);
+								else if(lv->type == V_FLOAT64)
+									fprintf(stderr, "[THROWDBG]     local %s = FLT %.17g type=%d\n", ln[li], var_get_float(lv), (int)lv->type);
 								else {
 									fprintf(stderr, "[THROWDBG]     local %s = type=%d is_array=%d\n", ln[li], (int)lv->type, (int)lv->is_array);
 									if(lv->type == V_OBJECT) {
@@ -5702,6 +5789,28 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num) {
 					(unsigned)(av != NULL ? av->is_array : 0u),
 					(long long)((av != NULL && (av->type == V_INT || av->type == V_INT64 ||
 					             av->type == V_FLOAT || av->type == V_FLOAT64)) ? var_get_int64(av) : -1));
+			}
+			if(vm->bc.srcmap_on) { /* DIAG (temp): map the caller's call/NEW pc back to
+			   * the compiled source so the exact `new X(...)` site is readable. */
+				PC callpc = (vm->pc > 0) ? vm->pc - 1 : 0;
+				mstr_t* loc = mstr_new("");
+				if(bc_srcmap_locate(&vm->bc, callpc, loc))
+					fprintf(stderr, "[fpcdbg] callsite@%u: %s\n", (unsigned)callpc, loc->cstr);
+				mstr_free(loc);
+				/* caller frames: func-entry pcs up the scope stack, so the app
+				 * function that invoked this ctor is identifiable too. */
+				scope_t* sc = (vm->scope_stack_top > 0) ? vm->scope_stack[vm->scope_stack_top - 1] : NULL;
+				int hop = 0;
+				while(sc != NULL && hop++ < 8) {
+					if(sc->is_func && sc->func != NULL) {
+						mstr_t* fl = mstr_new("");
+						fprintf(stderr, "[fpcdbg]   frame[%d] entrypc=%u\n", hop, (unsigned)sc->func->pc);
+						if(bc_srcmap_locate(&vm->bc, sc->func->pc, fl))
+							fprintf(stderr, "[fpcdbg]     %s\n", fl->cstr);
+						mstr_free(fl);
+					}
+					sc = sc->prev;
+				}
 			}
 		}
 	}
@@ -6443,6 +6552,13 @@ static inline void math_result(vm_t* vm, opr_code_t op, node_t* n, var_t* res) {
 static inline int num_class(var_t* v) {
 	switch(v->type) {
 		case V_INT:     return NC_INT32;
+		/* A boolean is numeric for arithmetic: JS ToNumber(true)=1, ToNumber(false)=0.
+		 * Classifying it as NC_INT32 lets `3*false`->0, `3-false`->3, `true+true`->2
+		 * take the numeric lane instead of falling through to string concatenation
+		 * (which produced `3+false`->"3false", `3*false`->undefined). `+` still
+		 * concatenates when the OTHER operand is a string, since that operand stays
+		 * NC_NONE and the both-numeric guard fails ("a"+true -> "atrue"). */
+		case V_BOOL:    return NC_INT32;
 		case V_INT64:   return NC_INT64;
 		case V_FLOAT:
 		case V_FLOAT64: return NC_FLOAT;
@@ -6469,6 +6585,7 @@ static inline int32_t to_int32(var_t* v) {
 	double d;
 	switch(v->type) {
 		case V_INT:     return *(int*)v->value;
+		case V_BOOL:    return *(int*)v->value; // ToInt32(true)=1, ToInt32(false)=0
 		case V_INT64:   return (int32_t)(*(int64_t*)v->value);
 		case V_FLOAT:   d = (double)(*(float*)v->value); break;
 		case V_FLOAT64: d = *(double*)v->value; break;
@@ -6688,6 +6805,36 @@ static inline void math_op(vm_t* vm, opr_code_t op, var_t* v1, var_t* v2, node_t
 	vm_push(vm, var_new(vm));
 }
 
+/* Code-unit (unsigned byte) lexicographic order, which is what the ES Abstract
+ * Relational Comparison of two strings requires; plain strcmp uses signed char
+ * and mis-orders bytes above 0x7F (UTF-8 continuation bytes). */
+static int str_unit_cmp(const char* a, const char* b) {
+    const unsigned char* p = (const unsigned char*)(a ? a : "");
+    const unsigned char* q = (const unsigned char*)(b ? b : "");
+    while(*p != 0 && *p == *q) { p++; q++; }
+    return (int)*p - (int)*q;
+}
+
+/* JS ToNumber for a string: surrounding whitespace stripped, empty -> 0, and
+ * the whole remainder must parse or the result is NaN (reported as false). */
+static bool str_to_number(const char* s, double* out) {
+    if(s == NULL) { *out = 0.0; return true; }
+    while(*s==' '||*s=='\t'||*s=='\n'||*s=='\r'||*s=='\v'||*s=='\f') s++;
+    const char* e = s + strlen(s);
+    while(e > s && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\n'||e[-1]=='\r'||e[-1]=='\v'||e[-1]=='\f')) e--;
+    if(e == s) { *out = 0.0; return true; }
+    char buf[64];
+    size_t n = (size_t)(e - s);
+    if(n >= sizeof(buf)) return false;
+    memcpy(buf, s, n);
+    buf[n] = 0;
+    char* end = NULL;
+    double d = strtod(buf, &end);
+    if(end != buf + n) return false;
+    *out = d;
+    return true;
+}
+
 static inline void compare(vm_t* vm, opr_code_t op, var_t* v1, var_t* v2) {
     if(v1->type == V_OBJECT) {
         bool i = false;
@@ -6800,6 +6947,33 @@ static inline void compare(vm_t* vm, opr_code_t op, var_t* v1, var_t* v2) {
 		return;
 	}
 
+	/* ---- string vs number ----
+	 * A string against a number compares by ToNumber(string) for == and the
+	 * relational ops (=== / !== stay type-strict). Previously every mixed
+	 * string/number comparison fell through to false. */
+	if((v1->type == V_STRING && (var_is_number(v2) || v2->type == V_BOOL)) ||
+	   (v2->type == V_STRING && (var_is_number(v1) || v1->type == V_BOOL))) {
+		double d = 0.0;
+		bool ok = str_to_number((const char*)((v1->type == V_STRING) ? v1->value : v2->value), &d);
+		if(!ok) d = NAN;
+		double f1 = (v1->type == V_STRING) ? d : var_get_float64(v1);
+		double f2 = (v1->type == V_STRING) ? var_get_float64(v2) : d;
+		bool r = false;
+		switch(op) {
+			case INSTR_TEQ:  r = false; break;      /* different types */
+			case INSTR_NTEQ: r = true;  break;
+			case INSTR_EQ:   r = (f1 == f2); break; /* NaN makes this false */
+			case INSTR_NEQ:  r = (f1 != f2); break; /* NaN makes this true  */
+			case INSTR_LES:  r = (f1 < f2);  break;
+			case INSTR_GRT:  r = (f1 > f2);  break;
+			case INSTR_LEQ:  r = (f1 <= f2); break;
+			case INSTR_GEQ:  r = (f1 >= f2); break;
+			default: break;
+		}
+		vm_push(vm, r ? vm->builtin_vars.var_true : vm->builtin_vars.var_false);
+		return;
+	}
+
 	bool i = false;
 	if(v1->type == v2->type) {
 		if(v1->type == V_STRING) {
@@ -6814,6 +6988,30 @@ static inline void compare(vm_t* vm, opr_code_t op, var_t* v1, var_t* v2) {
 					if(i && getenv("MARIO_CMPDBG"))
 						fprintf(stderr, "[CMPDBG] str NEQ true: '%s' vs '%s'\n", (const char*)v1->value, (const char*)v2->value);
 					break;
+				/* Relational on two strings is lexicographic by code unit, not
+				 * numeric: these four cases were missing entirely, so "a"<"b"
+				 * (and every minified `"u">typeof window` guard) fell through
+				 * to false. */
+				case INSTR_LES: {
+					int c = str_unit_cmp((const char*)v1->value, (const char*)v2->value);
+					i = (c < 0);
+					break;
+				}
+				case INSTR_GRT: {
+					int c = str_unit_cmp((const char*)v1->value, (const char*)v2->value);
+					i = (c > 0);
+					break;
+				}
+				case INSTR_LEQ: {
+					int c = str_unit_cmp((const char*)v1->value, (const char*)v2->value);
+					i = (c <= 0);
+					break;
+				}
+				case INSTR_GEQ: {
+					int c = str_unit_cmp((const char*)v1->value, (const char*)v2->value);
+					i = (c >= 0);
+					break;
+				}
 			}
 		}
 		else if(v1->type == V_NULL) {
@@ -7189,7 +7387,10 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 	else
 		vm_push_node(vm, n);
 }
-static void do_extends(vm_t* vm, var_t* cls_var, const char* super_name) {
+/* Link cls_var under its superclass. `implicit_obj` marks the default
+ * `extends Object` every class gets from vm_new_class()/INSTR_EXTENDS, as
+ * opposed to a superclass the source actually named. */
+static void do_extends(vm_t* vm, var_t* cls_var, const char* super_name, int implicit_obj) {
 	node_t* n = vm_find_in_scopes(vm, super_name);
 	if(n == NULL) {
 		mario_debug("Super Class '%s' not found!\n", super_name);
@@ -7197,7 +7398,28 @@ static void do_extends(vm_t* vm, var_t* cls_var, const char* super_name) {
 	}
 
 	var_set_father(cls_var, n->var);
-	var_add(cls_var, "@super", n->var); // var_add takes its own reference
+	/* ES static inheritance: a derived class's [[Prototype]] is its superclass, so
+	 * `Sub.staticValue` must resolve up the class chain. var_set_father only links
+	 * the INSTANCE prototypes, and inherited static METHODS survive on their own
+	 * @super path inside find_func - but an inherited static VALUE (a property
+	 * assigned to the base class) read as undefined, and Object.getPrototypeOf(Sub)
+	 * reported Function.prototype instead of Base. FPROTO is exactly the link
+	 * Object.setPrototypeOf installs and vm_find_in_class already walks.
+	 *
+	 * Only an EXPLICIT superclass gets that link. mario keeps a class's statics on
+	 * the class var's instance prototype (where vm_reg_static/handle_class put them),
+	 * so giving every class FPROTO=Object made the static walk reach
+	 * Function.prototype FIRST and hand back Function.prototype.apply for
+	 * `Reflect.apply` - the native static never ran and the universal apply then
+	 * threw "target is not callable" on the argument list. A class with no named
+	 * superclass must keep resolving statics through its own prototype. */
+	if(!implicit_obj && n->var != cls_var && n->var->type == V_OBJECT)
+		var_set_callable_proto(cls_var, n->var);
+	node_t* sn = var_add(cls_var, "@super", n->var); // var_add takes its own reference
+	if(sn != NULL) {
+		sn->invisable = 1;
+		sn->be_unenumerable = 1;
+	}
 }
 
 /** create object by classname or function */
@@ -7283,7 +7505,12 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 	{
 		var_t* chain[32];
 		int cn = 0;
-		for(var_t* c = ctor_var; c != NULL && cn < 32; c = NULL)
+		/* Advance ONLY in the body: a `c = NULL` loop-increment (the historical
+		 * form) truncated the walk to the leaf class, so superclass field
+		 * initializers never replayed and inherited class fields (github's
+		 * catalyst `nameAttribute="app-name"` on the base element class) read
+		 * back undefined on every instance. */
+		for(var_t* c = ctor_var; c != NULL && cn < 32; )
 		{
 			chain[cn++] = c;
 			node_t* sn = var_find_own_member(c, "@super");
@@ -7308,6 +7535,9 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 				break;
 			}
 		}
+		if(getenv("MARIO_FIELDDBG") != NULL)
+			fprintf(stderr, "[fielddbg] replay ctor=%p cn=%d has_fields=%d obj=%p\n",
+					(void*)ctor_var, cn, (int)has_fields, (void*)obj);
 		if(has_fields) {
 			var_ref(obj);
 			for(int i = cn - 1; i >= 0; i--) {
@@ -7331,6 +7561,8 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 					var_t* rv = vm_pop2(vm);
 					if(rv == NULL)
 						rv = var_new(vm);
+					if(getenv("MARIO_FIELDDBG") != NULL)
+						fprintf(stderr, "[fielddbg]   install '%s' rv=%p on obj=%p\n", fs, (void*)rv, (void*)obj);
 					node_t* rn = var_add(obj, fs, rv);
 					if(rn != NULL)
 						var_unref(rv);
@@ -7369,6 +7601,30 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 		 * previous value afterwards so nested/outer constructions stay correct. */
 		var_t* old_nt = vm->new_target;
 		vm->new_target = ctor_var;
+		if(getenv("MARIO_NEWAT") != NULL && (vm->pc > 0 ? vm->pc - 1 : 0) == (PC)atoi(getenv("MARIO_NEWAT"))) {
+			func_t* dbgcf = var_get_func(constructor);
+			fprintf(stderr, "[newctor] name='%s' ctor_var=%p constructor=%p ctor_pc=%u ctor_native=%p arg_num=%d\n",
+				name, (void*)ctor_var, (void*)constructor,
+				(unsigned)(dbgcf != NULL ? dbgcf->pc : 0u),
+				(void*)(dbgcf != NULL ? dbgcf->native : NULL), arg_num);
+			/* DIAG (temp): walk protoV's chain to see which level supplies the
+			 * "constructor" the @@ctor-less fallback picked up. */
+			fprintf(stderr, "[newctor]   @@ctor_present=%d protoV=%p\n",
+				(var_find_own_member(ctor_var, "@@ctor") != NULL) ? 1 : 0, (void*)protoV);
+			{
+				var_t* pp = protoV;
+				int hh = 0;
+				while(pp != NULL && hh++ < 12) {
+					node_t* cn2 = var_find_own_member(pp, CONSTRUCTOR);
+					var_t* cv2 = (cn2 != NULL) ? cn2->var : NULL;
+					func_t* cf2 = (cv2 != NULL) ? var_get_func(cv2) : NULL;
+					fprintf(stderr, "[newctor]   proto[%d]=%p is_class=%u own.constructor=%p pc=%u native=%p\n",
+						hh, (void*)pp, (unsigned)pp->is_class, (void*)cv2,
+						(unsigned)(cf2 != NULL ? cf2->pc : 0u), (void*)(cf2 != NULL ? cf2->native : NULL));
+					pp = var_get_prototype(pp);
+				}
+			}
+		}
 		func_call(vm, obj, constructor, arg_num);
 		vm->new_target = old_nt;
 		var_t* ret = vm_pop2(vm); // no unref: ret carries func_call's push ref
@@ -7408,6 +7664,13 @@ static void dbg_dump_member(const char* key, void* value, void* ud);
 
 var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
 	node_t* n = vm_load_node(vm, name, false); //load class;
+	if(getenv("MARIO_NEWAT") != NULL && (vm->pc > 0 ? vm->pc - 1 : 0) == (PC)atoi(getenv("MARIO_NEWAT"))) {
+		fprintf(stderr, "[newobj] name='%s' n=%p n->name='%s' n->var=%p is_class=%u is_func=%u\n",
+			name, (void*)n, (n != NULL && n->name != NULL) ? n->name : "(null)",
+			(void*)(n != NULL ? n->var : NULL),
+			(unsigned)(n != NULL && n->var != NULL ? n->var->is_class : 0u),
+			(unsigned)(n != NULL && n->var != NULL ? n->var->is_func : 0u));
+	}
 
 	if(n == NULL) {
 		mario_debug("Error: There is no class: '%s'!\n", name);
@@ -7535,6 +7798,44 @@ static bool do_new(vm_t* vm, const char* full) {
 	 * throw. Return true so handle_new does not vm_terminate (the throw must be
 	 * catchable by an enclosing try/catch). */
 	node_t* cn = vm_load_node(vm, name->cstr, false);
+	if(getenv("MARIO_NEWAT") != NULL) { /* DIAG (temp): dump named-NEW at a specific call vpc */
+		PC cur = (vm->pc > 0) ? vm->pc - 1 : 0;
+		if(cur == (PC)atoi(getenv("MARIO_NEWAT"))) {
+			fprintf(stderr, "[newat] NEW name='%s' argc=%d vpc=%u resolved=%p is_func=%u is_class=%u\n",
+				name->cstr, arg_num, (unsigned)cur, (void*)(cn ? cn->var : NULL),
+				(unsigned)(cn && cn->var ? cn->var->is_func : 0u),
+				(unsigned)(cn && cn->var ? cn->var->is_class : 0u));
+			/* DIAG (temp): which node/name did the free-variable lookup land on, and
+			 * what constructor does that class actually pin? A native ctor has
+			 * native!=NULL/pc==0; a script class ctor has native==NULL/pc==body. */
+			if(cn != NULL) {
+				fprintf(stderr, "[newat]   node=%p node->name='%s'\n", (void*)cn,
+					cn->name != NULL ? cn->name : "(null)");
+				var_t* cv = cn->var;
+				if(cv != NULL) {
+					node_t* ctorn = var_find_own_member(cv, "@@ctor");
+					var_t* ctorv = (ctorn != NULL) ? ctorn->var : NULL;
+					func_t* cf = (ctorv != NULL) ? var_get_func(ctorv) : NULL;
+					fprintf(stderr, "[newat]   classvar=%p refs=%d @@ctor=%p @@ctor_pc=%u @@ctor_native=%p\n",
+						(void*)cv, cv->refs, (void*)ctorv,
+						(unsigned)(cf != NULL ? cf->pc : 0u), (void*)(cf != NULL ? cf->native : NULL));
+					var_t* proto = var_get_prototype(cv);
+					node_t* pcn = (proto != NULL) ? var_find_own_member(proto, CONSTRUCTOR) : NULL;
+					var_t* pv = (pcn != NULL) ? pcn->var : NULL;
+					func_t* pf2 = (pv != NULL) ? var_get_func(pv) : NULL;
+					fprintf(stderr, "[newat]   proto=%p proto.constructor=%p pc=%u native=%p\n",
+						(void*)proto, (void*)pv, (unsigned)(pf2 != NULL ? pf2->pc : 0u),
+						(void*)(pf2 != NULL ? pf2->native : NULL));
+				}
+			}
+			{
+				scope_t* sc2 = vm_get_scope(vm);
+				fprintf(stderr, "[newat]   scope=%p is_objlit=%d is_func=%d scopevar=%p\n",
+					(void*)sc2, (sc2 != NULL && sc2->is_objlit) ? 1 : 0,
+					(sc2 != NULL && sc2->is_func) ? 1 : 0, (void*)(sc2 != NULL ? sc2->var : NULL));
+			}
+		}
+	}
 	if(cn != NULL && cn->var != NULL && cn->var->is_func) {
 		func_t* cf = var_get_func(cn->var);
 		if(cf != NULL && cf->is_arrow) {
@@ -7675,6 +7976,23 @@ var_t* vm_new_class(vm_t* vm, const char* cls) {
 	if(n == NULL)
 		return NULL;
 	var_t* cls_var = n->var;
+	/* Capture whether this binding was ALREADY a class before is_class is forced on
+	 * below. A declared/reopened class keeps its prototype; a name that collides with
+	 * a LIVE non-class value must NOT inherit that value's prototype (see the fresh
+	 * prototype guard further down). */
+	int was_class = (cls_var != NULL) ? cls_var->is_class : 0;
+	if(getenv("MARIO_CLSDBG") != NULL) { /* DIAG (temp): a class name that collides with a
+	   * LIVE non-class binding in the current scope is reused as the class object; if
+	   * that var already carries Object.prototype, the class body's `constructor`
+	   * lands on Object.prototype and corrupts it globally. */
+		int reuse = (cls_var != NULL && !var_empty(cls_var) && !cls_var->is_class);
+		if(reuse) {
+			var_t* pb = var_get_prototype(cls_var);
+			var_t* op = (vm->builtin_vars.var_Object != NULL) ? var_get_prototype(vm->builtin_vars.var_Object) : NULL;
+			fprintf(stderr, "[clsdbg] class '%s' REUSED live non-class var=%p type=%u proto=%p ==Object.prototype?%d\n",
+				cls, (void*)cls_var, (unsigned)cls_var->type, (void*)pb, (pb == op) ? 1 : 0);
+		}
+	}
 	cls_var->type = V_OBJECT;
 	/* A class/constructor is callable (`new X()`), so `typeof X` must report
 	 * "function" per spec. is_func stays 0 on purpose: new_obj() dispatches
@@ -7687,12 +8005,26 @@ var_t* vm_new_class(vm_t* vm, const char* cls) {
 		node_t* fnn = var_add(cls_var, "@@fname", var_new_str(vm, cls));
 		if(fnn != NULL) { fnn->invisable = 1; fnn->be_unenumerable = 1; }
 	}
-	if(var_get_prototype(cls_var) == NULL) {
+	/* A class ALWAYS owns a fresh prototype object. When the name reused a LIVE
+	 * non-class binding (!was_class) - ubiquitous in minified bundles, e.g. axios's
+	 * `let ty = class e{constructor(e){...}}` (CancelToken) where `e` is also the
+	 * enclosing webpack module parameter - that binding's existing prototype is a
+	 * SHARED one: for a plain object it is Object.prototype itself. The class body's
+	 * members are installed on var_get_prototype(cls_var) (see handle_class), so
+	 * reusing that prototype writes `constructor` straight into Object.prototype and
+	 * corrupts it globally. Every @@ctor-less native class then falls back to
+	 * Object.prototype.constructor in new_obj_with_ctor(): MessagePort (created inside
+	 * MessageChannel's native ctor) ran CancelToken's ctor and threw
+	 * "executor must be a function", aborting React's scheduler and leaving the page
+	 * blank. Give a reused non-class binding a fresh prototype so the class members
+	 * land on it, not on the shared prototype. do_extends(Object) below then links the
+	 * fresh prototype under Object.prototype as usual. */
+	if(!was_class || var_get_prototype(cls_var) == NULL) {
 		var_set_prototype(cls_var, var_new_obj_no_proto(vm, NULL, NULL));
 	}
 
 	if(strcmp(cls, "Object") != 0)
-		do_extends(vm, cls_var, "Object");
+		do_extends(vm, cls_var, "Object", 1);
 	return cls_var;
 }
 
@@ -7769,9 +8101,28 @@ static var_t* do_module(vm_t* vm, const char* spec_in) {
 
 	node_t* hit = var_find_own_member(vm->modules, spec);
 	if(hit != NULL && hit->var != NULL) {
+		if(getenv("MARIO_MODDBG") != NULL)
+			mario_printf("[moddbg] HIT  '%s' ns=%p\n", spec, (void*)hit->var);
 		if(resolved != NULL) mstr_free(resolved);
 		return hit->var; // already loaded, or in-progress (circular import)
 	}
+
+	/* Self-import (rspack entry chunks end with `import*as c from "<own url>";
+	 * e.C(c)` to register their own factory map): the registry key produced by
+	 * the embedder's top-level registration and the one this relative resolve
+	 * yields can differ by normalisation, and a miss here would evaluate a
+	 * second, empty copy - or hand back a namespace that is not the live one
+	 * being populated. The module currently evaluating IS the answer. */
+	if(vm->cur_module != NULL && vm->cur_module_spec != NULL &&
+	   strcmp(spec, vm->cur_module_spec) == 0) {
+		if(getenv("MARIO_MODDBG") != NULL)
+			mario_printf("[moddbg] SELF '%s' ns=%p\n", spec, (void*)vm->cur_module);
+		if(resolved != NULL) mstr_free(resolved);
+		return vm->cur_module;
+	}
+	if(getenv("MARIO_MODDBG") != NULL)
+		mario_printf("[moddbg] LOAD '%s' (from '%s', cur='%s')\n", spec, spec_in,
+		           vm->cur_module_spec != NULL ? vm->cur_module_spec : "(null)");
 
 	if(_load_m_func == NULL) {
 		mario_printf("Error: no module loader, can not import '%s'!\n", spec);
@@ -7799,12 +8150,60 @@ static var_t* do_module(vm_t* vm, const char* spec_in) {
 	PC saved_pc = vm->pc;
 	vm->cur_module = ns;
 	vm->cur_module_spec = reg_spec;
+	/* The module scope itself is opened by vm_load_run off the compiler's
+	 * chunk_is_module flag, which covers nested imports and top-level module
+	 * scripts alike. */
 	vm_load_run(vm, js->cstr);
 	mstr_free(js);
 	vm->cur_module = saved_mod;
 	vm->cur_module_spec = saved_spec;
 	vm->pc = saved_pc;
 	return ns;
+}
+
+/* Public twin of do_module's registration half for top-level <script type=
+ * "module"> bodies: the embedder already holds the source (it fetched the
+ * <script src>), so only the registry binding + cur_module bracketing is
+ * needed. Registering under the absolute URL is what makes a later
+ * `import "<same url>"` from another chunk return THIS namespace instead of
+ * evaluating a second, registry-less copy of the bundle. */
+bool vm_load_run_module(vm_t* vm, const char* s, const char* spec) {
+	if(vm == NULL || s == NULL)
+		return false;
+	if(vm->modules == NULL) {
+		vm->modules = var_new_obj_no_proto(vm, NULL, NULL);
+		node_t* mn = var_add(vm->root, "@@modules", vm->modules);
+		if(mn != NULL) {
+			mn->invisable = 1;
+			mn->be_unenumerable = 1;
+		}
+	}
+	var_t* ns = NULL;
+	if(spec != NULL && spec[0] != 0) {
+		node_t* hit = var_find_own_member(vm->modules, spec);
+		if(hit != NULL && hit->var != NULL)
+			ns = hit->var;
+		if(ns == NULL) {
+			ns = var_new_obj_no_proto(vm, NULL, NULL);
+			node_t* reg = var_add(vm->modules, spec, ns);
+			/* Prefer the registry's own copy of the key so the namespace
+			 * outlives the caller's buffer. */
+			if(reg != NULL && reg->name != NULL)
+				spec = reg->name;
+		}
+	}
+	if(ns == NULL)
+		ns = var_new_obj_no_proto(vm, NULL, NULL);
+	var_t* saved_mod = vm->cur_module;
+	const char* saved_spec = vm->cur_module_spec;
+	PC saved_pc = vm->pc;
+	vm->cur_module = ns;
+	vm->cur_module_spec = spec;
+	bool ok = vm_load_run(vm, s);
+	vm->cur_module = saved_mod;
+	vm->cur_module_spec = saved_spec;
+	vm->pc = saved_pc;
+	return ok;
 }
 
 /* Instruction handler function type for table-based dispatch */
@@ -8280,6 +8679,16 @@ static inline void handle_neg(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 			break;
 		case V_BIGINT:
 			vm_push(vm, var_new_bigint(vm, bn_neg((bignum_t*)v->value)));
+			break;
+		case V_BOOL:
+			/* -true == -1, -false == -0 (ToNumber(bool) is 1/0). */
+			if(var_get_bool(v))
+				vm_push(vm, var_new_int(vm, -1));
+			else
+				vm_push(vm, var_new_float64(vm, -0.0));
+			break;
+		case V_NULL:
+			vm_push(vm, var_new_float64(vm, -0.0)); // -null == -0
 			break;
 		default:
 			/* -"x" / -undefined etc.: JS yields NaN. Push it so the value stack
@@ -8876,9 +9285,12 @@ static inline void handle_var(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 	 * the nearest enclosing function scope (or the global scope), skipping any
 	 * block/loop/try scopes. Otherwise a `var` declared inside a block would be
 	 * destroyed when that block scope pops, deviating from JS semantics
-	 * (e.g. `for(var i=0;..){var x=i;} print(x)` must see x afterwards). */
+	 * (e.g. `for(var i=0;..){var x=i;} print(x)` must see x afterwards).
+	 * An ES module body scope is that module's variable environment, so it
+	 * stops the hoist: module-level `var`s belong to the module, never to the
+	 * global object (see scope_t.is_var_env). */
 	scope_t* sc = vm_get_scope(vm);
-	while(sc != NULL && !sc->is_func)
+	while(sc != NULL && !sc->is_func && !sc->is_var_env)
 		sc = sc->prev;
 	var_t* v = (sc != NULL) ? sc->var : vm->root;
 	if(v == NULL)
@@ -9148,6 +9560,13 @@ static inline void handle_get(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 	if(v == NULL) {
 		vm_push(vm, var_new(vm));
 		return;
+	}
+	if(getenv("MARIO_MODDBG") != NULL && s != NULL &&
+	   strstr(s, "__webpack_modules__") != NULL) {
+		node_t* hn = (v->type == V_OBJECT) ? var_find_own_member(v, s) : NULL;
+		mario_printf("[moddbg] GET %s recv=%p found=%d tag=%s\n", s, (void*)v,
+		           (hn != NULL && hn->var != NULL) ? 1 : 0,
+		           vm->dbg_tag != NULL ? vm->dbg_tag : "-");
 	}
 	do_get(vm, v, s, false);
 	var_unref(v);
@@ -9666,6 +10085,18 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 					(av != NULL && av->type == V_STRING) ? var_get_str(av) : "-");
 			}
 		}
+		/* webpack/rspack require probe: the runtime function carries m/C/o
+		 * members; logging each id it is invoked with shows exactly which
+		 * chunk entries and factories actually execute. */
+		if(getenv("MARIO_WPDBG") != NULL && func->is_func && arg_num >= 1 &&
+		   var_find_own_member(func, "m") != NULL && var_find_own_member(func, "C") != NULL) {
+			void* raw = vm->stack[vm->stack_top - 1];
+			int mg = (raw != NULL) ? (int)(*(int8_t*)raw) : -1;
+			var_t* av = (raw != NULL) ? ((mg == 1) ? ((node_t*)raw)->var : (var_t*)raw) : NULL;
+			fprintf(stderr, "[wpdbg] require '%s' via '%s' tag=%s\n",
+			        (av != NULL && av->type == V_STRING) ? var_get_str(av) : "?",
+			        name->cstr, vm->dbg_tag != NULL ? vm->dbg_tag : "-");
+		}
 		func_call(vm, obj, func, arg_num);
 	}
 	else {
@@ -9782,6 +10213,97 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 					(unsigned)(vm->pc > 0 ? vm->pc - 1 : 0),
 					(csc != NULL && csc->func != NULL) ? (unsigned)csc->func->pc : 0,
 					(obj != NULL) ? (int)obj->type : -1);
+			if(vm->bc.srcmap_on) { /* DIAG (temp): resolve the failed-dispatch call site
+			   * and the enclosing frames back to source, so the exact `.getAttribute`
+			   * (etc.) that received a class instead of an element is readable even
+			   * though the page later catches and re-throws (losing the origin). */
+				PC cpc = (vm->pc > 0) ? vm->pc - 1 : 0;
+				mstr_t* loc = mstr_new("");
+				if(bc_srcmap_locate(&vm->bc, cpc, loc))
+					fprintf(stderr, "[calldbg]   callsite@%u: %s\n", (unsigned)cpc, loc->cstr);
+				mstr_free(loc);
+				scope_t* sc2 = csc;
+				int hop2 = 0;
+				while(sc2 != NULL && hop2++ < 10) {
+					if(sc2->is_func && sc2->func != NULL) {
+						mstr_t* fl = mstr_new("");
+						if(bc_srcmap_locate(&vm->bc, sc2->func->pc, fl))
+							fprintf(stderr, "[calldbg]   frame[%d] fpc=%u: %s\n", hop2, (unsigned)sc2->func->pc, fl->cstr);
+						mstr_free(fl);
+					}
+					sc2 = sc2->prev;
+				}
+			}
+			/* webpack registry probe: walk the scope chain for the runtime's
+			 * factory map `b` and the require function's `t.m`; a merge that
+			 * landed in a different object than the one t() reads shows up as
+			 * two pointers / a zero count here. */
+			if(getenv("MARIO_MODDBG") != NULL) {
+				scope_t* sc = csc;
+				int hop = 0;
+				while(sc != NULL && hop++ < 24) {
+					var_t* envs[14]; int ne = 0;
+					if(sc->var != NULL) envs[ne++] = sc->var;
+					if(sc->is_func && sc->func != NULL) {
+						var_t* cl = sc->func->closure.var;
+						func_t* clf = sc->func->closure.func;
+						int cg = 0;
+						while(cl != NULL && cg++ < 12 && ne < 14) {
+							envs[ne++] = cl;
+							node_t* lex = var_find_own_member(cl, "@@lex");
+							if(getenv("MARIO_LEXDBG") != NULL)
+								fprintf(stderr, "[calldbg]   lex[%d.%d.%d] cl=%p lexnode=%p lexvar=%p empty=%d type=%d cnt=%u\n",
+								        hop-1, ne-1, cg-1, (void*)cl, (void*)lex,
+								        (void*)(lex != NULL ? lex->var : NULL),
+								        (lex != NULL && lex->var != NULL) ? (int)var_empty(lex->var) : -1,
+								        (lex != NULL && lex->var != NULL) ? (int)lex->var->type : -1,
+								        (unsigned)(lex != NULL && lex->var != NULL ? lex->var->children.size : 0));
+							if(lex != NULL && !var_empty(lex->var)) { cl = lex->var; continue; }
+							if(clf == NULL) break;
+							cl = clf->closure.var; clf = clf->closure.func;
+						}
+					}
+					for(int ei = 0; ei < ne; ++ei) {
+						var_t* env = envs[ei];
+						if(getenv("MARIO_LEXDBG") != NULL && env->children.buckets != NULL) {
+							fprintf(stderr, "[calldbg]   allenv[%d.%d] ptr=%p is_func=%d:", hop-1, ei,
+							        (void*)env, (int)env->is_func);
+							for(uint32_t bk = 0; bk < env->children.capacity; ++bk)
+								for(hash_entry_t* ke = env->children.buckets[bk]; ke != NULL; ke = ke->next)
+									if(ke->key != NULL) fprintf(stderr, " %s", ke->key);
+							fprintf(stderr, "\n");
+						}
+						static const char* wn[] = {"b", "r", "d", "t"};
+						for(int wi = 0; wi < 4; ++wi) {
+							node_t* wn2 = var_find_own_member(env, wn[wi]);
+							if(wn2 == NULL || wn2->var == NULL) continue;
+							var_t* wv = wn2->var;
+							node_t* mn = (wv->is_func || wv->type == V_OBJECT)
+							             ? var_find_own_member(wv, "m") : NULL;
+							fprintf(stderr, "[calldbg]   env[%d.%d] %s type=%d is_func=%d ptr=%p cnt=%u m=%p mcnt=%u\n",
+							        hop-1, ei, wn[wi], (int)wv->type, (int)wv->is_func, (void*)wv,
+							        (unsigned)wv->children.size,
+							        (void*)(mn != NULL ? mn->var : NULL),
+							        (unsigned)(mn != NULL && mn->var != NULL ? mn->var->children.size : 0));
+							if(mn != NULL && mn->var != NULL && mn->var->children.buckets != NULL) {
+								fprintf(stderr, "[calldbg]   mkeys:");
+								for(uint32_t bk = 0; bk < mn->var->children.capacity; ++bk)
+									for(hash_entry_t* ke = mn->var->children.buckets[bk]; ke != NULL; ke = ke->next)
+										if(ke->key != NULL) fprintf(stderr, " %s", ke->key);
+								fprintf(stderr, "\n");
+							}
+							if(strcmp(wn[wi], "t") == 0 && env->children.buckets != NULL) {
+								fprintf(stderr, "[calldbg]   envkeys[%d.%d] ptr=%p:", hop-1, ei, (void*)env);
+								for(uint32_t bk = 0; bk < env->children.capacity; ++bk)
+									for(hash_entry_t* ke = env->children.buckets[bk]; ke != NULL; ke = ke->next)
+										if(ke->key != NULL) fprintf(stderr, " %s", ke->key);
+								fprintf(stderr, "\n");
+							}
+						}
+					}
+					sc = sc->prev;
+				}
+			}
 			if(obj != NULL && obj->type == V_OBJECT && obj->children.buckets != NULL) {
 				for(uint32_t b = 0; b < obj->children.capacity; ++b) {
 					for(hash_entry_t* e2 = obj->children.buckets[b]; e2 != NULL; e2 = e2->next)
@@ -9795,7 +10317,16 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 					for(hash_entry_t* e3 = csc->var->children.buckets[b]; e3 != NULL; e3 = e3->next) {
 						node_t* nd = (node_t*)e3->value;
 						if(nd == NULL || nd->var == NULL || e3->key == NULL) continue;
-						fprintf(stderr, "[calldbg]     local '%s' type=%d\n", e3->key, (int)nd->var->type);
+						fprintf(stderr, "[calldbg]     local '%s' type=%d", e3->key, (int)nd->var->type);
+						if(nd->var->type == V_STRING && nd->var->value != NULL)
+							fprintf(stderr, " str=%.60s", (const char*)nd->var->value);
+						else if(nd->var->type == V_FLOAT && nd->var->value != NULL)
+							fprintf(stderr, " num=%g", *(double*)nd->var->value);
+						else if(nd->var->type == V_FLOAT64 && nd->var->value != NULL)
+							fprintf(stderr, " num=%g", *(double*)nd->var->value);
+						else if(nd->var->type == V_INT && nd->var->value != NULL)
+							fprintf(stderr, " int=%d", *(int*)nd->var->value);
+						fprintf(stderr, "\n");
 						if(nd->var->type == V_OBJECT && nd->var->children.buckets != NULL) {
 							for(uint32_t b2 = 0; b2 < nd->var->children.capacity; ++b2) {
 								for(hash_entry_t* e4 = nd->var->children.buckets[b2]; e4 != NULL; e4 = e4->next) {
@@ -10771,6 +11302,18 @@ static inline void handle_get_iter(vm_t* vm, PC ins, opr_code_t instr, uint32_t 
 	var_t* iterable = vm_pop2(vm);
 	var_t* iter = vm_get_iterator(vm, iterable);
 	if(iter == NULL) {
+		if(getenv("MARIO_ITERDBG") != NULL && iterable != NULL) {
+			fprintf(stderr, "[iterdbg] not iterable type=%d is_array=%d is_func=%d tag=%s keys:",
+			        (int)iterable->type, (int)iterable->is_array, (int)iterable->is_func,
+			        vm->dbg_tag != NULL ? vm->dbg_tag : "-");
+			if(iterable->children.buckets != NULL) {
+				int shown = 0;
+				for(uint32_t bk = 0; bk < iterable->children.capacity && shown < 12; ++bk)
+					for(hash_entry_t* ke = iterable->children.buckets[bk]; ke != NULL && shown < 12; ke = ke->next)
+						if(ke->key != NULL) { fprintf(stderr, " %s", ke->key); shown++; }
+			}
+			fprintf(stderr, "\n");
+		}
 		vm_push(vm, var_new(vm));
 		if(iterable != NULL) var_unref(iterable);
 		vm_throw(vm, "object is not iterable");
@@ -11458,7 +12001,7 @@ static inline void handle_class(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		vm->pc++;
 		offset = OFF(ins);
 		const char* sup = bc_getstr(&vm->bc, offset);
-		do_extends(vm, cls_var, sup);
+		do_extends(vm, cls_var, sup, 0);
 	}
 
 	var_t* protoV = var_get_prototype(cls_var);
@@ -11502,8 +12045,17 @@ static inline void handle_extends_v(vm_t* vm, PC ins, opr_code_t instr, uint32_t
 	var_t* cls = (sc != NULL) ? sc->class_var : NULL;
 	if(cls != NULL && sup != NULL) {
 		var_set_father(cls, sup);
+		/* Class-side [[Prototype]] (static inheritance) - see do_extends. An
+		 * `extends <expression>` subclass must inherit the base's static properties
+		 * as well; e.g. a polyfill installing
+		 * `window.PerformanceObserver = class extends PO {...}` has to keep
+		 * PO.supportedEntryTypes readable through the replacement class. */
+		if(sup != cls && sup->type == V_OBJECT)
+			var_set_callable_proto(cls, sup);
 		node_t* sn = var_add(cls, "@super", sup);
 		if(sn != NULL) {
+			sn->invisable = 1;
+			sn->be_unenumerable = 1;
 			var_unref(sup); // node holds its own reference
 			sup = NULL;
 		}
@@ -11521,23 +12073,27 @@ static inline void handle_fieldn(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 	var_t* fn = vm_pop2(vm);
 	scope_t* sc = vm_get_scope(vm);
 	var_t* cls = (sc != NULL) ? sc->class_var : NULL;
+	if(getenv("MARIO_FIELDDBG") != NULL)
+		fprintf(stderr, "[fielddbg] FIELDN '%s' cls=%p fn=%p\n", s ? s : "?", (void*)cls, (void*)fn);
 	if(cls != NULL && fn != NULL) {
 		node_t* ex = var_find_own_member(cls, "@fields");
 		var_t* arr = (ex != NULL) ? ex->var : NULL;
 		if(arr == NULL || !arr->is_array) {
 			arr = var_new_array(vm);
 			node_t* an = var_add(cls, "@fields", arr);
-			if(an != NULL)
-				var_unref(arr);
+			/* var_add/node_new take their OWN reference and var_new_array hands
+			 * back a baseline-refs(0) var, so an extra var_unref here underflowed
+			 * the count and FREED the array: every class field initializer was
+			 * recorded into recycled memory and `new X()` silently dropped all
+			 * ES2022 instance fields (github's react-app nameAttribute/#c). */
+			(void)an;
 		}
 		var_t* pair = var_new_array(vm);
 		var_t* nm = var_new_str(vm, s);
-		var_array_add(pair, nm);
-		var_unref(nm);
-		var_array_add(pair, fn);
+		var_array_add(pair, nm);   /* array now owns nm (baseline 0 + add ref) */
+		var_array_add(pair, fn);    /* array takes a ref; drop the popped one below */
 		var_unref(fn);
-		var_array_add(arr, pair);
-		var_unref(pair);
+		var_array_add(arr, pair);   /* arr now owns pair (baseline 0 + add ref) */
 	} else if(fn != NULL) {
 		var_unref(fn);
 	}
@@ -12069,6 +12625,15 @@ static var_t* mario_gopd_default(vm_t* vm, var_t* obj, var_t* key) {
 /* `new ctor(...args)` from a constructor VAR (a proxy forwards to its construct
  * trap). Returns a refs==0 object, matching new_obj()'s contract. */
 static var_t* construct_from_var(vm_t* vm, var_t* ctor, var_t* argsNatural, var_t* newTarget) {
+	if(getenv("MARIO_NEWDBG") != NULL) { /* DIAG (temp): direct-construct entry (proxy/Reflect/native) */
+		fprintf(stderr, "[newdbg] CONSTRUCT_FROM_VAR ctor t%u f%u cls%u proxy%u argc=%d pc=%u\n",
+			(unsigned)(ctor != NULL ? ctor->type : 999u),
+			(unsigned)(ctor != NULL ? ctor->is_func : 0u),
+			(unsigned)(ctor != NULL ? ctor->is_class : 0u),
+			(unsigned)(ctor != NULL ? (var_is_proxy(ctor) ? 1u : 0u) : 0u),
+			(argsNatural != NULL) ? (int)var_array_size(argsNatural) : -1,
+			(unsigned)(vm->pc > 0 ? vm->pc - 1 : 0));
+	}
 	if(ctor == NULL || !var_is_callable(ctor)) {
 		vm_throw_type_native(vm, "TypeError", "target is not a constructor");
 		return var_new(vm);
@@ -12426,6 +12991,13 @@ var_t* mario_apply_var(vm_t* vm, var_t* func, var_t* thisArg, var_t* argsNatural
 }
 
 var_t* mario_construct_var(vm_t* vm, var_t* ctor, var_t* argsNatural, var_t* newTarget) {
+	if(getenv("MARIO_NEWDBG") != NULL) { /* DIAG (temp): who constructs without a NEW opcode */
+		fprintf(stderr, "[newdbg] CONSTRUCT_VAR ctor t%u f%u cls%u argc=%ld\n",
+			(unsigned)(ctor != NULL ? ctor->type : 999u),
+			(unsigned)(ctor != NULL ? ctor->is_func : 0u),
+			(unsigned)(ctor != NULL ? ctor->is_class : 0u),
+			(long)((argsNatural != NULL && argsNatural->is_array) ? var_array_size(argsNatural) : -1));
+	}
 	if(ctor == NULL) {
 		vm_throw_type_native(vm, "TypeError", "target is not a constructor");
 		return var_new(vm);
@@ -12737,6 +13309,12 @@ static inline void handle_export(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 	if(node == NULL || node->var == NULL)
 		return;
 	var_add(vm->cur_module, name, node->var);
+	if(getenv("MARIO_MODDBG") != NULL && name != NULL &&
+	   (strstr(name, "__webpack_modules__") != NULL ||
+	    strstr(name, "__webpack_require__") != NULL))
+		mario_printf("[moddbg] EXPORT %s -> ns=%p val=%p tag=%s\n", name,
+		           (void*)vm->cur_module, (void*)node->var,
+		           vm->dbg_tag != NULL ? vm->dbg_tag : "-");
 }
 
 /* INSTR_EXPORT_VALUE key: pop a value and set the current module namespace's
@@ -13317,17 +13895,17 @@ bool vm_run(vm_t* vm) {
 		/* Table-based instruction dispatch */
 		instr_table[instr](vm, ins, instr, offset);
 
-		/* INSTR_INCLUDE / INSTR_MODULE compile and run nested source mid-run
-		 * (do_include / do_module -> vm_load_run). Appending bytecode can realloc
-		 * vm->bc.code_buf, so the cached `code`/`code_size` would dangle and the
-		 * next `code[vm->pc++]` reads freed memory (Bus error). Refresh them from
-		 * the live buffer. vm->pc was already restored to the outer instruction
-		 * stream by the loader, and the outer script's own INSTR_END still bounds
-		 * this run even though code_size now spans the appended module code. */
-		if(instr == INSTR_INCLUDE || instr == INSTR_MODULE) {
-			code = vm->bc.code_buf;
-			code_size = vm->bc.cindex;
-		}
+		/* Refresh the cached code pointer after EVERY dispatch: any instruction
+		 * that runs user code (calls, getters, `new`) can reach native_await ->
+		 * the embedder's on_await_pending pump, which may compile and run a
+		 * further script mid-run (ewebview settles a registry promise by
+		 * evaluating the chunk that registers it). Appending bytecode reallocs
+		 * vm->bc.code_buf, so a stale `code`/`code_size` here reads freed memory
+		 * (Bus error). Two L1 loads per instruction buy that safety; vm->pc was
+		 * already re-seated onto the outer stream by any nested loader, and the
+		 * outer script's own INSTR_END still bounds this run. */
+		code = vm->bc.code_buf;
+		code_size = vm->bc.cindex;
 
 		/* Page-independent service cadence (see mario.h): one increment+compare
 		 * per dispatch when armed, nothing when step_interval is 0. The hook may
@@ -13372,6 +13950,7 @@ bool vm_load(vm_t* vm, const char* s) {
 	if(vm->compiler == NULL)
 		return false;
 
+	vm->bc.chunk_is_module = false;   /* the coming compile re-decides it */
 	if(vm->bc.cindex > 0) {
 		//vm->bc.cindex--;
 		vm->pc = vm->bc.cindex;
@@ -13382,7 +13961,52 @@ bool vm_load(vm_t* vm, const char* s) {
 bool vm_load_run(vm_t* vm, const char* s) {
 	bool ret = false;
 	if(vm_load(vm, s)) {
+		/* ES module bodies (top-level import/export syntax) run in their own
+		 * module scope: every rspack/webpack chunk top-levels `export const
+		 * __rspack_esm_id` / `__webpack_modules__`, and with all bodies sharing
+		 * the global scope the second chunk's const initializer became a write
+		 * to the first chunk's already-defined const - a per-spec TypeError that
+		 * aborted evaluation and left every importer a half-empty namespace.
+		 * A block-flavoured scope confines const/let/class per module, and it is
+		 * flagged is_var_env so `var`/function declarations bind here too (a
+		 * module's variable environment is the module, never the global object).
+		 * Undeclared assignments in a chunk tail still create globals, which is
+		 * what `_N_E`-style runtime pokes rely on. */
+		bool is_mod = vm->bc.chunk_is_module;
+		int scope_base = vm->scope_stack_top;
+		var_t* anon_mod = NULL;
+		if(is_mod) {
+			scope_t* msc = scope_new(var_new_block(vm));
+			msc->is_block = true;
+			/* A module body is its own variable environment: `var` and function
+			 * declarations stay inside it instead of hoisting to the global
+			 * object. Chunks that top-level `var b={}` (the webpack/rspack module
+			 * registry) otherwise shared one global binding, so a later chunk's
+			 * initializer clobbered the earlier chunk's registry and its require
+			 * function could no longer find any factory. */
+			msc->is_var_env = true;
+			msc->stack_top = vm->stack_top;
+			vm_push_scope(vm, msc);
+			if(vm->cur_module == NULL) {
+				/* A top-level module <script> has no registry entry (nothing
+				 * registered its URL); give its exports an anonymous namespace
+				 * rooted off root so the EXPORT instructions have a target and
+				 * GC cannot take it mid-run. */
+				anon_mod = var_new_obj_no_proto(vm, NULL, NULL);
+				node_t* hn = var_add(vm->root, "@@curmod", anon_mod);
+				if(hn != NULL) { hn->invisable = 1; hn->be_unenumerable = 1; }
+				vm->cur_module = anon_mod;
+			}
+		}
 		vm_run(vm);
+		if(is_mod) {
+			/* An error-unwound body may leave inner scopes behind: pop back to
+			 * the recorded top so nothing leaks into the importer's frame. */
+			while(vm->scope_stack_top > scope_base)
+				vm_pop_scope(vm);
+			if(anon_mod != NULL)
+				vm->cur_module = NULL;
+		}
 		if(vm->propagating_err != NULL)
 			vm_report_uncaught(vm); // script top: an uncaught error aborts this script only
 		ret = true;

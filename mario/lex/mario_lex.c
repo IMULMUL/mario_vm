@@ -48,6 +48,16 @@ bool is_alpha(unsigned char ch) {
 	return false;
 }
 
+/* Any byte >= 0x80 is part of a multi-byte UTF-8 sequence. Outside string /
+ * comment / regex literals the only legal place for those in JS source is an
+ * identifier (bundles ship unquoted non-ASCII property names and keys such as
+ * `{\u0131:"i", \u0262:"g"}` written literally), so treat every high byte as an
+ * identifier character. Unicode whitespace is consumed earlier by
+ * lex_skip_unicode_space(), so it never reaches the identifier branch. */
+static bool is_id_utf8(unsigned char ch) {
+	return ch >= 0x80;
+}
+
 bool is_alpha_num(const char* cstr) {
 	if (cstr[0] == 0){
 		return true;
@@ -359,14 +369,42 @@ void lex_read_escape(lex_t* lex) {
 
 void lex_get_basic_token(lex_t* lex) {
 	// tokens
-	if (is_alpha(lex->curr_ch) || lex->curr_ch == '$' ||
+	if (is_alpha(lex->curr_ch) || lex->curr_ch == '$' || is_id_utf8((unsigned char)lex->curr_ch) ||
 	    (lex->curr_ch == '\\' && lex->next_ch == 'u')) { //  IDs (JS allows '$' in identifiers, e.g. jQuery's $)
 		/* Identifiers may embed unicode escapes: bundlers emit CJK property
 		 * names as `\u4E0A\u62A5...` and mixed forms like `SDK\u7248\u672C`.
 		 * Decode them into tk_str exactly like string literals do
 		 * (lex_read_u_escape leaves curr_ch on the last consumed char, hence
-		 * the trailing step). */
+		 * the trailing step). Raw UTF-8 bytes pass through untouched so the
+		 * reconstructed name matches the bytes used at every other use site. */
 		while (is_alpha(lex->curr_ch) || is_numeric(lex->curr_ch) || lex->curr_ch == '$' ||
+		       is_id_utf8((unsigned char)lex->curr_ch) ||
+		       (lex->curr_ch == '\\' && lex->next_ch == 'u')) {
+			if (lex->curr_ch == '\\') {
+				lex_get_nextch(lex); /* onto 'u' */
+				lex_read_u_escape(lex);
+				lex_get_nextch(lex);
+				continue;
+			}
+			mstr_add(lex->tk_str, lex->curr_ch);
+			lex_get_nextch(lex);
+		}
+		lex->tk = LEX_ID;
+	} else if (lex->curr_ch == '#' &&
+	           (is_alpha(lex->next_ch) || lex->next_ch == '$' ||
+	            is_id_utf8((unsigned char)lex->next_ch))) { // ES2022 private identifiers
+		/* `#name` in class bodies (`#x = 1;`, `#m(){}`) and member access
+		 * (`this.#x`). Lex it as a plain LEX_ID whose name carries the '#':
+		 * the class-body parser then registers it like any other field or
+		 * method and member access resolves it by that exact name, so a
+		 * private member is just a '#'-prefixed member that code outside
+		 * the class cannot spell (identifier syntax always keeps the '#').
+		 * Without this the '#' fell into the char-token path and aborted
+		 * whole bundles (github's environment-*.js live-region class). */
+		mstr_add(lex->tk_str, '#');
+		lex_get_nextch(lex);
+		while (is_alpha(lex->curr_ch) || is_numeric(lex->curr_ch) || lex->curr_ch == '$' ||
+		       is_id_utf8((unsigned char)lex->curr_ch) ||
 		       (lex->curr_ch == '\\' && lex->next_ch == 'u')) {
 			if (lex->curr_ch == '\\') {
 				lex_get_nextch(lex); /* onto 'u' */

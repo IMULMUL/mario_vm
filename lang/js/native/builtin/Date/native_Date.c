@@ -437,6 +437,243 @@ var_t* native_date_getTimezoneOffset(vm_t* vm, var_t* env, void* data) {
 	return var_new_int(vm, tz_offset_minutes(ms));
 }
 
+/*===== setters =====*/
+
+/* Store a new epoch-ms time value into this instance's hidden @@t member and
+ * return it as a Number (NaN when out of range / invalid). The existing V_INT64
+ * var is updated in place so repeated set* calls do not leak a fresh var. */
+static var_t* date_store_ms(vm_t* vm, var_t* env, int64_t ms) {
+	var_t* thisV = get_obj(env, THIS);
+	if(thisV == NULL)
+		return var_new_float64(vm, NAN);
+	if(ms < DATE_MIN_MS || ms > DATE_MAX_MS)
+		ms = DATE_INVALID;
+	node_t* tn = var_find_own_member(thisV, "@@t");
+	if(tn == NULL || tn->var == NULL) {
+		tn = var_add(thisV, "@@t", var_new_int64(vm, ms));
+		if(tn != NULL) { tn->be_unenumerable = 1; tn->invisable = 1; }
+	} else {
+		tn->var->type = V_INT64;
+		*((int64_t*)tn->var->value) = ms;
+	}
+	if(ms == DATE_INVALID)
+		return var_new_float64(vm, NAN);
+	return var_new_int64(vm, ms);
+}
+
+/* Read argument idx as an integer field value. Returns false when the argument
+ * is absent or NaN (both make the composed date invalid per the ES spec). */
+static bool date_arg_field(var_t* env, uint32_t idx, int* out) {
+	if(idx >= get_func_args_num(env))
+		return false;
+	var_t* v = get_func_arg(env, idx);
+	double dv = (v == NULL) ? NAN : var_get_float64(v);
+	if(isnan(dv))
+		return false;
+	*out = (int)dv;
+	return true;
+}
+
+/* Recompose a LOCAL timestamp from civil fields; mktime resolves zone + DST and
+ * normalises out-of-range fields (so setDate(32) rolls into the next month). */
+static int64_t local_recompose(struct tm* tm, int msec) {
+	tm->tm_isdst = -1;
+	time_t t = mktime(tm);
+	if(t == (time_t)-1)
+		return DATE_INVALID;
+	int64_t ms = (int64_t)t * 1000LL + msec;
+	if(ms < DATE_MIN_MS || ms > DATE_MAX_MS)
+		return DATE_INVALID;
+	return ms;
+}
+
+/* Recompose a UTC timestamp from civil + time-of-day fields (mon is 1-12). */
+static int64_t utc_recompose(int64_t year, int mon, int mday,
+                             int hour, int min, int sec, int msec) {
+	int64_t ms = days_from_civil(year, mon, mday) * MS_PER_DAY
+	           + ((int64_t)(hour * 60 + min) * 60 + sec) * 1000LL + msec;
+	if(ms < DATE_MIN_MS || ms > DATE_MAX_MS)
+		return DATE_INVALID;
+	return ms;
+}
+
+/* Load this instance's LOCAL fields; false when the date is invalid. */
+static bool date_load_local(var_t* env, struct tm* tm, int* msec) {
+	int64_t ms;
+	if(!date_this_ms(env, &ms) || ms == DATE_INVALID)
+		return false;
+	return local_fields(ms, tm, msec);
+}
+
+/* Load this instance's UTC fields; false when the date is invalid. */
+static bool date_load_utc(var_t* env, int64_t* year, int* mon, int* mday,
+                          int* hour, int* min, int* sec, int* msec) {
+	int64_t ms; int wday;
+	if(!date_this_ms(env, &ms) || ms == DATE_INVALID)
+		return false;
+	utc_fields(ms, year, mon, mday, &wday, hour, min, sec, msec);
+	return true;
+}
+
+var_t* native_date_setTime(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	return date_store_ms(vm, env, date_from_number(get_func_arg(env, 0)));
+}
+
+var_t* native_date_setMilliseconds(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	struct tm tm; int msec; int v;
+	if(!date_load_local(env, &tm, &msec) || !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	msec = v;
+	return date_store_ms(vm, env, local_recompose(&tm, msec));
+}
+
+var_t* native_date_setSeconds(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	struct tm tm; int msec; int v;
+	if(!date_load_local(env, &tm, &msec) || !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	tm.tm_sec = v;
+	if(date_arg_field(env, 1, &v)) msec = v;
+	return date_store_ms(vm, env, local_recompose(&tm, msec));
+}
+
+var_t* native_date_setMinutes(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	struct tm tm; int msec; int v;
+	if(!date_load_local(env, &tm, &msec) || !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	tm.tm_min = v;
+	if(date_arg_field(env, 1, &v)) tm.tm_sec = v;
+	if(date_arg_field(env, 2, &v)) msec = v;
+	return date_store_ms(vm, env, local_recompose(&tm, msec));
+}
+
+var_t* native_date_setHours(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	struct tm tm; int msec; int v;
+	if(!date_load_local(env, &tm, &msec) || !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	tm.tm_hour = v;
+	if(date_arg_field(env, 1, &v)) tm.tm_min = v;
+	if(date_arg_field(env, 2, &v)) tm.tm_sec = v;
+	if(date_arg_field(env, 3, &v)) msec = v;
+	return date_store_ms(vm, env, local_recompose(&tm, msec));
+}
+
+var_t* native_date_setDate(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	struct tm tm; int msec; int v;
+	if(!date_load_local(env, &tm, &msec) || !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	tm.tm_mday = v;
+	return date_store_ms(vm, env, local_recompose(&tm, msec));
+}
+
+var_t* native_date_setMonth(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	struct tm tm; int msec; int v;
+	if(!date_load_local(env, &tm, &msec) || !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	tm.tm_mon = v;   /* JS month is 0-11, same as tm_mon */
+	if(date_arg_field(env, 1, &v)) tm.tm_mday = v;
+	return date_store_ms(vm, env, local_recompose(&tm, msec));
+}
+
+var_t* native_date_setFullYear(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	struct tm tm; int msec; int v;
+	if(!date_load_local(env, &tm, &msec) || !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	if(v >= 0 && v <= 99) v += 1900;   /* JS two-digit year mapping */
+	tm.tm_year = v - 1900;
+	if(date_arg_field(env, 1, &v)) tm.tm_mon = v;
+	if(date_arg_field(env, 2, &v)) tm.tm_mday = v;
+	return date_store_ms(vm, env, local_recompose(&tm, msec));
+}
+
+/* UTC variants of the mutators above. */
+var_t* native_date_setUTCMilliseconds(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	int64_t y; int mon, mday, hour, min, sec, msec; int v;
+	if(!date_load_utc(env, &y, &mon, &mday, &hour, &min, &sec, &msec) ||
+	   !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	msec = v;
+	return date_store_ms(vm, env, utc_recompose(y, mon, mday, hour, min, sec, msec));
+}
+
+var_t* native_date_setUTCSeconds(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	int64_t y; int mon, mday, hour, min, sec, msec; int v;
+	if(!date_load_utc(env, &y, &mon, &mday, &hour, &min, &sec, &msec) ||
+	   !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	sec = v;
+	if(date_arg_field(env, 1, &v)) msec = v;
+	return date_store_ms(vm, env, utc_recompose(y, mon, mday, hour, min, sec, msec));
+}
+
+var_t* native_date_setUTCMinutes(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	int64_t y; int mon, mday, hour, min, sec, msec; int v;
+	if(!date_load_utc(env, &y, &mon, &mday, &hour, &min, &sec, &msec) ||
+	   !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	min = v;
+	if(date_arg_field(env, 1, &v)) sec = v;
+	if(date_arg_field(env, 2, &v)) msec = v;
+	return date_store_ms(vm, env, utc_recompose(y, mon, mday, hour, min, sec, msec));
+}
+
+var_t* native_date_setUTCHours(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	int64_t y; int mon, mday, hour, min, sec, msec; int v;
+	if(!date_load_utc(env, &y, &mon, &mday, &hour, &min, &sec, &msec) ||
+	   !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	hour = v;
+	if(date_arg_field(env, 1, &v)) min = v;
+	if(date_arg_field(env, 2, &v)) sec = v;
+	if(date_arg_field(env, 3, &v)) msec = v;
+	return date_store_ms(vm, env, utc_recompose(y, mon, mday, hour, min, sec, msec));
+}
+
+var_t* native_date_setUTCDate(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	int64_t y; int mon, mday, hour, min, sec, msec; int v;
+	if(!date_load_utc(env, &y, &mon, &mday, &hour, &min, &sec, &msec) ||
+	   !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	mday = v;
+	return date_store_ms(vm, env, utc_recompose(y, mon, mday, hour, min, sec, msec));
+}
+
+var_t* native_date_setUTCMonth(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	int64_t y; int mon, mday, hour, min, sec, msec; int v;
+	if(!date_load_utc(env, &y, &mon, &mday, &hour, &min, &sec, &msec) ||
+	   !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	mon = v + 1;   /* JS month is 0-11, civil month is 1-12 */
+	if(date_arg_field(env, 1, &v)) mday = v;
+	return date_store_ms(vm, env, utc_recompose(y, mon, mday, hour, min, sec, msec));
+}
+
+var_t* native_date_setUTCFullYear(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	int64_t y; int mon, mday, hour, min, sec, msec; int v;
+	if(!date_load_utc(env, &y, &mon, &mday, &hour, &min, &sec, &msec) ||
+	   !date_arg_field(env, 0, &v))
+		return date_store_ms(vm, env, DATE_INVALID);
+	if(v >= 0 && v <= 99) v += 1900;
+	y = v;
+	if(date_arg_field(env, 1, &v)) mon = v + 1;
+	if(date_arg_field(env, 2, &v)) mday = v;
+	return date_store_ms(vm, env, utc_recompose(y, mon, mday, hour, min, sec, msec));
+}
+
 /* toISOString()/toJSON(): "YYYY-MM-DDTHH:MM:SS.sssZ" (UTC). Years outside
  * 0000..9999 use the expanded +/-YYYYYY form, matching the ES spec. */
 var_t* native_date_toISOString(vm_t* vm, var_t* env, void* data) {
@@ -567,6 +804,16 @@ void reg_native_Date(vm_t* vm) {
 	vm_reg_native(vm, cls, "getMilliseconds()", native_date_getMilliseconds, NULL);
 	vm_reg_native(vm, cls, "getTimezoneOffset()", native_date_getTimezoneOffset, NULL);
 
+	/* Local-time field mutators. */
+	vm_reg_native(vm, cls, "setTime(ms)", native_date_setTime, NULL);
+	vm_reg_native(vm, cls, "setMilliseconds(ms)", native_date_setMilliseconds, NULL);
+	vm_reg_native(vm, cls, "setSeconds(s)", native_date_setSeconds, NULL);
+	vm_reg_native(vm, cls, "setMinutes(m)", native_date_setMinutes, NULL);
+	vm_reg_native(vm, cls, "setHours(h)", native_date_setHours, NULL);
+	vm_reg_native(vm, cls, "setDate(d)", native_date_setDate, NULL);
+	vm_reg_native(vm, cls, "setMonth(m)", native_date_setMonth, NULL);
+	vm_reg_native(vm, cls, "setFullYear(y)", native_date_setFullYear, NULL);
+
 	/* UTC field accessors. */
 	vm_reg_native(vm, cls, "getUTCFullYear()", native_date_getUTCFullYear, NULL);
 	vm_reg_native(vm, cls, "getUTCMonth()", native_date_getUTCMonth, NULL);
@@ -576,6 +823,15 @@ void reg_native_Date(vm_t* vm) {
 	vm_reg_native(vm, cls, "getUTCMinutes()", native_date_getUTCMinutes, NULL);
 	vm_reg_native(vm, cls, "getUTCSeconds()", native_date_getUTCSeconds, NULL);
 	vm_reg_native(vm, cls, "getUTCMilliseconds()", native_date_getUTCMilliseconds, NULL);
+
+	/* UTC field mutators. */
+	vm_reg_native(vm, cls, "setUTCMilliseconds(ms)", native_date_setUTCMilliseconds, NULL);
+	vm_reg_native(vm, cls, "setUTCSeconds(s)", native_date_setUTCSeconds, NULL);
+	vm_reg_native(vm, cls, "setUTCMinutes(m)", native_date_setUTCMinutes, NULL);
+	vm_reg_native(vm, cls, "setUTCHours(h)", native_date_setUTCHours, NULL);
+	vm_reg_native(vm, cls, "setUTCDate(d)", native_date_setUTCDate, NULL);
+	vm_reg_native(vm, cls, "setUTCMonth(m)", native_date_setUTCMonth, NULL);
+	vm_reg_native(vm, cls, "setUTCFullYear(y)", native_date_setUTCFullYear, NULL);
 
 	/* Formatting. */
 	vm_reg_native(vm, cls, "toISOString()", native_date_toISOString, NULL);

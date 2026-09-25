@@ -31,6 +31,26 @@ static var_t* native_Boolean_call(vm_t* vm, var_t* env, void* data) {
 	return var_new_bool(vm, b);
 }
 
+/* Boolean.prototype.toString(): "true" / "false". mario has no wrapper objects,
+ * so `this` IS the primitive boolean (var_true / var_false). github's
+ * app-runtime computes `t.staff = (0,u.Xl)().toString()` where Xl() returns a
+ * `!!...` boolean; without a prototype on the primitive that member lookup
+ * threw "can not find function 'toString' on object{}". */
+static var_t* native_Boolean_toString(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* v = get_obj(env, THIS);
+	bool b = (v != NULL) ? var_get_bool(v) : false;
+	return var_new_str(vm, b ? "true" : "false");
+}
+
+/* Boolean.prototype.valueOf(): the primitive boolean behind `this`. */
+static var_t* native_Boolean_valueOf(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* v = get_obj(env, THIS);
+	bool b = (v != NULL) ? var_get_bool(v) : false;
+	return var_new_bool(vm, b);
+}
+
 static inline void load_basic_classes(vm_t* vm) {
 	var_t* console = new_obj(vm, "Console", 0);
 	var_add(vm->root, "console", console);
@@ -43,6 +63,25 @@ static inline void load_basic_classes(vm_t* vm) {
 	vm_reg_var(vm, NULL, "Infinity", var_new_float(vm, (float)INFINITY), true);
 	vm_reg_var(vm, NULL, "NaN", var_new_float(vm, (float)NAN), true);
 	vm_reg_native(vm, NULL, "Boolean(value)", native_Boolean_call, NULL);
+
+	/* Boolean primitives need a prototype chain so `false.toString()` / `x.valueOf()`
+	 * resolve (numbers/strings get theirs in var_new_int/var_new_str). mario has no
+	 * Boolean wrapper CLASS, but the global Boolean function's auto-created
+	 * .prototype is a perfectly good home for the two methods: register them there,
+	 * cache the function as builtin_vars.var_Boolean (so var_new_bool links it), and
+	 * retro-link the true/false singletons - those were built in vm_new BEFORE the
+	 * natives ran, when var_Boolean was still NULL. */
+	var_t* boolfn = vm_load_var(vm, "Boolean", false);
+	if(boolfn != NULL) {
+		vm_reg_native(vm, boolfn, "toString()", native_Boolean_toString, NULL);
+		vm_reg_native(vm, boolfn, "valueOf()", native_Boolean_valueOf, NULL);
+		vm->builtin_vars.var_Boolean = boolfn;
+		var_t* bproto = var_get_prototype(boolfn);
+		if(bproto != NULL) {
+			var_set_prototype(vm->builtin_vars.var_true, bproto);
+			var_set_prototype(vm->builtin_vars.var_false, bproto);
+		}
+	}
 }
 
 void reg_all_natives(vm_t* vm) {

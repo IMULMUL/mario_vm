@@ -849,6 +849,58 @@ var_t* native_Array_findIndex(vm_t* vm, var_t* env, void* data) {
 	return var_new_int(vm, -1);
 }
 
+/* ES2023 findLast/findLastIndex: same callback contract as find/findIndex but
+ * walking from the last element towards the first. Bundles feature-detect them
+ * (`[].findLast`) and fall back to a manual loop only when they are missing,
+ * which is fine but leaves the detection lying about the engine's level. */
+var_t* native_Array_findLast(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = array_recv(vm, env);
+	var_t* f = get_obj(env, "f");
+	if(f == NULL || f->type == V_UNDEF)
+		return NULL;
+	int32_t sz = (int32_t)var_array_size(arr);
+	int32_t i;
+	vm->gc.gc_defer++;
+	for(i=sz-1; i>=0; --i) {
+		var_t* el = var_array_get_var(arr, i);
+		var_t* res = array_call_cb(vm, env, f, el, (uint32_t)i, arr);
+		bool hit = (res != NULL) && var_get_bool(res);
+		if(res != NULL)
+			var_unref(res);
+		if(hit) {
+			vm->gc.gc_defer--;
+			return el; /* borrowed from arr; func_call adds the stack ref */
+		}
+	}
+	vm->gc.gc_defer--;
+	return NULL; /* undefined */
+}
+
+var_t* native_Array_findLastIndex(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = array_recv(vm, env);
+	var_t* f = get_obj(env, "f");
+	if(f == NULL || f->type == V_UNDEF)
+		return var_new_int(vm, -1);
+	int32_t sz = (int32_t)var_array_size(arr);
+	int32_t i;
+	vm->gc.gc_defer++;
+	for(i=sz-1; i>=0; --i) {
+		var_t* el = var_array_get_var(arr, i);
+		var_t* res = array_call_cb(vm, env, f, el, (uint32_t)i, arr);
+		bool hit = (res != NULL) && var_get_bool(res);
+		if(res != NULL)
+			var_unref(res);
+		if(hit) {
+			vm->gc.gc_defer--;
+			return var_new_int(vm, i);
+		}
+	}
+	vm->gc.gc_defer--;
+	return var_new_int(vm, -1);
+}
+
 var_t* native_Array_includes(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 	var_t* arr = array_recv(vm, env);
@@ -1223,7 +1275,10 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, "shift()", native_Array_shift, NULL); 
 	vm_reg_native(vm, cls, "unshift()", native_Array_unshift, NULL); 
 	vm_reg_native(vm, cls, "slice(start, end)", native_Array_slice, NULL); 
-	vm_reg_native(vm, cls, "isArray(obj)", native_Array_isArray, NULL); 
+	/* ES static, not an instance method: a `class Sub extends Array` resolves
+	 * inherited statics through the is_static-flagged chain in vm_find_in_class,
+	 * so registering it as a plain prototype method hid `Sub.isArray`. */
+	vm_reg_static(vm, cls, "isArray(obj)", native_Array_isArray, NULL); 
 	vm_reg_native(vm, cls, "length()", native_Array_length, NULL); 
 	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_Array_iterator, NULL); 
 
@@ -1234,6 +1289,8 @@ void reg_native_Array(vm_t* vm) {
 	/* ES6 prototype methods */
 	vm_reg_native(vm, cls, "find(f)", native_Array_find, NULL);
 	vm_reg_native(vm, cls, "findIndex(f)", native_Array_findIndex, NULL);
+	vm_reg_native(vm, cls, "findLast(f)", native_Array_findLast, NULL);
+	vm_reg_native(vm, cls, "findLastIndex(f)", native_Array_findLastIndex, NULL);
 	vm_reg_native(vm, cls, "includes(search, fromIndex)", native_Array_includes, NULL);
 	vm_reg_native(vm, cls, "indexOf(search, fromIndex)", native_Array_indexOf, NULL);
 	vm_reg_native(vm, cls, "lastIndexOf(search, fromIndex)", native_Array_lastIndexOf, NULL);

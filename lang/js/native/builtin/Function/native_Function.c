@@ -5,6 +5,7 @@ extern "C" {
 #include "native_Function.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define CLS_FUNCTION "Function"
 
@@ -79,7 +80,8 @@ var_t* native_Function_call(vm_t* vm, var_t* env, void* data) {
 	var_t* thisArg = get_func_arg(env, 0);
 	var_t* target_name = target != NULL ? var_find_own_member_var(target, "@@fname") : NULL;
 	if(target_name != NULL && target_name->type == V_STRING &&
-	   strcmp(var_get_str(target_name), "toString") == 0) {
+	   strcmp(var_get_str(target_name), "toString") == 0 &&
+	   getenv("MARIO_CALLDBG") != NULL) {
 		var_t* fn_ts = vm->builtin_vars.var_Function != NULL ? var_find_own_member_var(var_get_prototype(vm->builtin_vars.var_Function), "toString") : NULL;
 		var_t* obj_ts = vm->builtin_vars.var_Object != NULL ? var_find_own_member_var(var_get_prototype(vm->builtin_vars.var_Object), "toString") : NULL;
 		fprintf(stderr, "[Function.call->toString] script=%s target=%p fn=%d obj=%d arg=%p type=%u is_func=%u is_class=%u refs=%u proxy=%u\n",
