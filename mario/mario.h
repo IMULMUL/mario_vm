@@ -69,8 +69,8 @@ typedef struct st_hash_map {
 	hash_entry_t**      buckets;
 	uint32_t            size;
 	uint32_t            capacity;
-	uint32_t            load_factor_num;   // 负载因子分子
-	uint32_t            load_factor_den;   // 负载因子分母
+	uint32_t            load_factor_num;   // load factor numerator
+	uint32_t            load_factor_den;   // load factor denominator
 } hash_map_t;
 
 // Hash map functions
